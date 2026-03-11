@@ -118,7 +118,7 @@ def detect_group(entry, taxon_map):
         return "archaea"
     elif first == "Viruses":
         return "viruses"
-    elif "Homo sapiens" in lineage:
+    elif "Homo" in lineage:
         return "human"
     elif first == "Eukaryota":
         if lineage[1] == "Fungi":

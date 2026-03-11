@@ -4,6 +4,8 @@ work/
 results/
 test_results/
 
+datalake/
+
 *.parquet
 *.jsonl
 *.jsonl.zst
