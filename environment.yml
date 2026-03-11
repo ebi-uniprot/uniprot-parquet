@@ -6,5 +6,8 @@ dependencies:
   - openjdk=17 # Required for Nextflow
   - nextflow # The orchestrator
   - duckdb # The Parquet engine
+  - duckdb-cli
   - python=3.14 # For your Polars/DuckDB demo scripts
   - polars # For the lazy evaluation demo
+  - PyYAML
+  - notebook

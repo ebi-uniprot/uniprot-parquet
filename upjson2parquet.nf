@@ -67,9 +67,9 @@ process processChunk {
         echo " .-- BEGUN ${task.process} for ${accfile}...; Attempt ${task.attempt} \$(date)"
     fi
     if [ -s "${params.mapping}" ]; then
-        ${process_json} ${accfile} -o outdir -e ${extension} -m "${params.mapping}"
+        ${process_json} ${accfile} -o outdir -e ${extension} -m "${params.mapping}" -p "${task.hash}"
     else
-        ${process_json} ${accfile} -o outdir -e ${extension}
+        ${process_json} ${accfile} -o outdir -e ${extension} -p "${task.hash}"
     fi
     echo " '-- ENDED ${task.process} \$(date)"
     """

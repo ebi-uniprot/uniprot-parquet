@@ -37,6 +37,8 @@ import argparse
 import polars as pl
 from pathlib import Path
 from collections import defaultdict
+import uuid
+
 
 
 def eprint(*myargs, **kwargs):
@@ -76,6 +78,7 @@ def check_args():
     p.add_argument("-m", "--taxonmap", type=is_valid_file, help="YAML custom mapping file: taxonId -> group name")
     p.add_argument("-o", "--outdir", default="datalake")
     p.add_argument("-e", "--extension", default="tsv", choices=["tsv", "parquet"])
+    p.add_argument("-p", "--prefix", default=None, help="Prefix for output files (e.g., Nextflow task hash)")
 
     args = p.parse_args()
 
@@ -95,7 +98,7 @@ def load_taxon_map(path):
     return taxon_map
 
 
-def detect_group(entry, taxon_map):
+def detect_taxon_group(entry, taxon_map):
     """
     detect taxon group based on taxid or lineage
     """
@@ -136,7 +139,8 @@ def detect_group(entry, taxon_map):
             return "invertebrates"
     return "unclassified"
 
-
+def detect_review_status(entry):
+    return entry["entryType"] =="UniProtKB reviewed (Swiss-Prot)"
 
 def build_tables(df):
     """
@@ -174,41 +178,29 @@ def build_tables(df):
     return tables
 
 
-def write_group_jsonl(groups, outdir):
+def write_group_jsonl(groups, outdir, file_prefix=None):
     """
-    write taxonomy grouped jsonl
+    Write grouped JSONL files using Hive partitioning.
+    Uses file_prefix (e.g., Nextflow hash) to prevent collisions.
     """
-    for group, jsonl in groups.items():
-        path = outdir / f"{group}.jsonl"
-        with open(path, "w") as f:
-            f.write(jsonl)
+    # Fallback to a random UUID if no hash is provided
+    if not file_prefix:
+        file_prefix = str(uuid.uuid4())[:8]
 
+    for (status, taxon_group), entries in groups.items():
+        # 1. Build the Hive partition path
+        # Result: datalake/review_status=sp/tax_division=human/
+        partition_dir = outdir / f"review_status={status}".lower() / f"tax_division={taxon_group}"
+        partition_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 2. Assign the unique filename e.g. 3f8a9b.jsonl
+        outfile = partition_dir / f"{file_prefix}.jsonl"
+        
+        # 3. Write the list of dictionaries back out as JSON Lines
+        with open(outfile, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
 
-def write_tables(groups, outdir, filetype="parquet"):
-    """
-    write parquet (or tsv) table
-    """
-    for group, entries in groups.items():
-        df = pl.DataFrame(entries, strict=False)
-        tables = build_tables(df)
-        for table_name, table_df in tables.items():
-            if table_df.height == 0:
-                continue
-
-            outfile = outdir / f"{group}.{table_name}.{filetype}"
-            if filetype == "parquet":
-                table_df.write_parquet(
-                    outfile,
-                    compression="zstd",
-                    use_pyarrow=True
-                )
-            elif filetype == "tsv":
-                table_df.write_csv(
-                    outfile,
-                    separator="\t"
-                )
-            else:
-                raise ValueError(f"Unsupported filetype: {filetype}")
 
 
 def process_chunk(args):
@@ -223,21 +215,18 @@ def process_chunk(args):
     if args.taxonmap is not None:
         taxon_map = load_taxon_map(args.taxonmap)
 
-    json_by_taxon = defaultdict(str)
-    entries_by_taxon = defaultdict(list)
+    json_by_status_taxon = defaultdict(list)
 
     with open(args.input_jsonl) as f:
         for line in f:
             entry = json.loads(line)
-            accession = entry["primaryAccession"]
-            group = detect_group(entry, taxon_map)
+            taxon_group = detect_taxon_group(entry, taxon_map)
+            status = detect_review_status(entry)
             #eprint(f"{accession} -> {group}") #debug
-            json_by_taxon[group] += line
-            entries_by_taxon[group].append(entry)
+            json_by_status_taxon[(status, taxon_group )].append(entry)
 
-    write_group_jsonl(json_by_taxon, outdir) #taxdiv-grouped jsonl
+    write_group_jsonl(json_by_status_taxon, outdir) #taxdiv-grouped jsonl
 
-    write_tables(entries_by_taxon, outdir, args.extension) #dataframes
 
 
 if __name__ == "__main__":
