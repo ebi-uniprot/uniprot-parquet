@@ -1,7 +1,7 @@
-#!/bin/env bash
+#!/usr/bin/env bash
 threads=1
 batchsize=20 #200000
-inputfile=entries.json
+inputfile=entries_test.json
 outdir="$(pwd)/datalake"
 maxforks=50 # how many concurrent processes
 extension=tsv #{tsv, parquet}

@@ -1,4 +1,4 @@
-#!/bin/env python3
+#!/usr/bin/env python3
 #Mon  9 Mar 13:46:17 GMT 2026 0.1 coded first draft
 #Tue 10 Mar 11:04:33 GMT 2026 0.3 added split by taxonomy and creation of json files
 #Tue 10 Mar 15:33:43 GMT 2026 1.0 added simple build_tables
