@@ -68,5 +68,5 @@ print(df.collect())
 
 - Orchestration: Nextflow
 - Engine: DuckDB CLI
-- Language: Python 3.14
+- Language: Python >3.14
 - Format: Apache Parquet (Zstd)
