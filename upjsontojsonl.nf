@@ -1,5 +1,6 @@
 // Minimal Nextflow to convert JSON -> JSONL
-params.inputfile = "${projectDir}/entries_test.json"
+// 
+params.inputfile = "${projectDir}/uniprot_results.json"
 params.outdir = "${projectDir}/datalake"
 
 process convertJsonToJsonl {
