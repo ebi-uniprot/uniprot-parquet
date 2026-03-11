@@ -16,6 +16,12 @@ micromamba activate uniprot-lake
 
 ### 2. Execution
 
+Trivial test for Nextflow setup.
+
+```bash
+nextflow run test.nf
+```
+
 Run the pipeline with a stratified JSONL sample.
 
 ```bash
