@@ -1,0 +1,10 @@
+name: uniprot-lake
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - openjdk=17 # Required for Nextflow
+  - nextflow # The orchestrator
+  - duckdb # The Parquet engine
+  - python=3.14 # For your Polars/DuckDB demo scripts
+  - polars # For the lazy evaluation demo
