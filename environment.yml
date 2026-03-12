@@ -10,6 +10,8 @@ dependencies:
   - python=3.14 # For your Polars/DuckDB demo scripts
   - polars # For the lazy evaluation demo
   - PyYAML
-  - ijson           # Streaming JSON parser for large files
-  - zstandard       # Zstd compression for JSONL chunks
+  - ijson # Streaming JSON parser for large files
+  - zstandard # Zstd compression for JSONL chunks
   - notebook
+  - pandas
+  - pyarrow
