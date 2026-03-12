@@ -17,7 +17,7 @@ case "$MODE" in
         OUTDIR="$(pwd)/results/uniprot_lake_test"
         BATCHSIZE=100
         MAXFORKS=4
-        MEMORY="4GB"
+        MEMORY="12GB"
         PROFILE="local"
         ;;
     prod)

@@ -32,47 +32,18 @@ def eprint(*args, **kwargs):
 
 
 def stream_records(path):
-    """
-    Yield JSON records from input file. Auto-detects format:
-      - JSONL: first line is a complete JSON object
-      - Wrapper/array: streamed via ijson
-    Handles .gz transparently.
-    """
-    is_gz = str(path).endswith('.gz')
-    opener = gzip.open if is_gz else open
-
-    # Peek at first line to detect format
-    with opener(path, 'rt', encoding='utf-8') as fh:
-        first_line = fh.readline().strip()
-
-    # JSONL: first line parses as a complete JSON object
-    if first_line.startswith('{'):
-        try:
-            json.loads(first_line)
-            eprint("Detected format: jsonl")
-            with opener(path, 'rt', encoding='utf-8') as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        yield json.loads(line)
-            return
-        except json.JSONDecodeError:
-            pass
-
-    # Wrapper or array format - use ijson for streaming
+    """Yield entries from {"results": [...]} JSON file. Handles .gz transparently."""
     try:
         import ijson
     except ImportError:
         eprint("ERROR: ijson not installed. Run: pip install ijson")
         sys.exit(1)
 
+    is_gz = str(path).endswith('.gz')
+    opener = gzip.open if is_gz else open
+
     with opener(path, 'rb') as fh:
-        if first_line.startswith('['):
-            eprint("Detected format: json array")
-            yield from ijson.items(fh, 'item')
-        else:
-            eprint("Detected format: json wrapper (results array)")
-            yield from ijson.items(fh, 'results.item')
+        yield from ijson.items(fh, 'results.item', use_float=True)
 
 
 def open_zst_writer(path):

@@ -56,7 +56,7 @@ def read_json_clause(jsonl_path, schema_path):
     with open(schema_path) as f:
         schema = json.load(f)
     cols = ', '.join(f"'{name}': '{dtype}'" for name, dtype in schema.items())
-    return f"read_json('{jsonl_path}', format='newline_delimited', columns={{{cols}}})"
+    return f"read_json('{jsonl_path}', format='newline_delimited', maximum_object_size=536870912, columns={{{cols}}})"
 
 
 def write_core(con, read_clause, outdir):
