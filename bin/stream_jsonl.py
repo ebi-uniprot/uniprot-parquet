@@ -2,9 +2,8 @@
 """
 Stream UniProtKB JSON(.gz) → zstd-compressed chunked JSONL files.
 
-Handles two input formats:
-  1. Newline-delimited JSON (JSONL) - one record per line
-  2. JSON with {"results": [...]} wrapper - streamed via ijson
+Handles input format:
+  1. JSON with {"results": [...]} wrapper - streamed via ijson
 
 Output chunks are .jsonl.zst (zstandard compressed).
 DuckDB reads these natively.
@@ -55,7 +54,7 @@ def open_zst_writer(path):
 
 def main():
     parser = argparse.ArgumentParser(description='Stream UniProtKB JSON to chunked JSONL.zst')
-    parser.add_argument('input', help='Input JSON/JSONL file (optionally .gz)')
+    parser.add_argument('input', help='Input JSON file (optionally .gz)')
     parser.add_argument('-o', '--outdir', default='jsonl_chunks', help='Output directory')
     parser.add_argument('-b', '--batch-size', type=int, default=500000,
                         help='Records per chunk file (default: 500000)')

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Infer DuckDB schema from a JSONL(.gz) file using sample_size=-1 (full scan).
+Infer DuckDB schema from a JSONL(.zst) file using sample_size=-1 (full scan).
 
 Outputs a JSON file mapping column_name → DuckDB_type.
-DuckDB reads .jsonl.gz natively.
+DuckDB reads .jsonl.zst natively.
 
 Usage:
     infer_schema.py <input.jsonl[.gz]> -o <schema.json>
@@ -23,7 +23,7 @@ def eprint(*args, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(description='Infer DuckDB schema from JSONL')
-    parser.add_argument('input', help='Input JSONL(.gz) file')
+    parser.add_argument('input', help='Input JSONL(.zst) file')
     parser.add_argument('-o', '--output', default='schema.json', help='Output schema JSON')
     parser.add_argument('--memory-limit', default='8GB', help='DuckDB memory limit')
     args = parser.parse_args()
