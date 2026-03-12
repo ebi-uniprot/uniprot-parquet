@@ -12,12 +12,20 @@ SUBSET_SIZE="${2:-}"
 
 # ─── Defaults ─────────────────────────────────────────────────────
 case "$MODE" in
-    test)
-        INPUTFILE="entries_test.json"
-        OUTDIR="$(pwd)/datalake"
+    test_small)
+        INPUTFILE="test_json/small.json.gz"
+        OUTDIR="$(pwd)/datalake/uniprot_lake_test_small"
         BATCHSIZE=100
         MAXFORKS=4
         MEMORY="12GB"
+        PROFILE="local"
+        ;;
+    test_med)
+        INPUTFILE="test_json/med.json.gz"
+        OUTDIR="$(pwd)/results/uniprot_lake_test_med"
+        BATCHSIZE=500
+        MAXFORKS=8
+        MEMORY="16GB"
         PROFILE="local"
         ;;
     prod)
@@ -43,7 +51,7 @@ case "$MODE" in
 esac
 
 echo "╔═══════════════════════════════════════════════════════╗"
-echo "║  UniProtKB → Parquet Datalake                        ║"
+echo "║  UniProtKB → Parquet Datalake                         ║"
 echo "╠═══════════════════════════════════════════════════════╣"
 echo "║  Mode:      $MODE"
 echo "║  Input:     $INPUTFILE"

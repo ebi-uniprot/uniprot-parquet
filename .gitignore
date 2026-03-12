@@ -10,7 +10,7 @@ datalake/
 *.jsonl
 *.jsonl.zst
 uniprot_lake/
-sample.jsonl
+test_json/med.json.gz
 
 env/
 .mamba/
@@ -28,3 +28,4 @@ ENV/
 
 .DS_Store
 .vscode/
+.ipynb_checkpoints/

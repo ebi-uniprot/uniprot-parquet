@@ -29,20 +29,21 @@ params.memory_limit   = '8GB'    // DuckDB memory limit per process
 params.max_parquet_mb = 512      // target max parquet file size
 
 /* ── SCRIPTS ──────────────────────────────────────────────────────── */
-stream_script       = "${projectDir}/bin/stream_jsonl.py"
-infer_schema_script = "${projectDir}/bin/infer_schema.py"
+stream_script        = "${projectDir}/bin/stream_jsonl.py"
+infer_schema_script  = "${projectDir}/bin/infer_schema.py"
 merge_schemas_script = "${projectDir}/bin/merge_schemas.py"
-transform_script    = "${projectDir}/bin/duckdb_transform.py"
-collect_script      = "${projectDir}/bin/collect_lake.py"
-validate_script     = "${projectDir}/bin/validate_lake.py"
+transform_script     = "${projectDir}/bin/duckdb_transform.py"
+collect_script       = "${projectDir}/bin/collect_lake.py"
+validate_script      = "${projectDir}/bin/validate_lake.py"
 
 
 /* ── PROCESS: Stream input to zstd-compressed chunked JSONL ───────── */
 process STREAM_JSONL {
     tag 'stream'
-    cpus 1
+    
+    cpus 4
     memory '4 GB'
-    time '12h'
+    time '12h' 
 
     input:
     path inputfile
@@ -51,14 +52,22 @@ process STREAM_JSONL {
     path "chunks/*.jsonl.zst", emit: chunks
 
     script:
+    def cpus = task.cpus
     """
     set -euo pipefail
     echo " .-- STREAM_JSONL BEGUN \$(date)"
-    python3 ${stream_script} ${inputfile} -o chunks -b ${params.batchsize}
+
+    mkdir -p chunks
+
+    pigz -dc ${inputfile} \\
+        | python3 ${stream_script} \\
+        | split -l ${params.batchsize} \\
+            --filter "zstd -3 -T${cpus} > chunks/\\\$FILE.jsonl.zst" \\
+            - chunk_
+
     echo " '-- STREAM_JSONL ENDED \$(date)"
     """
 }
-
 
 /* ── PROCESS: Infer schema from one chunk (full scan) ─────────────── */
 process INFER_SCHEMA {
@@ -191,15 +200,15 @@ process VALIDATE {
 workflow {
     log.info """
     ╔═══════════════════════════════════════════════════════════╗
-    ║  UniProtKB → Parquet Datalake (Star Schema)              ║
-    ║  Release: ${params.release}                                    ║
+    ║  UniProtKB → Parquet Datalake (Star Schema)               ║
+    ║  Release: ${params.release}                               ║
     ╚═══════════════════════════════════════════════════════════╝
     Input:      ${params.inputfile}
     Output:     ${params.outdir}
     Batch size: ${params.batchsize}
     Max forks:  ${params.maxforks}
     DuckDB mem: ${params.memory_limit}
-    ──────────────────────────────────────────────────────────────
+    ─────────────────────────────────────────────────────────────
     """.stripIndent()
 
     // 0. Validate input
