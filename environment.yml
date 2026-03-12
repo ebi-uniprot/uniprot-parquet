@@ -11,4 +11,5 @@ dependencies:
   - polars # For the lazy evaluation demo
   - PyYAML
   - ijson           # Streaming JSON parser for large files
+  - zstandard       # Zstd compression for JSONL chunks
   - notebook
