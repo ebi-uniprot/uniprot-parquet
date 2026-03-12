@@ -38,7 +38,7 @@ def main():
 
     result = con.sql(f"""
         DESCRIBE SELECT * FROM read_json('{jsonl_path}',
-            maximum_object_size = 2684354560,
+            maximum_object_size = 568435456,
             format='newline_delimited',
             sample_size=-1
         )

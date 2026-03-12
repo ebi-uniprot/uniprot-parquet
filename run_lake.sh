@@ -14,7 +14,7 @@ SUBSET_SIZE="${2:-}"
 case "$MODE" in
     test)
         INPUTFILE="entries_test.json"
-        OUTDIR="$(pwd)/results/uniprot_lake_test"
+        OUTDIR="$(pwd)/datalake"
         BATCHSIZE=100
         MAXFORKS=4
         MEMORY="12GB"
@@ -22,7 +22,7 @@ case "$MODE" in
         ;;
     prod)
         INPUTFILE="UniProtKB.json.gz"
-        OUTDIR="$(pwd)/results/uniprot_lake"
+        OUTDIR="$(pwd)/datalake"
         BATCHSIZE=500000
         MAXFORKS=50
         MEMORY="8GB"
@@ -30,7 +30,7 @@ case "$MODE" in
         ;;
     subset)
         INPUTFILE="UniProtKB.json.gz"
-        OUTDIR="$(pwd)/results/uniprot_lake_subset"
+        OUTDIR="$(pwd)/datalake"
         BATCHSIZE=500000
         MAXFORKS=30
         MEMORY="8GB"
