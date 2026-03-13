@@ -41,8 +41,8 @@ validate_script     = "${projectDir}/bin/validate_lake.py"
 process STREAM_JSONL {
     tag 'stream'
     cpus 1
-    memory '4 GB'
-    time '12h'
+    memory '4 GB' // we can give 8GB for prod if needed
+    time '48h' // longer time for full dataset
 
     input:
     path inputfile
@@ -64,8 +64,8 @@ process STREAM_JSONL {
 process INFER_SCHEMA {
     tag { "${chunk.baseName}" }
     cpus 1
-    memory '4 GB'
-    maxForks Math.min(params.maxforks, 20)
+    memory '4 GB' // we can give 8GB for prod if needed
+    maxForks Math.min(params.maxforks, 20) // limit parallelism for schema inference
 
     input:
     path chunk
@@ -109,7 +109,7 @@ process DUCKDB_TRANSFORM {
     memory '8 GB'
     maxForks Math.min(params.maxforks, 50)
     errorStrategy 'retry'
-    maxRetries 2
+    maxRetries 1
 
     input:
     path chunk
@@ -140,7 +140,7 @@ process DUCKDB_TRANSFORM {
 process COLLECT_LAKE {
     tag { "${table}" }
     cpus 2
-    memory '16 GB'
+    memory '16 GB' // more memory for larger datasets
     maxForks 3
 
     publishDir "${params.outdir}", mode: 'copy'

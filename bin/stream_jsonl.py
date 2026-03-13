@@ -54,7 +54,7 @@ def open_zst_writer(path):
 
 def main():
     parser = argparse.ArgumentParser(description='Stream UniProtKB JSON to chunked JSONL.zst')
-    parser.add_argument('input', help='Input JSON file (optionally .gz)')
+    parser.add_argument('input', help='Input JSON file with {"results": [...]} (optionally .gz)')
     parser.add_argument('-o', '--outdir', default='jsonl_chunks', help='Output directory')
     parser.add_argument('-b', '--batch-size', type=int, default=500000,
                         help='Records per chunk file (default: 500000)')

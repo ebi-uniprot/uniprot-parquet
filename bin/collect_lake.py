@@ -60,16 +60,7 @@ def main():
         (FORMAT PARQUET, PARTITION_BY (review_status, tax_division),
          COMPRESSION 'zstd', ROW_GROUP_SIZE 500000)
     """)
-
-    # Report file sizes
-    for root, dirs, fnames in os.walk(out):
-        for fname in fnames:
-            if fname.endswith('.parquet'):
-                path = os.path.join(root, fname)
-                size_mb = os.path.getsize(path) / (1024 * 1024)
-                eprint(f"  {path}: {size_mb:.1f} MB")
-                if size_mb > args.max_parquet_mb:
-                    eprint(f"  WARNING: exceeds {args.max_parquet_mb}MB limit!")
+    #  Note: we could reduce the ROW_GROUP_SIZE if we wanted smaller files
 
 
 if __name__ == '__main__':
