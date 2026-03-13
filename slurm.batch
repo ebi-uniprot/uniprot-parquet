@@ -1,0 +1,35 @@
+#!/bin/bash
+#SBATCH --time=48:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --nodes=1
+#SBATCH -p production
+#SBATCH --mem=32G
+#SBATCH --job-name=uniprot_lake
+#SBATCH --output=logs/uniprot_%j.log
+#SBATCH --error=logs/uniprot_%j.err
+
+source ~/.bashrc
+
+module load nextflow
+module load python/3.12
+
+# Install micromamba only if not already installed
+if [ ! -f "$HOME/.local/bin/micromamba" ]; then
+    curl -L micro.mamba.pm/install.sh -o /tmp/install.sh
+    bash /tmp/install.sh -b -p $HOME/micromamba
+    rm /tmp/install.sh
+fi
+
+export MAMBA_EXE="$HOME/.local/bin/micromamba"
+export MAMBA_ROOT_PREFIX="$HOME/micromamba"
+export PATH="$(dirname $MAMBA_EXE):$PATH"
+
+micromamba --version
+
+cd ~/uniprot-parquet
+
+# Create environment only if it doesn't exist
+micromamba env list | grep -q "uniprot-lake" || micromamba create -f environment.yml -y
+
+nextflow clean -f && micromamba run -n uniprot-lake ./run_lake.sh prod
