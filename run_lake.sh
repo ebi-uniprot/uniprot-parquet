@@ -21,11 +21,11 @@ case "$MODE" in
         PROFILE="local"
         ;;
     prod)
-        INPUTFILE="UniProtKB.json.gz"
+        INPUTFILE="entries_test.json"
         OUTDIR="$(pwd)/datalake"
-        BATCHSIZE=500000
+        BATCHSIZE=500
         MAXFORKS=50
-        MEMORY="8GB"
+        MEMORY="16GB"
         PROFILE="prod"
         ;;
     subset)
