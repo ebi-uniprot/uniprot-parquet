@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Infer DuckDB schema from a JSONL(.zst) file using sample_size=-1 (full scan).
+Infer DuckDB schema from a JSONL.zst file using sample_size=-1 (full scan).
 
 Outputs a JSON file mapping column_name → DuckDB_type.
 DuckDB reads .jsonl.zst natively.

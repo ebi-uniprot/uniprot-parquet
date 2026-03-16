@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
 # ─── UniProtKB → Parquet Datalake Pipeline ────────────────────────
 # Usage:
-#   ./run_lake.sh                    # test mode (entries_test.json, local)
-#   ./run_lake.sh prod               # production (UniProtKB.json.gz, slurm)
-#   ./run_lake.sh subset 5000000     # first 5M records, slurm short queue
+#   ./run_lake.sh                                         # test mode
+#   ./run_lake.sh prod                                    # production
+#   ./run_lake.sh prod --input /path/to/UniProtKB.json.gz
+#   ./run_lake.sh prod --outdir /scratch/results
+#   ./run_lake.sh prod --input /path/to/file.json.gz --outdir /scratch/results
 
 set -euo pipefail
 
+#MODE="${1:-test}"
+#SUBSET_SIZE="${2:-}"
+
 MODE="${1:-test}"
-SUBSET_SIZE="${2:-}"
+shift || true
+
+# ─── Parse optional flags ─────────────────────────────────────────
+INPUTFILE_OVERRIDE=""
+OUTDIR_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --input)  INPUTFILE_OVERRIDE="$2"; shift 2 ;;
+        --outdir) OUTDIR_OVERRIDE="$2";    shift 2 ;;
+        *)        echo "Unknown flag: $1"; exit 1  ;;
+    esac
+done
 
 # ─── Defaults ─────────────────────────────────────────────────────
 case "$MODE" in
@@ -29,11 +46,11 @@ case "$MODE" in
         PROFILE="local"
         ;;
     prod)
-        INPUTFILE="UniProtKB.json.gz"
+        INPUTFILE="~/uniprot100k.json.gz"
         OUTDIR="$(pwd)/datalake"
-        BATCHSIZE=500000
+        BATCHSIZE=500
         MAXFORKS=50
-        MEMORY="8GB"
+        MEMORY="16GB"
         PROFILE="prod"
         ;;
     subset)

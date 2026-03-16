@@ -29,6 +29,26 @@ nextflow run main.nf --input "sample.jsonl" --outdir "results/"
 
 ```
 
+#### Execution in SLURM
+SSH to SLURM login node
+
+```
+ssh codon-slurm-login
+```
+
+Clone the repository
+
+```
+git clone https://github.com/ebi-uniprot/uniprot-parquet.git
+cd uniprot-parquet
+```
+
+Run the sbatch script
+
+```
+sbatch slurm.batch
+```
+
 ## Architecture
 
 Nextflow parallelizes the workload while DuckDB handles schema inference and Parquet generation.
