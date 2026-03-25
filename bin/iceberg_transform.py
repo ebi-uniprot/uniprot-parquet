@@ -222,6 +222,59 @@ ORDER BY sub.reviewed, sub.taxid
 """
 
 
+XREFS_SQL = """
+SELECT
+    sub.acc,
+    sub.reviewed,
+    sub.taxid,
+
+    unnest.database                                 AS database,
+    unnest.id                                       AS id,
+    unnest.properties                               AS properties
+
+FROM (
+    SELECT
+        e.primaryAccession                           AS acc,
+        CASE WHEN e.entryType LIKE '%Swiss-Prot%'
+             THEN true ELSE false END                AS reviewed,
+        e.organism.taxonId                           AS taxid,
+        e.uniProtKBCrossReferences
+    FROM {read_clause} e
+    WHERE e.uniProtKBCrossReferences IS NOT NULL
+      AND len(e.uniProtKBCrossReferences) > 0
+) sub, LATERAL unnest(sub.uniProtKBCrossReferences)
+ORDER BY sub.reviewed, sub.taxid, unnest.database
+"""
+
+
+COMMENTS_SQL = """
+SELECT
+    sub.acc,
+    sub.reviewed,
+    sub.taxid,
+
+    unnest.commentType                              AS comment_type,
+    -- Extract text value from the common texts[] array (most comment types)
+    CASE WHEN unnest.texts IS NOT NULL AND len(unnest.texts) > 0
+         THEN unnest.texts[1].value
+         ELSE NULL END                              AS text_value,
+    -- Full comment structure for complex/polymorphic types
+    unnest                                          AS comment
+
+FROM (
+    SELECT
+        e.primaryAccession                           AS acc,
+        CASE WHEN e.entryType LIKE '%Swiss-Prot%'
+             THEN true ELSE false END                AS reviewed,
+        e.organism.taxonId                           AS taxid,
+        e.comments
+    FROM {read_clause} e
+    WHERE e.comments IS NOT NULL AND len(e.comments) > 0
+) sub, LATERAL unnest(sub.comments)
+ORDER BY sub.reviewed, sub.taxid, unnest.commentType
+"""
+
+
 SORTED_JSONL_SQL = """
 SELECT *
 FROM {read_clause} e
@@ -417,6 +470,18 @@ def write_features(con, read_clause, table, batch_size):
     return stream_to_iceberg(con, sql, table, batch_size, label="features")
 
 
+def write_xrefs(con, read_clause, table, batch_size):
+    """Stream xrefs from DuckDB → Iceberg xrefs table."""
+    sql = XREFS_SQL.format(read_clause=read_clause)
+    return stream_to_iceberg(con, sql, table, batch_size, label="xrefs")
+
+
+def write_comments(con, read_clause, table, batch_size):
+    """Stream comments from DuckDB → Iceberg comments table."""
+    sql = COMMENTS_SQL.format(read_clause=read_clause)
+    return stream_to_iceberg(con, sql, table, batch_size, label="comments")
+
+
 def write_sorted_jsonl(con, read_clause, output_path):
     """Write a taxid-sorted JSONL.zst file using DuckDB's native COPY.
 
@@ -503,37 +568,50 @@ def main():
     features_schema = infer_iceberg_schema(
         con, FEATURES_SQL.format(read_clause=read_clause), "features"
     )
+    xrefs_schema = infer_iceberg_schema(
+        con, XREFS_SQL.format(read_clause=read_clause), "xrefs"
+    )
+    comments_schema = infer_iceberg_schema(
+        con, COMMENTS_SQL.format(read_clause=read_clause), "comments"
+    )
 
     entries_sort = _sort_order_for(entries_schema, "reviewed", "taxid")
     features_sort = _sort_order_for(features_schema, "reviewed", "taxid")
+    xrefs_sort = _sort_order_for(xrefs_schema, "reviewed", "taxid", "database")
+    comments_sort = _sort_order_for(comments_schema, "reviewed", "taxid", "comment_type")
 
     # ── Init Iceberg catalog ──
     catalog = get_catalog(args.catalog_uri, warehouse)
-    entries_table = ensure_table(
-        catalog, args.namespace, "entries",
-        entries_schema, entries_sort,
-    )
-    features_table = ensure_table(
-        catalog, args.namespace, "features",
-        features_schema, features_sort,
-    )
+    tables = {}
+    for name, schema, sort in [
+        ("entries", entries_schema, entries_sort),
+        ("features", features_schema, features_sort),
+        ("xrefs", xrefs_schema, xrefs_sort),
+        ("comments", comments_schema, comments_sort),
+    ]:
+        tables[name] = ensure_table(catalog, args.namespace, name, schema, sort)
 
     # Tag release as a table property if provided
     if args.release:
-        with entries_table.transaction() as txn:
-            txn.set_properties({"uniprot.release": args.release})
-        with features_table.transaction() as txn:
-            txn.set_properties({"uniprot.release": args.release})
+        for tbl in tables.values():
+            with tbl.transaction() as txn:
+                txn.set_properties({"uniprot.release": args.release})
         eprint(f"  Tagged tables with release={args.release}")
 
-    # ── Write entries ──
-    eprint("\n--- ENTRIES ---")
+    # ── Write tables ──
     t_total = time.time()
-    n_entries = write_entries(con, read_clause, entries_table, args.batch_size)
 
-    # ── Write features ──
+    eprint("\n--- ENTRIES ---")
+    n_entries = write_entries(con, read_clause, tables["entries"], args.batch_size)
+
     eprint("\n--- FEATURES ---")
-    n_features = write_features(con, read_clause, features_table, args.batch_size)
+    n_features = write_features(con, read_clause, tables["features"], args.batch_size)
+
+    eprint("\n--- XREFS ---")
+    n_xrefs = write_xrefs(con, read_clause, tables["xrefs"], args.batch_size)
+
+    eprint("\n--- COMMENTS ---")
+    n_comments = write_comments(con, read_clause, tables["comments"], args.batch_size)
 
     # ── Sorted JSONL (optional) ──
     if args.sorted_jsonl:
@@ -541,7 +619,7 @@ def main():
         write_sorted_jsonl(con, read_clause, args.sorted_jsonl)
 
     # ── Write version-hint.text for DuckDB iceberg_scan compatibility ──
-    for tbl_name, tbl in [("entries", entries_table), ("features", features_table)]:
+    for tbl_name, tbl in tables.items():
         _write_version_hint(tbl)
         eprint(f"  wrote version-hint.text for {tbl_name}")
 
@@ -551,10 +629,11 @@ def main():
     eprint(f"DONE in {elapsed:.1f}s")
     eprint(f"  entries:  {n_entries:,} rows")
     eprint(f"  features: {n_features:,} rows")
+    eprint(f"  xrefs:    {n_xrefs:,} rows")
+    eprint(f"  comments: {n_comments:,} rows")
 
-    # Print snapshot info
-    eprint(f"\n  entries snapshot:  {entries_table.current_snapshot()}")
-    eprint(f"  features snapshot: {features_table.current_snapshot()}")
+    for name, tbl in tables.items():
+        eprint(f"  {name} snapshot: {tbl.current_snapshot()}")
     eprint("=" * 60)
 
 

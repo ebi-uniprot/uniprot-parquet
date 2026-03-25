@@ -47,6 +47,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from iceberg_transform import (
     ENTRIES_SQL,
     FEATURES_SQL,
+    XREFS_SQL,
+    COMMENTS_SQL,
     build_read_clause,
     init_duckdb,
 )
@@ -243,6 +245,20 @@ def main():
     features_schema = arrow_schema_to_dict(features_batch.schema)
     eprint(f"  features: {len(features_schema['columns'])} columns")
 
+    xrefs_sql = XREFS_SQL.format(read_clause=read_clause)
+    reader = con.sql(xrefs_sql).to_arrow_reader(batch_size=1)
+    xrefs_batch = next(reader)
+    del reader
+    xrefs_schema = arrow_schema_to_dict(xrefs_batch.schema)
+    eprint(f"  xrefs: {len(xrefs_schema['columns'])} columns")
+
+    comments_sql = COMMENTS_SQL.format(read_clause=read_clause)
+    reader = con.sql(comments_sql).to_arrow_reader(batch_size=1)
+    comments_batch = next(reader)
+    del reader
+    comments_schema = arrow_schema_to_dict(comments_batch.schema)
+    eprint(f"  comments: {len(comments_schema['columns'])} columns")
+
     elapsed = time.time() - t0
     eprint(f"  Inferred in {elapsed:.1f}s")
 
@@ -251,6 +267,8 @@ def main():
         "release": args.release,
         "entries": entries_schema,
         "features": features_schema,
+        "xrefs": xrefs_schema,
+        "comments": comments_schema,
     }
 
     new_path = os.path.join(schema_dir, f"{args.release}.json")

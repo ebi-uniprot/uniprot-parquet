@@ -33,6 +33,16 @@ def features_table(catalog):
     return catalog.load_table("uniprot.features")
 
 
+@pytest.fixture(scope="session")
+def xrefs_table(catalog):
+    return catalog.load_table("uniprot.xrefs")
+
+
+@pytest.fixture(scope="session")
+def comments_table(catalog):
+    return catalog.load_table("uniprot.comments")
+
+
 # ─── Row counts ──────────────────────────────────────────────────────
 
 
@@ -66,6 +76,52 @@ class TestRowCounts:
         )
         assert fc_sum == features_count
 
+    def test_xrefs_count_positive(self, xrefs_table):
+        snapshot = xrefs_table.current_snapshot()
+        assert snapshot is not None
+        count = int(snapshot.summary["total-records"])
+        assert count > 0, "Expected xrefs rows"
+
+    def test_xrefs_count_consistency(self, entries_table, xrefs_table):
+        """sum(entries.xref_count) should equal xrefs row count."""
+        import pyarrow.compute as pc
+
+        xref_sum = 0
+        for batch in entries_table.scan(
+            selected_fields=("xref_count",)
+        ).to_arrow_batch_reader():
+            s = pc.sum(batch.column("xref_count")).as_py()
+            if s is not None:
+                xref_sum += s
+
+        xrefs_count = int(
+            xrefs_table.current_snapshot().summary["total-records"]
+        )
+        assert xref_sum == xrefs_count
+
+    def test_comments_count_positive(self, comments_table):
+        snapshot = comments_table.current_snapshot()
+        assert snapshot is not None
+        count = int(snapshot.summary["total-records"])
+        assert count > 0, "Expected comments rows"
+
+    def test_comments_count_consistency(self, entries_table, comments_table):
+        """sum(entries.comment_count) should equal comments row count."""
+        import pyarrow.compute as pc
+
+        comment_sum = 0
+        for batch in entries_table.scan(
+            selected_fields=("comment_count",)
+        ).to_arrow_batch_reader():
+            s = pc.sum(batch.column("comment_count")).as_py()
+            if s is not None:
+                comment_sum += s
+
+        comments_count = int(
+            comments_table.current_snapshot().summary["total-records"]
+        )
+        assert comment_sum == comments_count
+
 
 # ─── Single snapshot per table ───────────────────────────────────────
 
@@ -97,6 +153,26 @@ class TestSnapshots:
             f"Expected 1 append snapshot, got {len(append_snapshots)}"
         )
 
+    def test_xrefs_single_snapshot(self, xrefs_table):
+        from pyiceberg.table.snapshots import Operation
+
+        snapshots = list(xrefs_table.metadata.snapshots)
+        append_snapshots = [
+            s for s in snapshots
+            if s.summary and s.summary.operation == Operation.APPEND
+        ]
+        assert len(append_snapshots) == 1
+
+    def test_comments_single_snapshot(self, comments_table):
+        from pyiceberg.table.snapshots import Operation
+
+        snapshots = list(comments_table.metadata.snapshots)
+        append_snapshots = [
+            s for s in snapshots
+            if s.summary and s.summary.operation == Operation.APPEND
+        ]
+        assert len(append_snapshots) == 1
+
 
 # ─── Schema checks ──────────────────────────────────────────────────
 
@@ -120,6 +196,20 @@ class TestSchema:
             "acc", "reviewed", "taxid", "organism_name", "seq_length",
             "type", "start_pos", "end_pos", "description",
         }
+        missing = required - names
+        assert not missing, f"Missing columns: {missing}"
+
+    def test_xrefs_required_columns(self, xrefs_table):
+        schema = xrefs_table.schema()
+        names = {f.name for f in schema.fields}
+        required = {"acc", "reviewed", "taxid", "database", "id", "properties"}
+        missing = required - names
+        assert not missing, f"Missing columns: {missing}"
+
+    def test_comments_required_columns(self, comments_table):
+        schema = comments_table.schema()
+        names = {f.name for f in schema.fields}
+        required = {"acc", "reviewed", "taxid", "comment_type", "text_value", "comment"}
         missing = required - names
         assert not missing, f"Missing columns: {missing}"
 
@@ -155,6 +245,18 @@ class TestDataIntegrity:
         arrow = features_table.scan(selected_fields=("type",)).to_arrow()
         assert arrow.column("type").null_count == 0
 
+    def test_xrefs_have_database(self, xrefs_table):
+        arrow = xrefs_table.scan(selected_fields=("database",)).to_arrow()
+        assert arrow.column("database").null_count == 0
+
+    def test_xrefs_have_id(self, xrefs_table):
+        arrow = xrefs_table.scan(selected_fields=("id",)).to_arrow()
+        assert arrow.column("id").null_count == 0
+
+    def test_comments_have_type(self, comments_table):
+        arrow = comments_table.scan(selected_fields=("comment_type",)).to_arrow()
+        assert arrow.column("comment_type").null_count == 0
+
     def test_sample_accession_present(self, entries_table):
         """Check that a known accession from small.json.gz is in the table."""
         arrow = entries_table.scan(selected_fields=("acc",)).to_arrow()
@@ -165,7 +267,7 @@ class TestDataIntegrity:
         assert entries_table.properties.get("uniprot.release") == "test_2026"
 
 
-# ─── Sorted by taxid ────────────────────────────────────────────────
+# ─── Sorted by reviewed, taxid ─────────────────────────────────────
 
 
 class TestSortOrder:
@@ -179,3 +281,13 @@ class TestSortOrder:
         arrow = features_table.scan(selected_fields=("taxid",)).to_arrow()
         taxids = arrow.column("taxid").to_pylist()
         assert taxids == sorted(taxids), "Features not sorted by taxid"
+
+    def test_xrefs_sorted_by_taxid(self, xrefs_table):
+        arrow = xrefs_table.scan(selected_fields=("taxid",)).to_arrow()
+        taxids = arrow.column("taxid").to_pylist()
+        assert taxids == sorted(taxids), "Xrefs not sorted by taxid"
+
+    def test_comments_sorted_by_taxid(self, comments_table):
+        arrow = comments_table.scan(selected_fields=("taxid",)).to_arrow()
+        taxids = arrow.column("taxid").to_pylist()
+        assert taxids == sorted(taxids), "Comments not sorted by taxid"

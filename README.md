@@ -4,14 +4,16 @@ Pipeline to transform UniProtKB JSON dumps into an Apache Iceberg data lake usin
 
 ## What it produces
 
-| Output                        | Description                                                                    |
-| ----------------------------- | ------------------------------------------------------------------------------ |
-| `warehouse/uniprot/entries/`  | Iceberg table — one row per protein, sorted by `reviewed`, `taxid`             |
-| `warehouse/uniprot/features/` | Iceberg table — one row per positional feature, sorted by `reviewed`, `taxid`  |
-| `catalog.db`                  | SQLite Iceberg catalog                                                         |
-| `uniprot.jsonl.zst`           | Taxid-sorted JSONL archive (for downstream consumers)                          |
+| Output                         | Description                                                                   |
+| ------------------------------ | ----------------------------------------------------------------------------- |
+| `warehouse/uniprot/entries/`   | Iceberg table — one row per protein                                           |
+| `warehouse/uniprot/features/`  | Iceberg table — one row per positional feature                                |
+| `warehouse/uniprot/xrefs/`     | Iceberg table — one row per cross-reference                                   |
+| `warehouse/uniprot/comments/`  | Iceberg table — one row per comment annotation                                |
+| `catalog.db`                   | SQLite Iceberg catalog                                                        |
+| `uniprot.jsonl.zst`            | Taxid-sorted JSONL archive (for downstream consumers)                         |
 
-No Hive partitioning — Iceberg handles data skipping via per-file column statistics. Data is sorted by `reviewed` then `taxid`, so queries filtering on either skip most data files automatically.
+All tables are sorted by `reviewed` then `taxid`. Iceberg handles data skipping via per-file column statistics — queries filtering on either column skip most data files automatically. No Hive partitioning needed.
 
 ## Setup
 
@@ -71,9 +73,11 @@ The Iceberg schema is inferred at runtime from DuckDB's Arrow output — there i
 
 ## Schema
 
-Two tables, both sorted by `reviewed` (Swiss-Prot vs TrEMBL) then `taxid`:
+We adopt a denormalized-first design, prioritizing query simplicity for the typical bioinformatics user. Parquet's columnar storage mitigates any read-amplification cost — if a query touches 5 of 30+ columns, only those 5 are read from disk. Supplementary normalized tables (features, xrefs, comments) are provided for high-cardinality relationships that would make the main table unwieldy as arrays.
 
-**entries** — one row per protein, 30+ top-level columns for fast filtering plus full nested structures (zero cost if not selected, thanks to Parquet column pruning):
+All four tables are sorted by `reviewed` (Swiss-Prot vs TrEMBL) then `taxid`, and all include denormalized entry-level fields (`acc`, `reviewed`, `taxid`) so most queries don't need joins.
+
+**entries** — one row per protein, the primary table for 90% of use cases:
 
 - Identity: `acc`, `id`, `reviewed`, `secondary_accs`
 - Organism: `taxid`, `organism_name`, `organism_common`, `lineage`
@@ -83,11 +87,22 @@ Two tables, both sorted by `reviewed` (Swiss-Prot vs TrEMBL) then `taxid`:
 - Versioning: `first_public`, `last_modified`, `entry_version`, `seq_version`
 - Nested: `organism`, `protein_desc`, `genes`, `keywords`, `comments`, `xrefs`, `references`, `features`
 
-**features** — one row per positional annotation, denormalized with entry-level fields so most feature queries don't need joins:
+**features** — one row per positional annotation:
 
 - `acc`, `reviewed`, `taxid`, `organism_name`, `seq_length`
 - `type`, `start_pos`, `end_pos`, `description`, `feature_id`
 - `evidence_codes`, `ligand_name`, `ligand_id`
+
+**xrefs** — one row per cross-reference:
+
+- `acc`, `reviewed`, `taxid`
+- `database`, `id`, `properties`
+
+**comments** — one row per comment annotation:
+
+- `acc`, `reviewed`, `taxid`
+- `comment_type`, `text_value` (extracted from common texts array)
+- `comment` (full nested structure for polymorphic comment types)
 
 ## Querying
 
@@ -102,6 +117,8 @@ con.load_extension("iceberg")
 base = 'datalake/uniprot_lake_test_med/warehouse/uniprot'
 con.sql(f"CREATE VIEW entries AS SELECT * FROM iceberg_scan('{base}/entries')")
 con.sql(f"CREATE VIEW features AS SELECT * FROM iceberg_scan('{base}/features')")
+con.sql(f"CREATE VIEW xrefs AS SELECT * FROM iceberg_scan('{base}/xrefs')")
+con.sql(f"CREATE VIEW comments AS SELECT * FROM iceberg_scan('{base}/comments')")
 
 # All human kinases
 con.sql("""
@@ -116,6 +133,22 @@ con.sql("""
     SELECT acc, type, start_pos, end_pos, description
     FROM features
     WHERE taxid = 9606 AND type = 'Domain'
+""").show()
+
+# Proteins with both PDB and AlphaFold structures
+con.sql("""
+    SELECT acc, database, id
+    FROM xrefs
+    WHERE database IN ('PDB', 'AlphaFoldDB')
+      AND taxid = 9606
+""").show()
+
+# Function annotations for human proteins
+con.sql("""
+    SELECT acc, text_value
+    FROM comments
+    WHERE comment_type = 'FUNCTION'
+      AND taxid = 9606
 """).show()
 
 # Reviewed vs unreviewed counts
