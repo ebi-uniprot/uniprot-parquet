@@ -1,2 +1,5 @@
-polars
-PyYAML
+duckdb>=1.1
+pyiceberg[pyarrow,sql-sqlite]>=0.7
+pyarrow>=14.0
+orjson>=3.9
+ijson>=3.2

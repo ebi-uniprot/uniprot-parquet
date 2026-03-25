@@ -3,15 +3,14 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
-  - openjdk=17 # Required for Nextflow
-  - nextflow # The orchestrator
-  - duckdb # The Parquet engine
-  - duckdb-cli
-  - python=3.14 # For your Polars/DuckDB demo scripts
-  - polars # For the lazy evaluation demo
-  - PyYAML
-  - ijson # Streaming JSON parser for large files
-  - zstandard # Zstd compression for JSONL chunks
-  - notebook
-  - pandas
-  - pyarrow
+  - openjdk=17          # Required for Nextflow
+  - nextflow            # Pipeline orchestration
+  - python>=3.11
+  - duckdb              # JSON/Parquet transformation engine
+  - pyarrow             # Arrow IPC between DuckDB and PyIceberg
+  - pip
+  - pip:
+      - pyiceberg[pyarrow,sql-sqlite]  # Iceberg table format + SQLite catalog
+      - duckdb                          # Python bindings
+      - orjson                          # Fast JSON serialisation for sorted JSONL
+      - ijson                           # Streaming JSON parser

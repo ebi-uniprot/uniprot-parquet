@@ -1,26 +1,22 @@
-install.sh
-logs/
+# Nextflow
 .nextflow/
 .nextflow.log*
 work/
+
+# Pipeline outputs
 results/
-test_results/
-
 datalake/
-
+warehouse/
+catalog.db
 *.parquet
 *.jsonl
 *.jsonl.zst
-uniprot_lake/
+
+# Test data (keep test_json/small.json.gz, ignore large files)
 test_json/med.json.gz
+test_results/
 
-env/
-.mamba/
-micromamba/
-lib/
-include/
-share/
-
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -28,6 +24,19 @@ __pycache__/
 venv/
 ENV/
 
+# Conda / micromamba
+env/
+.mamba/
+micromamba/
+lib/
+include/
+share/
+
+# Editors / OS
 .DS_Store
 .vscode/
 .ipynb_checkpoints/
+
+# Misc
+install.sh
+logs/
