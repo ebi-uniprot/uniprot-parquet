@@ -85,7 +85,7 @@ All four tables are sorted by `reviewed` (Swiss-Prot vs TrEMBL) then `taxid`, an
 - Sequence: `sequence`, `seq_length`, `seq_mass`, `seq_md5`, `seq_crc64`
 - Shortcuts: `go_ids`, `xref_dbs`, `keyword_ids`, `keyword_names`
 - Versioning: `first_public`, `last_modified`, `entry_version`, `seq_version`
-- Nested: `organism`, `protein_desc`, `genes`, `keywords`, `comments`, `xrefs`, `references`, `features`
+- Nested: `organism`, `protein_desc`, `genes`, `keywords`, `references`, `organism_hosts`, `gene_locations`
 
 **features** — one row per positional annotation:
 

@@ -46,7 +46,7 @@ case "$MODE" in
     prod)
         INPUTFILE="UniProtKB.json.gz"
         OUTDIR="$(pwd)/datalake"
-        MEMORY="16GB"
+        MEMORY="96GB"
         PROFILE="prod"
         ;;
     *)

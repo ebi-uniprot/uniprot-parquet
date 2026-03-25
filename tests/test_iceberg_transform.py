@@ -184,7 +184,7 @@ class TestSchema:
         required = {
             "acc", "id", "reviewed", "taxid", "organism_name", "gene_name",
             "protein_name", "sequence", "seq_length", "go_ids", "xref_dbs",
-            "feature_count", "features", "comments", "xrefs",
+            "feature_count", "xref_count", "comment_count",
         }
         missing = required - names
         assert not missing, f"Missing columns: {missing}"

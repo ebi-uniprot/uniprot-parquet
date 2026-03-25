@@ -161,14 +161,12 @@ SELECT
     e.extraAttributes.uniParcId                     AS uniparc_id,
 
     -- Full nested structures (preserved for power users)
+    -- features, xrefs, and comments are in their own tables
     e.organism                                      AS organism,
     e.proteinDescription                            AS protein_desc,
     e.genes                                         AS genes,
     e.keywords                                      AS keywords,
-    e.comments                                      AS comments,
-    e.uniProtKBCrossReferences                      AS xrefs,
     e.references                                    AS "references",
-    e.features                                      AS features,
     e.organismHosts                                 AS organism_hosts,
     e.geneLocations                                 AS gene_locations
 

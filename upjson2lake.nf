@@ -26,7 +26,7 @@ nextflow.enable.dsl = 2
 params.inputfile      = "${projectDir}/entries_test.json"
 params.outdir         = "${projectDir}/results/uniprot_lake"
 params.release        = "2026_01"
-params.memory_limit   = '16GB'    // DuckDB memory limit
+params.memory_limit   = '96GB'    // DuckDB memory limit (passed via --memory_limit)
 params.schema         = "${projectDir}/schema.json"
 params.schema_dir     = "${projectDir}/schemas"
 
@@ -108,7 +108,7 @@ process SCHEMA_CHECK {
 process ICEBERG_TRANSFORM {
     tag 'transform'
     cpus 4
-    memory '16 GB'
+    memory "${params.memory_limit.replace('GB', ' GB')}"
     time '48h'
 
     publishDir "${params.outdir}", mode: 'copy', pattern: 'warehouse'
