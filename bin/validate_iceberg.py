@@ -4,14 +4,16 @@ Validate the UniProtKB Iceberg data lake.
 
 Checks:
   - Both tables exist and are readable
-  - Row counts for entries and features
+  - Row counts from snapshot metadata (no full scan needed)
   - Snapshot metadata (snapshot ID, timestamp, summary)
   - entries.feature_count sum ≈ features row count
   - Data files: count, total size, largest file
   - Sample queries to verify data integrity
+  - Reviewed/unreviewed split
 
 Usage:
     validate_iceberg.py --catalog-uri sqlite:///catalog.db \
+        --warehouse /path/to/warehouse \
         [--namespace uniprot] [-o validation_report.txt]
 """
 
@@ -33,6 +35,10 @@ def main():
         "--catalog-uri", required=True,
         help="SQLite catalog URI (e.g. sqlite:///catalog.db)",
     )
+    parser.add_argument(
+        "--warehouse", required=True,
+        help="Iceberg warehouse directory",
+    )
     parser.add_argument("--namespace", default="uniprot", help="Iceberg namespace")
     parser.add_argument("-o", "--output", default="validation_report.txt", help="Output report file")
     args = parser.parse_args()
@@ -52,9 +58,10 @@ def main():
     try:
         catalog = SqlCatalog(
             "uniprot",
-            **{"uri": args.catalog_uri, "warehouse": "."},
+            **{"uri": args.catalog_uri, "warehouse": args.warehouse},
         )
-        log(f"\nCatalog: {args.catalog_uri}")
+        log(f"\nCatalog:   {args.catalog_uri}")
+        log(f"Warehouse: {args.warehouse}")
     except Exception as e:
         log(f"\nERROR: Cannot connect to catalog: {e}")
         with open(args.output, "w") as f:
@@ -73,7 +80,7 @@ def main():
             log(f"  ERROR: Cannot load table '{full_name}': {e}")
             continue
 
-        # Snapshot info
+        # Snapshot info + row count from metadata (no scan needed)
         snapshot = table.current_snapshot()
         if snapshot:
             log(f"  Snapshot ID:  {snapshot.snapshot_id}")
@@ -82,21 +89,17 @@ def main():
             )
             log(f"  Timestamp:    {ts.isoformat()}")
             if snapshot.summary:
-                for k, v in snapshot.summary.items():
+                summary_dict = snapshot.summary.ser_model()
+                for k, v in summary_dict.items():
                     log(f"  {k}: {v}")
+                # Use total-records from snapshot summary instead of full scan
+                total_records = summary_dict.get("total-records")
+                if total_records is not None:
+                    count = int(total_records)
+                    table_counts[table_name] = count
+                    log(f"  Row count (from metadata): {count:,}")
         else:
             log("  No snapshots (empty table)")
-
-        # Row count via scan
-        try:
-            t0 = time.time()
-            scan = table.scan()
-            arrow_table = scan.to_arrow()
-            count = arrow_table.num_rows
-            table_counts[table_name] = count
-            log(f"  Row count:    {count:,} (scanned in {time.time()-t0:.1f}s)")
-        except Exception as e:
-            log(f"  ERROR scanning: {e}")
 
         # Data file stats
         try:
@@ -128,21 +131,27 @@ def main():
         log(f"  features/entry ratio: {ratio:.1f}")
 
         # Check feature_count sum vs features table rows
+        # Only scan the single integer column — bounded memory
         try:
             entries_table = catalog.load_table(f"{args.namespace}.entries")
-            fc_scan = entries_table.scan(selected_fields=("feature_count",))
-            fc_arrow = fc_scan.to_arrow()
-            fc_col = fc_arrow.column("feature_count")
             import pyarrow.compute as pc
-            fc_sum = pc.sum(fc_col).as_py()
-            if fc_sum is not None:
-                log(f"  sum(entries.feature_count): {fc_sum:,}")
-                match = fc_sum == table_counts["features"]
-                log(f"  matches features rows: {'YES' if match else 'MISMATCH!'}")
+
+            fc_sum = 0
+            for batch in entries_table.scan(
+                selected_fields=("feature_count",)
+            ).to_arrow_batch_reader():
+                col = batch.column("feature_count")
+                batch_sum = pc.sum(col).as_py()
+                if batch_sum is not None:
+                    fc_sum += batch_sum
+
+            log(f"  sum(entries.feature_count): {fc_sum:,}")
+            match = fc_sum == table_counts["features"]
+            log(f"  matches features rows: {'YES' if match else 'MISMATCH!'}")
         except Exception as e:
             log(f"  (Could not verify feature_count: {e})")
 
-    # Sample data check
+    # Sample data check (bounded — limit=3)
     log(f"\n--- SAMPLE DATA ---")
     for table_name in ["entries", "features"]:
         full_name = f"{args.namespace}.{table_name}"
@@ -154,14 +163,21 @@ def main():
         except Exception as e:
             log(f"  {table_name}: ERROR sampling: {e}")
 
-    # Reviewed/unreviewed split
+    # Reviewed/unreviewed split — stream in batches to avoid OOM
     log(f"\n--- REVIEWED SPLIT ---")
     try:
         entries_table = catalog.load_table(f"{args.namespace}.entries")
-        arrow = entries_table.scan(selected_fields=("reviewed",)).to_arrow()
         import pyarrow.compute as pc
-        reviewed_count = pc.sum(pc.cast(arrow.column("reviewed"), "int64")).as_py()
-        total = arrow.num_rows
+
+        reviewed_count = 0
+        total = 0
+        for batch in entries_table.scan(
+            selected_fields=("reviewed",)
+        ).to_arrow_batch_reader():
+            col = batch.column("reviewed")
+            total += len(col)
+            reviewed_count += pc.sum(pc.cast(col, "int64")).as_py()
+
         log(f"  Reviewed (Swiss-Prot): {reviewed_count:,}")
         log(f"  Unreviewed (TrEMBL):  {total - reviewed_count:,}")
     except Exception as e:

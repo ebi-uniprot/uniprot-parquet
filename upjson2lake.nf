@@ -1,8 +1,6 @@
 #!/usr/bin/env nextflow
 
-// Tue 17 Mar 2026 - v4.0: Apache Iceberg data lake
-//
-// Pipeline: UniProtKB JSON → JSONL.zst + Iceberg tables (entries + features)
+// UniProtKB JSON → JSONL.zst + Iceberg tables (entries + features)
 //
 // Produces:
 //   <outdir>/uniprot.jsonl.zst              (taxid-sorted JSONL archive)
@@ -10,13 +8,15 @@
 //   <outdir>/warehouse/uniprot/features/     (Iceberg table: one row per feature)
 //   <outdir>/catalog.db                      (SQLite Iceberg catalog)
 //   <outdir>/validation_report.txt           (row counts, snapshot IDs)
+//   <outdir>/schemas/<release>.json          (post-transform schema snapshot)
 //
 // Architecture:
 //   1. Stream JSON(.gz) → single zstd-compressed JSONL
-//   2. Transform JSONL → Iceberg tables via DuckDB + PyIceberg
-//   3. Validate row counts + snapshot consistency
+//   2. Schema check — infer post-transform schema, diff against previous release
+//   3. Transform JSONL → Iceberg tables via DuckDB + PyIceberg
+//   4. Validate row counts + snapshot consistency
 //
-// Schema: defined in bin/iceberg_schema.py (PyIceberg types)
+// The Iceberg schema is inferred from the data (no hand-maintained schema file).
 // No partitioning — Iceberg handles data skipping via per-file column statistics.
 // Both tables sorted by taxid for organism-level query locality.
 
@@ -28,12 +28,13 @@ params.outdir         = "${projectDir}/results/uniprot_lake"
 params.release        = "2026_01"
 params.memory_limit   = '16GB'    // DuckDB memory limit
 params.schema         = "${projectDir}/schema.json"
+params.schema_dir     = "${projectDir}/schemas"
 
 /* ── SCRIPTS ──────────────────────────────────────────────────────── */
 stream_script        = "${projectDir}/bin/stream_jsonl.py"
+schema_check_script  = "${projectDir}/bin/schema_check.py"
 transform_script     = "${projectDir}/bin/iceberg_transform.py"
 validate_script      = "${projectDir}/bin/validate_iceberg.py"
-iceberg_schema_mod   = "${projectDir}/bin/iceberg_schema.py"
 
 
 /* ── PROCESS: Stream input to single zstd-compressed JSONL ────────── */
@@ -64,11 +65,50 @@ process STREAM_JSONL {
 }
 
 
+/* ── PROCESS: Pre-flight schema check ─────────────────────────────── */
+process SCHEMA_CHECK {
+    tag 'schema_check'
+    cpus 2
+    memory '8 GB'
+    time '2h'
+
+    publishDir "${params.outdir}", mode: 'copy', pattern: 'schemas/**'
+
+    input:
+    path jsonl
+    path duckdb_schema
+
+    output:
+    path "schemas/**", emit: schemas
+
+    script:
+    """
+    set -euo pipefail
+    echo " .-- SCHEMA_CHECK BEGUN \$(date)"
+
+    # Copy existing schemas into work dir so diff works
+    if [ -d "${params.schema_dir}" ]; then
+        cp -r ${params.schema_dir} schemas
+    else
+        mkdir -p schemas
+    fi
+
+    python3 ${schema_check_script} ${jsonl} \
+        --release ${params.release} \
+        --schema-dir schemas/ \
+        --duckdb-schema ${duckdb_schema} \
+        --memory-limit ${params.memory_limit}
+
+    echo " '-- SCHEMA_CHECK ENDED \$(date)"
+    """
+}
+
+
 /* ── PROCESS: Transform JSONL → Iceberg tables ────────────────────── */
 process ICEBERG_TRANSFORM {
     tag 'transform'
     cpus 4
-    memory '20 GB'
+    memory '16 GB'
     time '48h'
 
     publishDir "${params.outdir}", mode: 'copy', pattern: 'warehouse/**'
@@ -77,12 +117,11 @@ process ICEBERG_TRANSFORM {
 
     input:
     path jsonl
-    path schema
-    path iceberg_schema
+    path duckdb_schema
 
     output:
-    path "warehouse/**",     emit: warehouse
-    path "catalog.db",       emit: catalog
+    path "warehouse/**",      emit: warehouse
+    path "catalog.db",        emit: catalog
     path "uniprot.jsonl.zst", emit: jsonl
 
     script:
@@ -90,11 +129,8 @@ process ICEBERG_TRANSFORM {
     set -euo pipefail
     echo " .-- ICEBERG_TRANSFORM BEGUN \$(date)"
 
-    # Make iceberg_schema importable
-    export PYTHONPATH=\$(dirname ${iceberg_schema}):\$PYTHONPATH
-
     python3 ${transform_script} ${jsonl} \
-        --schema ${schema} \
+        --schema ${duckdb_schema} \
         --catalog-uri sqlite:///catalog.db \
         --warehouse ./warehouse \
         --namespace uniprot \
@@ -118,7 +154,6 @@ process VALIDATE {
     input:
     path warehouse
     path catalog
-    path iceberg_schema
 
     output:
     path "validation_report.txt", emit: report
@@ -126,10 +161,10 @@ process VALIDATE {
     script:
     """
     set -euo pipefail
-    export PYTHONPATH=\$(dirname ${iceberg_schema}):\$PYTHONPATH
 
     python3 ${validate_script} \
         --catalog-uri sqlite:///${catalog} \
+        --warehouse . \
         --namespace uniprot \
         -o validation_report.txt
     """
@@ -140,7 +175,7 @@ process VALIDATE {
 workflow {
     log.info """
     ╔═══════════════════════════════════════════════════════════╗
-    ║  UniProtKB → Iceberg Data Lake  v4.0                      ║
+    ║  UniProtKB → Iceberg Data Lake                            ║
     ║  Release: ${params.release}                               ║
     ╚═══════════════════════════════════════════════════════════╝
     Input:      ${params.inputfile}
@@ -156,24 +191,24 @@ workflow {
         System.exit(2)
     }
 
-    schema_ch         = Channel.fromPath(params.schema)
-    iceberg_schema_ch = Channel.fromPath(iceberg_schema_mod)
+    schema_ch = Channel.fromPath(params.schema)
 
     // 1. Stream input → single zstd-compressed JSONL
     input_ch = Channel.fromPath(params.inputfile)
     STREAM_JSONL(input_ch)
 
-    // 2. Transform → Iceberg tables (DuckDB reads + PyIceberg writes)
+    // 2. Schema check — infer + diff (fails on breaking changes)
+    SCHEMA_CHECK(STREAM_JSONL.out.jsonl, schema_ch)
+
+    // 3. Transform → Iceberg tables (DuckDB reads + PyIceberg writes)
     ICEBERG_TRANSFORM(
         STREAM_JSONL.out.jsonl,
         schema_ch,
-        iceberg_schema_ch,
     )
 
-    // 3. Validate the Iceberg lake
+    // 4. Validate the Iceberg lake
     VALIDATE(
         ICEBERG_TRANSFORM.out.warehouse,
         ICEBERG_TRANSFORM.out.catalog,
-        iceberg_schema_ch,
     )
 }

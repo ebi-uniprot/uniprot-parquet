@@ -5,11 +5,13 @@ Transform JSONL(.zst) → Apache Iceberg tables (entries + features).
 Architecture:
   - DuckDB reads the JSONL and performs all SQL transformations (flattening,
     unnesting, sorting) — it's purpose-built for this.
+  - The Iceberg schema is **inferred** from DuckDB's Arrow output on the first
+    batch, then applied to all subsequent batches.  No hand-maintained schema
+    file is needed.
   - DuckDB streams Arrow record batches (bounded memory, never materialises
     the full dataset).
-  - Batches are accumulated to a target size, then flushed to Iceberg via
-    PyIceberg's table.append().  Each flush creates a new data file in a
-    single Iceberg snapshot (committed at the end).
+  - PyIceberg writes each batch as a Parquet file, then registers all files
+    in a single atomic Iceberg snapshot.
 
 Memory model:
   At any moment we hold at most --batch-size rows in Arrow memory.  DuckDB
@@ -27,7 +29,7 @@ Usage:
         [--batch-size 1000000] \
         [--sorted-jsonl /path/to/sorted.jsonl.zst]
 
-Requires: duckdb, pyiceberg[pyarrow], pyarrow
+Requires: duckdb, pyiceberg[pyarrow,sql-sqlite], pyarrow
 """
 
 import os
@@ -38,20 +40,17 @@ import json
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.exceptions import (
     NamespaceAlreadyExistsError,
     TableAlreadyExistsError,
 )
-
-# Our schema definitions
-from iceberg_schema import (
-    ENTRIES_SCHEMA,
-    FEATURES_SCHEMA,
-    ENTRIES_SORT_ORDER,
-    FEATURES_SORT_ORDER,
-)
+from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
+from pyiceberg.schema import Schema, assign_fresh_schema_ids
+from pyiceberg.table.sorting import SortOrder, SortField
+from pyiceberg.transforms import IdentityTransform
 
 
 def eprint(*args, **kwargs):
@@ -86,8 +85,11 @@ def init_duckdb(memory_limit: str, threads: int | None) -> duckdb.DuckDBPyConnec
     con.sql(f"SET memory_limit='{memory_limit}'")
     if threads:
         con.sql(f"SET threads={threads}")
-    # Ensure temp directory uses local storage for spilling
-    con.sql("SET temp_directory='/tmp/duckdb_temp'")
+    # Use SLURM's $TMPDIR (local scratch) if available, else system default
+    temp_dir = os.environ.get("TMPDIR", "/tmp/duckdb_temp")
+    temp_dir = os.path.join(temp_dir, "duckdb_spill")
+    os.makedirs(temp_dir, exist_ok=True)
+    con.sql(f"SET temp_directory='{temp_dir}'")
     return con
 
 
@@ -163,7 +165,6 @@ SELECT
     e.proteinDescription                            AS protein_desc,
     e.genes                                         AS genes,
     e.keywords                                      AS keywords,
-    -- comments stored as MAP(VARCHAR, JSON)[] in source — cast to JSON string list
     e.comments                                      AS comments,
     e.uniProtKBCrossReferences                      AS xrefs,
     e.references                                    AS "references",
@@ -184,26 +185,26 @@ SELECT
     sub.organism_name,
     sub.seq_length,
 
-    f.type                                          AS type,
-    CAST(f.location.start.value AS INTEGER)         AS start_pos,
-    CAST(f.location.end.value AS INTEGER)           AS end_pos,
-    f.location.start.modifier                       AS start_modifier,
-    f.location.end.modifier                         AS end_modifier,
-    f.description                                   AS description,
-    f.featureId                                     AS feature_id,
+    unnest.type                                     AS type,
+    CAST(unnest.location.start.value AS INTEGER)    AS start_pos,
+    CAST(unnest.location.end.value AS INTEGER)      AS end_pos,
+    unnest.location.start.modifier                  AS start_modifier,
+    unnest.location.end.modifier                    AS end_modifier,
+    unnest.description                              AS description,
+    unnest.featureId                                AS feature_id,
 
     list_transform(
-        COALESCE(f.evidences, []),
+        COALESCE(unnest.evidences, []),
         x -> x.evidenceCode
     )                                               AS evidence_codes,
 
-    f.alternativeSequence.originalSequence           AS original_sequence,
-    f.alternativeSequence.alternativeSequences       AS alternative_sequences,
+    unnest.alternativeSequence.originalSequence      AS original_sequence,
+    unnest.alternativeSequence.alternativeSequences  AS alternative_sequences,
 
-    f.ligand.name                                   AS ligand_name,
-    f.ligand.id                                     AS ligand_id,
-    f.ligand.label                                  AS ligand_label,
-    f.ligand.note                                   AS ligand_note
+    unnest.ligand.name                              AS ligand_name,
+    unnest.ligand.id                                AS ligand_id,
+    unnest.ligand.label                             AS ligand_label,
+    unnest.ligand.note                              AS ligand_note
 
 FROM (
     SELECT
@@ -216,7 +217,7 @@ FROM (
         e.features
     FROM {read_clause} e
     WHERE e.features IS NOT NULL AND len(e.features) > 0
-) sub, LATERAL unnest(sub.features) AS f
+) sub, LATERAL unnest(sub.features)
 ORDER BY sub.taxid
 """
 
@@ -226,6 +227,42 @@ SELECT *
 FROM {read_clause} e
 ORDER BY e.organism.taxonId
 """
+
+
+# ─── Schema inference ────────────────────────────────────────────────────
+
+def infer_iceberg_schema(con, sql: str, label: str) -> Schema:
+    """Infer the Iceberg schema from a DuckDB SQL query.
+
+    Runs the query, reads the first batch to capture the Arrow schema
+    (which DuckDB fixes before yielding any rows), then returns the
+    corresponding Iceberg schema with auto-assigned field IDs.
+    """
+    eprint(f"  Inferring {label} schema from DuckDB...")
+    t0 = time.time()
+
+    result = con.sql(sql)
+    # Read a single small batch — we only need the schema, not the data.
+    # DuckDB resolves the full schema before the first row is yielded.
+    reader = result.to_arrow_reader(batch_size=1)
+    batch = next(reader)
+    # Close the reader to release DuckDB resources
+    del reader, result
+
+    raw_schema = _pyarrow_to_schema_without_ids(batch.schema)
+    # Assign unique, sequential field IDs (the raw schema has -1 for all)
+    iceberg_schema = assign_fresh_schema_ids(raw_schema)
+
+    eprint(f"    {len(iceberg_schema.fields)} columns inferred in {time.time()-t0:.1f}s")
+    return iceberg_schema
+
+
+def _sort_order_for(iceberg_schema: Schema, column_name: str) -> SortOrder:
+    """Build a SortOrder on the named column by looking up its field ID."""
+    field = iceberg_schema.find_field(column_name)
+    return SortOrder(
+        SortField(source_id=field.field_id, transform=IdentityTransform()),
+    )
 
 
 # ─── Iceberg catalog / table helpers ────────────────────────────────────
@@ -270,10 +307,15 @@ def stream_to_iceberg(con, sql, table, batch_size, label="table"):
     """Stream DuckDB result → Iceberg table in bounded-memory batches.
 
     DuckDB executes the query lazily and yields Arrow record batches of
-    `batch_size` rows.  We accumulate batches and flush to Iceberg once
-    we hit the target size.  This keeps Arrow memory bounded to roughly
-    one batch at a time (plus whatever DuckDB needs for the ORDER BY
-    spill).
+    `batch_size` rows.  Each batch is written as a Parquet file, then all
+    files are registered with Iceberg in a single atomic snapshot via
+    add_files().
+
+    The Arrow schema is determined once by DuckDB before the first batch
+    is yielded — all batches share the same schema.
+
+    Memory model: only one Arrow batch is held at a time (plus whatever
+    DuckDB needs for the ORDER BY spill).
 
     Returns the total number of rows written.
     """
@@ -281,10 +323,16 @@ def stream_to_iceberg(con, sql, table, batch_size, label="table"):
     t0 = time.time()
 
     result = con.sql(sql)
-    reader = result.fetch_record_batch(chunk_size=batch_size)
+    reader = result.to_arrow_reader(batch_size=batch_size)
+
+    # Resolve the data directory for this Iceberg table
+    table_location = table.location()
+    data_dir = os.path.join(table_location.replace("file://", ""), "data")
+    os.makedirs(data_dir, exist_ok=True)
 
     total_rows = 0
     batch_num = 0
+    parquet_files = []
 
     for record_batch in reader:
         arrow_tbl = pa.Table.from_batches([record_batch])
@@ -294,16 +342,27 @@ def stream_to_iceberg(con, sql, table, batch_size, label="table"):
 
         batch_num += 1
         total_rows += n
+
+        parquet_path = os.path.join(data_dir, f"{label}_{batch_num:05d}.parquet")
         t1 = time.time()
-        table.append(arrow_tbl)
+        pq.write_table(arrow_tbl, parquet_path, compression="zstd")
+        parquet_files.append(parquet_path)
         eprint(
             f"    batch {batch_num}: {n:,} rows "
             f"(total {total_rows:,}, "
             f"wrote in {time.time()-t1:.1f}s)"
         )
 
+    # Register all Parquet files with Iceberg in one atomic snapshot
+    if parquet_files:
+        t1 = time.time()
+        table.add_files(parquet_files)
+        eprint(f"    registered {len(parquet_files)} files with Iceberg "
+               f"in {time.time()-t1:.1f}s")
+
     elapsed = time.time() - t0
-    eprint(f"  {label}: {total_rows:,} rows in {batch_num} batches ({elapsed:.1f}s)")
+    eprint(f"  {label}: {total_rows:,} rows in {batch_num} batches, "
+           f"1 snapshot ({elapsed:.1f}s)")
     return total_rows
 
 
@@ -319,51 +378,24 @@ def write_features(con, read_clause, table, batch_size):
     return stream_to_iceberg(con, sql, table, batch_size, label="features")
 
 
-def write_sorted_jsonl(con, read_clause, output_path, batch_size):
-    """Write a taxid-sorted JSONL.zst file for downstream consumers.
+def write_sorted_jsonl(con, read_clause, output_path):
+    """Write a taxid-sorted JSONL.zst file using DuckDB's native COPY.
 
-    Streams from DuckDB in Arrow batches → orjson → zstd pipe.
-    Memory-bounded: only one batch of rows in Python at a time.
+    DuckDB handles the JSON serialisation and zstd compression internally,
+    which is faster than streaming through Python and avoids the orjson /
+    subprocess dependency for this code path.
     """
-    import subprocess
-
     eprint(f"  Writing sorted JSONL to {output_path}...")
     t0 = time.time()
 
     sql = SORTED_JSONL_SQL.format(read_clause=read_clause)
-    result = con.sql(sql)
+    con.sql(f"""
+        COPY ({sql}) TO '{output_path}'
+        (FORMAT JSON, COMPRESSION ZSTD)
+    """)
 
-    try:
-        import orjson
-    except ImportError:
-        eprint("  WARNING: orjson not available, skipping sorted JSONL")
-        return
-
-    proc = subprocess.Popen(
-        ["zstd", "-3", "-T0", "-o", output_path],
-        stdin=subprocess.PIPE,
-        bufsize=4 * 1024 * 1024,  # 4 MB write buffer
-    )
-
-    reader = result.fetch_record_batch(chunk_size=batch_size)
-    count = 0
-    batch_num = 0
-
-    for record_batch in reader:
-        batch_num += 1
-        rows = pa.Table.from_batches([record_batch]).to_pylist()
-        buf = b"".join(orjson.dumps(row) + b"\n" for row in rows)
-        proc.stdin.write(buf)
-        count += len(rows)
-        if batch_num % 10 == 0:
-            eprint(f"    jsonl batch {batch_num}: {count:,} rows written...")
-
-    proc.stdin.close()
-    rc = proc.wait()
-    if rc != 0:
-        eprint(f"  WARNING: zstd exited with code {rc}")
-
-    eprint(f"  Wrote {count:,} sorted JSONL records in {time.time()-t0:.1f}s")
+    elapsed = time.time() - t0
+    eprint(f"  Wrote sorted JSONL in {elapsed:.1f}s")
 
 
 # ─── Main ───────────────────────────────────────────────────────────────
@@ -424,15 +456,27 @@ def main():
     con = init_duckdb(args.memory_limit, args.threads)
     read_clause = build_read_clause(jsonl_path, args.schema)
 
+    # ── Infer Iceberg schemas from DuckDB Arrow output ──
+    eprint("--- SCHEMA INFERENCE ---")
+    entries_schema = infer_iceberg_schema(
+        con, ENTRIES_SQL.format(read_clause=read_clause), "entries"
+    )
+    features_schema = infer_iceberg_schema(
+        con, FEATURES_SQL.format(read_clause=read_clause), "features"
+    )
+
+    entries_sort = _sort_order_for(entries_schema, "taxid")
+    features_sort = _sort_order_for(features_schema, "taxid")
+
     # ── Init Iceberg catalog ──
     catalog = get_catalog(args.catalog_uri, warehouse)
     entries_table = ensure_table(
         catalog, args.namespace, "entries",
-        ENTRIES_SCHEMA, ENTRIES_SORT_ORDER,
+        entries_schema, entries_sort,
     )
     features_table = ensure_table(
         catalog, args.namespace, "features",
-        FEATURES_SCHEMA, FEATURES_SORT_ORDER,
+        features_schema, features_sort,
     )
 
     # Tag release as a table property if provided
@@ -455,7 +499,7 @@ def main():
     # ── Sorted JSONL (optional) ──
     if args.sorted_jsonl:
         eprint("\n--- SORTED JSONL ---")
-        write_sorted_jsonl(con, read_clause, args.sorted_jsonl, args.batch_size)
+        write_sorted_jsonl(con, read_clause, args.sorted_jsonl)
 
     # ── Summary ──
     elapsed = time.time() - t_total

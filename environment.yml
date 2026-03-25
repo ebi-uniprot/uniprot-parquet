@@ -6,6 +6,8 @@ dependencies:
   - openjdk=17          # Required for Nextflow
   - nextflow            # Pipeline orchestration
   - python>=3.11
+  - pigz                # Parallel gzip decompression
+  - zstd                # Zstandard compression for intermediate JSONL
   - duckdb              # JSON/Parquet transformation engine
   - pyarrow             # Arrow IPC between DuckDB and PyIceberg
   - pip
