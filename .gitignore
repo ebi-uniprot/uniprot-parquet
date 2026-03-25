@@ -4,7 +4,6 @@
 work/
 
 # Pipeline outputs
-results/
 datalake/
 warehouse/
 catalog.db

@@ -33,7 +33,7 @@ case "$MODE" in
         ;;
     test_med)
         INPUTFILE="test_json/med.json.gz"
-        OUTDIR="$(pwd)/results/uniprot_lake_test_med"
+        OUTDIR="$(pwd)/datalake/uniprot_lake_test_med"
         MEMORY="16GB"
         PROFILE="local"
         ;;
