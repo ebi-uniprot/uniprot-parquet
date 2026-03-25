@@ -25,22 +25,22 @@ def catalog(iceberg_lake):
 
 @pytest.fixture(scope="session")
 def entries_table(catalog):
-    return catalog.load_table("uniprot.entries")
+    return catalog.load_table("uniprotkb.entries")
 
 
 @pytest.fixture(scope="session")
 def features_table(catalog):
-    return catalog.load_table("uniprot.features")
+    return catalog.load_table("uniprotkb.features")
 
 
 @pytest.fixture(scope="session")
 def xrefs_table(catalog):
-    return catalog.load_table("uniprot.xrefs")
+    return catalog.load_table("uniprotkb.xrefs")
 
 
 @pytest.fixture(scope="session")
 def comments_table(catalog):
-    return catalog.load_table("uniprot.comments")
+    return catalog.load_table("uniprotkb.comments")
 
 
 # ─── Row counts ──────────────────────────────────────────────────────

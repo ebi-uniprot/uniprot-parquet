@@ -6,10 +6,10 @@ Pipeline to transform UniProtKB JSON dumps into an Apache Iceberg data lake usin
 
 | Output                         | Description                                                                   |
 | ------------------------------ | ----------------------------------------------------------------------------- |
-| `warehouse/uniprot/entries/`   | Iceberg table — one row per protein                                           |
-| `warehouse/uniprot/features/`  | Iceberg table — one row per positional feature                                |
-| `warehouse/uniprot/xrefs/`     | Iceberg table — one row per cross-reference                                   |
-| `warehouse/uniprot/comments/`  | Iceberg table — one row per comment annotation                                |
+| `warehouse/uniprotkb/entries/`   | Iceberg table — one row per protein                                           |
+| `warehouse/uniprotkb/features/`  | Iceberg table — one row per positional feature                                |
+| `warehouse/uniprotkb/xrefs/`     | Iceberg table — one row per cross-reference                                   |
+| `warehouse/uniprotkb/comments/`  | Iceberg table — one row per comment annotation                                |
 | `catalog.db`                   | SQLite Iceberg catalog                                                        |
 | `uniprot.jsonl.zst`            | Taxid-sorted JSONL archive (for downstream consumers)                         |
 
@@ -114,7 +114,7 @@ import duckdb
 con = duckdb.connect()
 con.load_extension("iceberg")
 
-base = 'datalake/uniprot_lake_test_med/warehouse/uniprot'
+base = 'datalake/uniprot_lake_test_med/warehouse/uniprotkb'
 con.sql(f"CREATE VIEW entries AS SELECT * FROM iceberg_scan('{base}/entries')")
 con.sql(f"CREATE VIEW features AS SELECT * FROM iceberg_scan('{base}/features')")
 con.sql(f"CREATE VIEW xrefs AS SELECT * FROM iceberg_scan('{base}/xrefs')")
@@ -165,7 +165,7 @@ catalog = SqlCatalog(
     uri="sqlite:///datalake/uniprot_lake_test_med/catalog.db",
     warehouse="datalake/uniprot_lake_test_med/warehouse",
 )
-entries = catalog.load_table("uniprot.entries")
+entries = catalog.load_table("uniprotkb.entries")
 
 # Scan human entries, selecting only what you need
 df = entries.scan(
@@ -179,7 +179,7 @@ df = entries.scan(
 ```python
 import polars as pl
 
-base = 'datalake/uniprot_lake_test_med/warehouse/uniprot'
+base = 'datalake/uniprot_lake_test_med/warehouse/uniprotkb'
 df = pl.scan_parquet(f"{base}/entries/data/*.parquet")
 df.filter(pl.col("taxid") == 9606).select("acc", "gene_name").collect()
 ```

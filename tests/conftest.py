@@ -65,7 +65,7 @@ def iceberg_lake(small_jsonl, tmp_path_factory):
         "--schema", SCHEMA_JSON,
         "--catalog-uri", catalog_uri,
         "--warehouse", warehouse,
-        "--namespace", "uniprot",
+        "--namespace", "uniprotkb",
         "--memory-limit", "4GB",
         "--batch-size", "50",
         "--release", "test_2026",

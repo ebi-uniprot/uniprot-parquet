@@ -24,7 +24,7 @@ Usage:
     iceberg_transform.py <input.jsonl.zst> \
         --catalog-uri sqlite:///path/to/catalog.db \
         --warehouse /path/to/warehouse \
-        [--namespace uniprot] \
+        [--namespace uniprotkb] \
         [--memory-limit 16GB] \
         [--batch-size 1000000] \
         [--sorted-jsonl /path/to/sorted.jsonl.zst]
@@ -523,8 +523,8 @@ def main():
         help="Iceberg warehouse directory (where data files live)",
     )
     parser.add_argument(
-        "--namespace", default="uniprot",
-        help="Iceberg namespace (default: uniprot)",
+        "--namespace", default="uniprotkb",
+        help="Iceberg namespace (default: uniprotkb)",
     )
     parser.add_argument("--memory-limit", default="16GB", help="DuckDB memory limit")
     parser.add_argument("--threads", type=int, default=None, help="DuckDB threads")

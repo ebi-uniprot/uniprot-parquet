@@ -14,7 +14,7 @@ Checks:
 Usage:
     validate_iceberg.py --catalog-uri sqlite:///catalog.db \
         --warehouse /path/to/warehouse \
-        [--namespace uniprot] [-o validation_report.txt]
+        [--namespace uniprotkb] [-o validation_report.txt]
 """
 
 import sys
@@ -39,7 +39,7 @@ def main():
         "--warehouse", required=True,
         help="Iceberg warehouse directory",
     )
-    parser.add_argument("--namespace", default="uniprot", help="Iceberg namespace")
+    parser.add_argument("--namespace", default="uniprotkb", help="Iceberg namespace")
     parser.add_argument("-o", "--output", default="validation_report.txt", help="Output report file")
     args = parser.parse_args()
 

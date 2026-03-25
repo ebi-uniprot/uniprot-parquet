@@ -133,7 +133,7 @@ process ICEBERG_TRANSFORM {
         --schema ${duckdb_schema} \
         --catalog-uri sqlite:///catalog.db \
         --warehouse ./warehouse \
-        --namespace uniprot \
+        --namespace uniprotkb \
         --memory-limit ${params.memory_limit} \
         --release ${params.release} \
         --sorted-jsonl uniprot.jsonl.zst
@@ -165,7 +165,7 @@ process VALIDATE {
     python3 ${validate_script} \
         --catalog-uri sqlite:///${catalog} \
         --warehouse ${warehouse} \
-        --namespace uniprot \
+        --namespace uniprotkb \
         -o validation_report.txt
     """
 }
