@@ -28,26 +28,26 @@ case "$MODE" in
     test_small)
         INPUTFILE="test_json/small.json.gz"
         OUTDIR="$(pwd)/datalake/uniprot_lake_test_small"
-        MEMORY="12GB"
+        MEMORY="8GB"
         PROFILE="local"
         ;;
     test_med)
         INPUTFILE="test_json/med.json.gz"
         OUTDIR="$(pwd)/datalake/uniprot_lake_test_med"
-        MEMORY="16GB"
+        MEMORY="8GB"
         PROFILE="local"
         ;;
-    prod)
+    subset)
         INPUTFILE="~/uniprot100k.json.gz"
         OUTDIR="$(pwd)/datalake"
         MEMORY="16GB"
-        PROFILE="prod"
+        PROFILE="short"
         ;;
-    subset)
+    prod)
         INPUTFILE="UniProtKB.json.gz"
         OUTDIR="$(pwd)/datalake"
-        MEMORY="8GB"
-        PROFILE="short"
+        MEMORY="16GB"
+        PROFILE="prod"
         ;;
     *)
         echo "Usage: $0 {test_small|test_med|prod|subset} [--input FILE] [--outdir DIR]"

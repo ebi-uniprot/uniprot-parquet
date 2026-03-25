@@ -40,7 +40,6 @@ import json
 
 import duckdb
 import pyarrow as pa
-import pyarrow.compute
 import pyarrow.parquet as pq
 
 from pyiceberg.catalog.sql import SqlCatalog
@@ -50,7 +49,6 @@ from pyiceberg.exceptions import (
 )
 from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.schema import Schema, assign_fresh_schema_ids
-from pyiceberg.partitioning import PartitionSpec, PartitionField
 from pyiceberg.table.sorting import SortOrder, SortField
 from pyiceberg.transforms import IdentityTransform
 
@@ -175,7 +173,7 @@ SELECT
     e.geneLocations                                 AS gene_locations
 
 FROM {read_clause} e
-ORDER BY e.organism.taxonId
+ORDER BY reviewed, e.organism.taxonId
 """
 
 
@@ -220,7 +218,7 @@ FROM (
     FROM {read_clause} e
     WHERE e.features IS NOT NULL AND len(e.features) > 0
 ) sub, LATERAL unnest(sub.features)
-ORDER BY sub.taxid
+ORDER BY sub.reviewed, sub.taxid
 """
 
 
@@ -269,18 +267,6 @@ def _sort_order_for(iceberg_schema: Schema, *column_names: str) -> SortOrder:
     )
 
 
-def _partition_spec_for(iceberg_schema: Schema, column_name: str) -> PartitionSpec:
-    """Build a PartitionSpec on a single identity column."""
-    field = iceberg_schema.find_field(column_name)
-    return PartitionSpec(
-        PartitionField(
-            source_id=field.field_id,
-            field_id=1000,  # partition field IDs start at 1000 by convention
-            transform=IdentityTransform(),
-            name=column_name,
-        ),
-    )
-
 
 # ─── Iceberg catalog / table helpers ────────────────────────────────────
 
@@ -295,7 +281,7 @@ def get_catalog(catalog_uri: str, warehouse: str) -> SqlCatalog:
     )
 
 
-def ensure_table(catalog, namespace, table_name, schema, sort_order, partition_spec=None):
+def ensure_table(catalog, namespace, table_name, schema, sort_order):
     """Create namespace + table if they don't already exist."""
     try:
         catalog.create_namespace(namespace)
@@ -304,17 +290,54 @@ def ensure_table(catalog, namespace, table_name, schema, sort_order, partition_s
         pass
 
     full_name = f"{namespace}.{table_name}"
-    kwargs = dict(schema=schema, sort_order=sort_order)
-    if partition_spec is not None:
-        kwargs["partition_spec"] = partition_spec
     try:
-        table = catalog.create_table(full_name, **kwargs)
+        table = catalog.create_table(
+            full_name,
+            schema=schema,
+            sort_order=sort_order,
+        )
         eprint(f"  Created table '{full_name}'")
     except TableAlreadyExistsError:
         table = catalog.load_table(full_name)
         eprint(f"  Loaded existing table '{full_name}'")
 
     return table
+
+
+def _write_version_hint(table):
+    """Write a version-hint.text file so DuckDB's iceberg_scan can find the latest metadata.
+
+    PyIceberg metadata files are named like 00002-<uuid>.metadata.json.
+    The version-hint.text file just contains the version number (e.g. "2").
+    """
+    table_location = table.location().replace("file://", "")
+    metadata_dir = os.path.join(table_location, "metadata")
+    if not os.path.isdir(metadata_dir):
+        return
+    # Find the highest-numbered metadata file and create DuckDB-compatible symlinks.
+    # PyIceberg writes metadata as "00002-<uuid>.metadata.json" but DuckDB's
+    # iceberg_scan expects "v2.metadata.json".  We write the version-hint.text
+    # AND create a symlink so DuckDB can find it.
+    metadata_files = {}
+    for fname in os.listdir(metadata_dir):
+        if fname.endswith(".metadata.json"):
+            try:
+                version = int(fname.split("-", 1)[0])
+                metadata_files[version] = fname
+            except ValueError:
+                continue
+    if metadata_files:
+        latest = max(metadata_files)
+        # Write version hint
+        hint_path = os.path.join(metadata_dir, "version-hint.text")
+        with open(hint_path, "w") as f:
+            f.write(str(latest))
+        # Create symlink: v2.metadata.json → 00002-<uuid>.metadata.json
+        symlink_name = f"v{latest}.metadata.json"
+        symlink_path = os.path.join(metadata_dir, symlink_name)
+        if os.path.lexists(symlink_path):
+            os.remove(symlink_path)
+        os.symlink(metadata_files[latest], symlink_path)
 
 
 # ─── Core pipeline ──────────────────────────────────────────────────────
@@ -344,13 +367,7 @@ def stream_to_iceberg(con, sql, table, batch_size, label="table"):
     # Resolve the data directory for this Iceberg table
     table_location = table.location()
     data_dir = os.path.join(table_location.replace("file://", ""), "data")
-
-    # Get partition column name from the table's partition spec (if any)
-    partition_col = None
-    spec = table.spec()
-    if spec and spec.fields:
-        partition_col = spec.fields[0].name
-        eprint(f"    partitioning by '{partition_col}'")
+    os.makedirs(data_dir, exist_ok=True)
 
     total_rows = 0
     file_num = 0
@@ -362,42 +379,18 @@ def stream_to_iceberg(con, sql, table, batch_size, label="table"):
         if n == 0:
             continue
 
+        file_num += 1
         total_rows += n
 
-        if partition_col and partition_col in arrow_tbl.column_names:
-            # Split batch by partition value so each Parquet file has one value
-            col = arrow_tbl.column(partition_col)
-            for val in col.unique().to_pylist():
-                mask = pa.compute.equal(col, val)
-                subset = arrow_tbl.filter(mask)
-                if subset.num_rows == 0:
-                    continue
-                file_num += 1
-                part_dir = os.path.join(data_dir, f"{partition_col}={val}")
-                os.makedirs(part_dir, exist_ok=True)
-                parquet_path = os.path.join(part_dir, f"{label}_{file_num:05d}.parquet")
-                t1 = time.time()
-                pq.write_table(subset, parquet_path, compression="zstd")
-                parquet_files.append(parquet_path)
-                eprint(
-                    f"    file {file_num}: {subset.num_rows:,} rows "
-                    f"({partition_col}={val}, "
-                    f"wrote in {time.time()-t1:.1f}s)"
-                )
-        else:
-            file_num += 1
-            os.makedirs(data_dir, exist_ok=True)
-            parquet_path = os.path.join(data_dir, f"{label}_{file_num:05d}.parquet")
-            t1 = time.time()
-            pq.write_table(arrow_tbl, parquet_path, compression="zstd")
-            parquet_files.append(parquet_path)
-            eprint(
-                f"    file {file_num}: {n:,} rows "
-                f"(total {total_rows:,}, "
-                f"wrote in {time.time()-t1:.1f}s)"
-            )
-
-    eprint(f"    total: {total_rows:,} rows across {file_num} files")
+        parquet_path = os.path.join(data_dir, f"{label}_{file_num:05d}.parquet")
+        t1 = time.time()
+        pq.write_table(arrow_tbl, parquet_path, compression="zstd")
+        parquet_files.append(parquet_path)
+        eprint(
+            f"    batch {file_num}: {n:,} rows "
+            f"(total {total_rows:,}, "
+            f"wrote in {time.time()-t1:.1f}s)"
+        )
 
     # Register all Parquet files with Iceberg in one atomic snapshot
     if parquet_files:
@@ -511,20 +504,18 @@ def main():
         con, FEATURES_SQL.format(read_clause=read_clause), "features"
     )
 
-    entries_sort = _sort_order_for(entries_schema, "taxid")
-    features_sort = _sort_order_for(features_schema, "taxid")
-    entries_partition = _partition_spec_for(entries_schema, "reviewed")
-    features_partition = _partition_spec_for(features_schema, "reviewed")
+    entries_sort = _sort_order_for(entries_schema, "reviewed", "taxid")
+    features_sort = _sort_order_for(features_schema, "reviewed", "taxid")
 
     # ── Init Iceberg catalog ──
     catalog = get_catalog(args.catalog_uri, warehouse)
     entries_table = ensure_table(
         catalog, args.namespace, "entries",
-        entries_schema, entries_sort, entries_partition,
+        entries_schema, entries_sort,
     )
     features_table = ensure_table(
         catalog, args.namespace, "features",
-        features_schema, features_sort, features_partition,
+        features_schema, features_sort,
     )
 
     # Tag release as a table property if provided
@@ -548,6 +539,11 @@ def main():
     if args.sorted_jsonl:
         eprint("\n--- SORTED JSONL ---")
         write_sorted_jsonl(con, read_clause, args.sorted_jsonl)
+
+    # ── Write version-hint.text for DuckDB iceberg_scan compatibility ──
+    for tbl_name, tbl in [("entries", entries_table), ("features", features_table)]:
+        _write_version_hint(tbl)
+        eprint(f"  wrote version-hint.text for {tbl_name}")
 
     # ── Summary ──
     elapsed = time.time() - t_total

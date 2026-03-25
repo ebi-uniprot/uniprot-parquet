@@ -111,7 +111,7 @@ process ICEBERG_TRANSFORM {
     memory '16 GB'
     time '48h'
 
-    publishDir "${params.outdir}", mode: 'copy', pattern: 'warehouse/**'
+    publishDir "${params.outdir}", mode: 'copy', pattern: 'warehouse'
     publishDir "${params.outdir}", mode: 'copy', pattern: 'catalog.db'
     publishDir "${params.outdir}", mode: 'copy', pattern: 'uniprot.jsonl.zst'
 
@@ -120,7 +120,7 @@ process ICEBERG_TRANSFORM {
     path duckdb_schema
 
     output:
-    path "warehouse/**",      emit: warehouse
+    path "warehouse",         emit: warehouse
     path "catalog.db",        emit: catalog
     path "uniprot.jsonl.zst", emit: jsonl
 
@@ -164,7 +164,7 @@ process VALIDATE {
 
     python3 ${validate_script} \
         --catalog-uri sqlite:///${catalog} \
-        --warehouse . \
+        --warehouse ${warehouse} \
         --namespace uniprot \
         -o validation_report.txt
     """
