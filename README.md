@@ -4,14 +4,14 @@ Pipeline to transform UniProtKB JSON dumps into an Apache Iceberg data lake usin
 
 ## What it produces
 
-| Output                         | Description                                                                   |
-| ------------------------------ | ----------------------------------------------------------------------------- |
-| `warehouse/uniprotkb/entries/`   | Iceberg table — one row per protein                                           |
-| `warehouse/uniprotkb/features/`  | Iceberg table — one row per positional feature                                |
-| `warehouse/uniprotkb/xrefs/`     | Iceberg table — one row per cross-reference                                   |
-| `warehouse/uniprotkb/comments/`  | Iceberg table — one row per comment annotation                                |
-| `catalog.db`                   | SQLite Iceberg catalog                                                        |
-| `uniprot.jsonl.zst`            | Taxid-sorted JSONL archive (for downstream consumers)                         |
+| Output                          | Description                                           |
+| ------------------------------- | ----------------------------------------------------- |
+| `warehouse/uniprotkb/entries/`  | Iceberg table — one row per protein                   |
+| `warehouse/uniprotkb/features/` | Iceberg table — one row per positional feature        |
+| `warehouse/uniprotkb/xrefs/`    | Iceberg table — one row per cross-reference           |
+| `warehouse/uniprotkb/comments/` | Iceberg table — one row per comment annotation        |
+| `catalog.db`                    | SQLite Iceberg catalog                                |
+| `uniprot.jsonl.zst`             | JSONL archive sorted by review status then taxid      |
 
 All tables are sorted by `reviewed` then `taxid`. Iceberg handles data skipping via per-file column statistics — queries filtering on either column skip most data files automatically. No Hive partitioning needed.
 

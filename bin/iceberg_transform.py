@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Transform JSONL(.zst) → Apache Iceberg tables (entries + features).
+Transform JSONL(.zst) → Apache Iceberg tables (entries, features, xrefs, comments).
 
 Architecture:
   - DuckDB reads the JSONL and performs all SQL transformations (flattening,
     unnesting, sorting) — it's purpose-built for this.
-  - The Iceberg schema is **inferred** from DuckDB's Arrow output on the first
-    batch, then applied to all subsequent batches.  No hand-maintained schema
-    file is needed.
+  - Iceberg schemas are inferred cheaply at startup (LIMIT 1, no ORDER BY) —
+    sub-second even on 180GB files.  The schemas are deterministically derived
+    from schema.json + the SQL transforms, so no need to persist them separately.
   - DuckDB streams Arrow record batches (bounded memory, never materialises
     the full dataset).
   - PyIceberg writes each batch as a Parquet file, then registers all files
@@ -33,6 +33,7 @@ Requires: duckdb, pyiceberg[pyarrow,sql-sqlite], pyarrow
 """
 
 import os
+import re
 import sys
 import argparse
 import time
@@ -40,7 +41,7 @@ import json
 
 import duckdb
 import pyarrow as pa
-import pyarrow.parquet as pq
+import pyarrow.parquet as pq  # used by stream_to_iceberg
 
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.exceptions import (
@@ -276,32 +277,43 @@ ORDER BY sub.reviewed, sub.taxid, unnest.commentType
 SORTED_JSONL_SQL = """
 SELECT *
 FROM {read_clause} e
-ORDER BY e.organism.taxonId
+ORDER BY
+    CASE WHEN e.entryType LIKE '%Swiss-Prot%' THEN 0 ELSE 1 END,
+    e.organism.taxonId
 """
 
 
 # ─── Schema inference ────────────────────────────────────────────────────
 
+def _inference_sql(sql: str) -> str:
+    """Wrap a transform SQL for cheap schema inference.
+
+    Strips ORDER BY (avoids a full-dataset sort) and adds LIMIT 1.
+    DuckDB resolves the full output schema from just one row, so this
+    turns an hours-long sort into a sub-second operation on large files.
+    """
+    # Remove the final ORDER BY clause (all our SQL templates end with one)
+    stripped = re.sub(r'\s+ORDER\s+BY\s+[^)]+$', '', sql, flags=re.IGNORECASE)
+    return f"SELECT * FROM ({stripped}) _infer LIMIT 1"
+
+
 def infer_iceberg_schema(con, sql: str, label: str) -> Schema:
     """Infer the Iceberg schema from a DuckDB SQL query.
 
-    Runs the query, reads the first batch to capture the Arrow schema
-    (which DuckDB fixes before yielding any rows), then returns the
-    corresponding Iceberg schema with auto-assigned field IDs.
+    Uses _inference_sql() to strip ORDER BY and add LIMIT 1, so the
+    query touches only a handful of input rows instead of sorting the
+    entire dataset.
     """
     eprint(f"  Inferring {label} schema from DuckDB...")
     t0 = time.time()
 
-    result = con.sql(sql)
-    # Read a single small batch — we only need the schema, not the data.
-    # DuckDB resolves the full schema before the first row is yielded.
+    cheap_sql = _inference_sql(sql)
+    result = con.sql(cheap_sql)
     reader = result.to_arrow_reader(batch_size=1)
     batch = next(reader)
-    # Close the reader to release DuckDB resources
     del reader, result
 
     raw_schema = _pyarrow_to_schema_without_ids(batch.schema)
-    # Assign unique, sequential field IDs (the raw schema has -1 for all)
     iceberg_schema = assign_fresh_schema_ids(raw_schema)
 
     eprint(f"    {len(iceberg_schema.fields)} columns inferred in {time.time()-t0:.1f}s")
@@ -558,20 +570,21 @@ def main():
     con = init_duckdb(args.memory_limit, args.threads)
     read_clause = build_read_clause(jsonl_path, args.schema)
 
-    # ── Infer Iceberg schemas from DuckDB Arrow output ──
+    # ── Infer Iceberg schemas (cheap: LIMIT 1, no ORDER BY) ──
     eprint("--- SCHEMA INFERENCE ---")
-    entries_schema = infer_iceberg_schema(
-        con, ENTRIES_SQL.format(read_clause=read_clause), "entries"
-    )
-    features_schema = infer_iceberg_schema(
-        con, FEATURES_SQL.format(read_clause=read_clause), "features"
-    )
-    xrefs_schema = infer_iceberg_schema(
-        con, XREFS_SQL.format(read_clause=read_clause), "xrefs"
-    )
-    comments_schema = infer_iceberg_schema(
-        con, COMMENTS_SQL.format(read_clause=read_clause), "comments"
-    )
+    table_names = ["entries", "features", "xrefs", "comments"]
+    table_sqls = [ENTRIES_SQL, FEATURES_SQL, XREFS_SQL, COMMENTS_SQL]
+
+    schemas = {}
+    for name, sql_template in zip(table_names, table_sqls):
+        schemas[name] = infer_iceberg_schema(
+            con, sql_template.format(read_clause=read_clause), name
+        )
+
+    entries_schema = schemas["entries"]
+    features_schema = schemas["features"]
+    xrefs_schema = schemas["xrefs"]
+    comments_schema = schemas["comments"]
 
     entries_sort = _sort_order_for(entries_schema, "reviewed", "taxid")
     features_sort = _sort_order_for(features_schema, "reviewed", "taxid")

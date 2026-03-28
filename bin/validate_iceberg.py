@@ -70,7 +70,7 @@ def main():
 
     table_counts = {}
 
-    for table_name in ["entries", "features"]:
+    for table_name in ["entries", "features", "xrefs", "comments"]:
         log(f"\n--- {table_name.upper()} ---")
         full_name = f"{args.namespace}.{table_name}"
 
@@ -153,7 +153,7 @@ def main():
 
     # Sample data check (bounded — limit=3)
     log(f"\n--- SAMPLE DATA ---")
-    for table_name in ["entries", "features"]:
+    for table_name in ["entries", "features", "xrefs", "comments"]:
         full_name = f"{args.namespace}.{table_name}"
         try:
             table = catalog.load_table(full_name)

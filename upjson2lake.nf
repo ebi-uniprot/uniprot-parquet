@@ -1,24 +1,31 @@
 #!/usr/bin/env nextflow
 
-// UniProtKB JSON → JSONL.zst + Iceberg tables (entries + features)
+// UniProtKB JSON → JSONL.zst + Iceberg tables (entries, features, xrefs, comments)
 //
-// Produces:
-//   <outdir>/uniprot.jsonl.zst              (taxid-sorted JSONL archive)
-//   <outdir>/warehouse/uniprot/entries/      (Iceberg table: one row per protein)
-//   <outdir>/warehouse/uniprot/features/     (Iceberg table: one row per feature)
-//   <outdir>/catalog.db                      (SQLite Iceberg catalog)
-//   <outdir>/validation_report.txt           (row counts, snapshot IDs)
-//   <outdir>/schemas/<release>.json          (post-transform schema snapshot)
+// Produces (inside <outdir>/<release>/):
+//   uniprot.jsonl.zst              (taxid-sorted JSONL archive)
+//   warehouse/uniprotkb/entries/   (Iceberg table: one row per protein)
+//   warehouse/uniprotkb/features/  (Iceberg table: one row per feature)
+//   warehouse/uniprotkb/xrefs/     (Iceberg table: one row per xref)
+//   warehouse/uniprotkb/comments/  (Iceberg table: one row per comment)
+//   catalog.db                     (SQLite Iceberg catalog)
+//   validation_report.txt          (row counts, snapshot IDs)
+//   manifest.json                  (provenance: checksums, git, row counts)
 //
 // Architecture:
 //   1. Stream JSON(.gz) → single zstd-compressed JSONL
-//   2. Schema check — infer post-transform schema, diff against previous release
+//   2. Schema check — full-scan JSONL validation against schema.json
+//      (reads every row with declared types; ~30-60 min on 180GB)
 //   3. Transform JSONL → Iceberg tables via DuckDB + PyIceberg
+//      (Iceberg schemas inferred cheaply via LIMIT 1 at startup)
 //   4. Validate row counts + snapshot consistency
+//   5. Generate provenance manifest
 //
-// The Iceberg schema is inferred from the data (no hand-maintained schema file).
+// Schema management: schema.json is the single source of truth (committed to repo).
+// Run `schema_bootstrap.py` once against the full dataset to generate it.
+// It is human-readable and manually editable.
 // No partitioning — Iceberg handles data skipping via per-file column statistics.
-// Both tables sorted by taxid for organism-level query locality.
+// All tables sorted by reviewed, taxid for query locality.
 
 nextflow.enable.dsl = 2
 
@@ -28,13 +35,16 @@ params.outdir         = "${projectDir}/results/uniprot_lake"
 params.release        = "2026_01"
 params.memory_limit   = '96GB'    // DuckDB memory limit (passed via --memory_limit)
 params.schema         = "${projectDir}/schema.json"
-params.schema_dir     = "${projectDir}/schemas"
+
+// Final output directory: <outdir>/<release>/
+def release_dir = "${params.outdir}/${params.release}"
 
 /* ── SCRIPTS ──────────────────────────────────────────────────────── */
 stream_script        = "${projectDir}/bin/stream_jsonl.py"
 schema_check_script  = "${projectDir}/bin/schema_check.py"
 transform_script     = "${projectDir}/bin/iceberg_transform.py"
 validate_script      = "${projectDir}/bin/validate_iceberg.py"
+manifest_script      = "${projectDir}/bin/release_manifest.py"
 
 
 /* ── PROCESS: Stream input to single zstd-compressed JSONL ────────── */
@@ -65,37 +75,26 @@ process STREAM_JSONL {
 }
 
 
-/* ── PROCESS: Pre-flight schema check ─────────────────────────────── */
+/* ── PROCESS: Pre-flight JSONL validation against schema.json ────── */
 process SCHEMA_CHECK {
     tag 'schema_check'
-    cpus 2
-    memory '8 GB'
-    time '2h'
-
-    publishDir "${params.outdir}", mode: 'copy', pattern: 'schemas/**'
+    cpus 4
+    memory "${params.memory_limit.replace('GB', ' GB')}"
+    time '4h'
 
     input:
     path jsonl
     path duckdb_schema
 
     output:
-    path "schemas/**", emit: schemas
+    val true, emit: validated
 
     script:
     """
     set -euo pipefail
     echo " .-- SCHEMA_CHECK BEGUN \$(date)"
 
-    # Copy existing schemas into work dir so diff works
-    if [ -d "${params.schema_dir}" ]; then
-        cp -r ${params.schema_dir} schemas
-    else
-        mkdir -p schemas
-    fi
-
     python3 ${schema_check_script} ${jsonl} \
-        --release ${params.release} \
-        --schema-dir schemas/ \
         --duckdb-schema ${duckdb_schema} \
         --memory-limit ${params.memory_limit}
 
@@ -111,13 +110,14 @@ process ICEBERG_TRANSFORM {
     memory "${params.memory_limit.replace('GB', ' GB')}"
     time '48h'
 
-    publishDir "${params.outdir}", mode: 'copy', pattern: 'warehouse'
-    publishDir "${params.outdir}", mode: 'copy', pattern: 'catalog.db'
-    publishDir "${params.outdir}", mode: 'copy', pattern: 'uniprot.jsonl.zst'
+    publishDir "${release_dir}", mode: 'copy', pattern: 'warehouse'
+    publishDir "${release_dir}", mode: 'copy', pattern: 'catalog.db'
+    publishDir "${release_dir}", mode: 'copy', pattern: 'uniprot.jsonl.zst'
 
     input:
     path jsonl
     path duckdb_schema
+    val schema_ok
 
     output:
     path "warehouse",         emit: warehouse
@@ -149,7 +149,7 @@ process VALIDATE {
     cpus 1
     memory '4 GB'
 
-    publishDir "${params.outdir}", mode: 'copy'
+    publishDir "${release_dir}", mode: 'copy'
 
     input:
     path warehouse
@@ -171,6 +171,39 @@ process VALIDATE {
 }
 
 
+/* ── PROCESS: Generate provenance manifest ───────────────────────── */
+process MANIFEST {
+    tag 'manifest'
+    cpus 1
+    memory '1 GB'
+
+    publishDir "${release_dir}", mode: 'copy'
+
+    input:
+    path warehouse
+    path catalog
+    path jsonl
+    path duckdb_schema
+
+    output:
+    path "manifest.json", emit: manifest
+
+    script:
+    """
+    set -euo pipefail
+
+    python3 ${manifest_script} \
+        --catalog-uri sqlite:///${catalog} \
+        --warehouse ${warehouse} \
+        --namespace uniprotkb \
+        --input-jsonl ${jsonl} \
+        --schema ${duckdb_schema} \
+        --release ${params.release} \
+        -o manifest.json
+    """
+}
+
+
 /* ── WORKFLOW ─────────────────────────────────────────────────────── */
 workflow {
     log.info """
@@ -180,7 +213,7 @@ workflow {
     ╚═══════════════════════════════════════════════════════════╝
     Input:      ${params.inputfile}
     Schema:     ${params.schema}
-    Output:     ${params.outdir}
+    Output:     ${release_dir}
     DuckDB mem: ${params.memory_limit}
     ─────────────────────────────────────────────────────────────
     """.stripIndent()
@@ -197,18 +230,29 @@ workflow {
     input_ch = Channel.fromPath(params.inputfile)
     STREAM_JSONL(input_ch)
 
-    // 2. Schema check — infer + diff (fails on breaking changes)
+    // 2. Schema check — full-scan JSONL validation against schema.json
+    //    (gate: transform only runs if validation passes)
     SCHEMA_CHECK(STREAM_JSONL.out.jsonl, schema_ch)
 
     // 3. Transform → Iceberg tables (DuckDB reads + PyIceberg writes)
+    //    Iceberg schemas are inferred cheaply (LIMIT 1) at startup
     ICEBERG_TRANSFORM(
         STREAM_JSONL.out.jsonl,
         schema_ch,
+        SCHEMA_CHECK.out.validated,
     )
 
     // 4. Validate the Iceberg lake
     VALIDATE(
         ICEBERG_TRANSFORM.out.warehouse,
         ICEBERG_TRANSFORM.out.catalog,
+    )
+
+    // 5. Generate provenance manifest
+    MANIFEST(
+        ICEBERG_TRANSFORM.out.warehouse,
+        ICEBERG_TRANSFORM.out.catalog,
+        ICEBERG_TRANSFORM.out.jsonl,
+        schema_ch,
     )
 }
