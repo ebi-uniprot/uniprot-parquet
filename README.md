@@ -4,6 +4,8 @@ Pipeline to transform UniProtKB JSON dumps into an Apache Iceberg data lake usin
 
 ## What it produces
 
+Each release lands in its own directory (`<outdir>/<release>/`):
+
 | Output                          | Description                                           |
 | ------------------------------- | ----------------------------------------------------- |
 | `warehouse/uniprotkb/entries/`  | Iceberg table — one row per protein                   |
@@ -11,7 +13,9 @@ Pipeline to transform UniProtKB JSON dumps into an Apache Iceberg data lake usin
 | `warehouse/uniprotkb/xrefs/`    | Iceberg table — one row per cross-reference           |
 | `warehouse/uniprotkb/comments/` | Iceberg table — one row per comment annotation        |
 | `catalog.db`                    | SQLite Iceberg catalog                                |
-| `uniprot.jsonl.zst`             | JSONL archive sorted by review status then taxid      |
+| `sorted.jsonl.zst`              | JSONL archive sorted by review status then taxid      |
+| `manifest.json`                 | Provenance record (checksums, git commit, row counts) |
+| `validation_report.txt`         | Row counts, snapshot IDs, consistency checks          |
 
 All tables are sorted by `reviewed` then `taxid`. Iceberg handles data skipping via per-file column statistics — queries filtering on either column skip most data files automatically. No Hive partitioning needed.
 
@@ -41,6 +45,22 @@ pip install -r requirements.txt
 ./run_lake.sh prod --input /path/to/UniProtKB.json.gz --outdir /scratch/lake
 ```
 
+## Schema management
+
+`schema.json` is the **single source of truth** for column types. It maps each top-level JSON field to its DuckDB type and is used by `read_json(columns={...})` for deterministic parsing. The Iceberg schemas are derived from it at transform time (cheap LIMIT 1 inference, sub-second).
+
+**Bootstrap** (run once on the full dataset):
+```bash
+python bin/schema_bootstrap.py /path/to/full_uniprotkb.jsonl.zst \
+    --schema-json-out schema.json \
+    --release 2026_01
+git add schema.json && git commit -m "chore: bootstrap schema.json for 2026_01"
+```
+
+**Validation** (runs automatically in the pipeline): the `SCHEMA_CHECK` step reads every row with the declared types from `schema.json`. If any entry doesn't conform, DuckDB throws a type error and the pipeline stops before the expensive transform.
+
+**Manual edits**: `schema.json` is human-readable. Adding new fields is safe (they'll be NULL until the data has them). If you know what will change in a new release, you can update it by hand.
+
 ## Architecture
 
 ```
@@ -52,28 +72,40 @@ UniProtKB.json.gz
 +-------+-------+
         |
         v
-+---------------+   Infer post-transform schema, diff against previous release
-| SCHEMA_CHECK  |   (exit 1 if schema changed — review before proceeding)
++---------------+   Full-scan JSONL validation against schema.json
+| SCHEMA_CHECK  |   (reads every row with declared types; ~30-60 min)
 +-------+-------+
-        |
+        |  (gate: transform only runs if validation passes)
         v
 +-------------------+   DuckDB (read + transform + sort)
 | ICEBERG_TRANSFORM |   PyIceberg (write Iceberg tables)
-+-------+-----------+
++-------+-----------+   Iceberg schemas inferred cheaply (LIMIT 1)
         |
         v
 +----------+   Row counts, snapshot checks, consistency
 | VALIDATE |
++----+-----+
+     |
+     v
++----------+   Checksums, git commit, row counts
+| MANIFEST |
 +----------+
 ```
 
 DuckDB handles the heavy lifting: JSON parsing, SQL transformations (flattening, unnesting), and sorting. It streams Arrow record batches to PyIceberg, which writes the Iceberg data files and manages the SQLite catalog. Memory stays bounded regardless of dataset size.
 
-The Iceberg schema is inferred at runtime from DuckDB's Arrow output — there is no hand-maintained schema file. The `SCHEMA_CHECK` step captures the post-transform schema and diffs it against the previous release, so you can review any changes before proceeding.
+The pipeline is **idempotent** — re-running on the same release directory drops and recreates all tables, so row counts are always correct. Each release gets its own isolated directory and catalog.
 
 ## Schema
 
-We adopt a denormalized-first design, prioritizing query simplicity for the typical bioinformatics user. Parquet's columnar storage mitigates any read-amplification cost — if a query touches 5 of 30+ columns, only those 5 are read from disk. Supplementary normalized tables (features, xrefs, comments) are provided for high-cardinality relationships that would make the main table unwieldy as arrays.
+We adopt a **denormalized-first + full nested** design. Each table has two layers:
+
+1. **Flattened convenience columns** (e.g. `gene_name`, `ec_numbers`, `go_ids`) — cover the 90% use case with simple SQL. These are intentionally lossy shortcuts: `gene_name` is only the first gene's primary name, `ec_numbers` are only from `recommendedName`, and `go_ids` are IDs without aspect/evidence.
+2. **Full nested structures** (e.g. `genes`, `protein_desc`, `references`, `comment`) — preserve all upstream data for power users. DuckDB's JSON path syntax makes these queryable without ETL. For example, to get all gene synonyms: `SELECT e.genes[1].synonyms FROM entries e`.
+
+This means no UniProtKB data is discarded. Users needing isoforms, gene synonyms, GO aspects, EC numbers from alternative names, multi-paragraph comments, or evidence codes can always query the nested columns. If a flattened shortcut proves too lossy for common queries, it can be expanded or a dedicated table added in a future release.
+
+Parquet's columnar storage mitigates any read-amplification cost — if a query touches 5 of 30+ columns, only those 5 are read from disk. Supplementary normalized tables (features, xrefs, comments) are provided for high-cardinality relationships that would make the main table unwieldy as arrays.
 
 All four tables are sorted by `reviewed` (Swiss-Prot vs TrEMBL) then `taxid`, and all include denormalized entry-level fields (`acc`, `reviewed`, `taxid`) so most queries don't need joins.
 
@@ -81,11 +113,11 @@ All four tables are sorted by `reviewed` (Swiss-Prot vs TrEMBL) then `taxid`, an
 
 - Identity: `acc`, `id`, `reviewed`, `secondary_accs`
 - Organism: `taxid`, `organism_name`, `organism_common`, `lineage`
-- Gene/protein: `gene_name`, `protein_name`, `ec_numbers`, `protein_existence`, `annotation_score`
-- Sequence: `sequence`, `seq_length`, `seq_mass`, `seq_md5`, `seq_crc64`
-- Shortcuts: `go_ids`, `xref_dbs`, `keyword_ids`, `keyword_names`
+- Gene/protein: `gene_name` (first gene only), `protein_name`, `ec_numbers` (recommendedName only), `protein_existence`, `annotation_score`
+- Sequence: `sequence` (canonical only), `seq_length`, `seq_mass`, `seq_md5`, `seq_crc64`
+- Shortcuts: `go_ids` (IDs only), `xref_dbs`, `keyword_ids`, `keyword_names`
 - Versioning: `first_public`, `last_modified`, `entry_version`, `seq_version`
-- Nested: `organism`, `protein_desc`, `genes`, `keywords`, `references`, `organism_hosts`, `gene_locations`
+- Full nested: `organism`, `protein_desc`, `genes`, `keywords`, `references`, `organism_hosts`, `gene_locations`
 
 **features** — one row per positional annotation:
 
@@ -114,7 +146,7 @@ import duckdb
 con = duckdb.connect()
 con.load_extension("iceberg")
 
-base = 'datalake/uniprot_lake_test_med/warehouse/uniprotkb'
+base = 'results/uniprot_lake/2026_01/warehouse/uniprotkb'
 con.sql(f"CREATE VIEW entries AS SELECT * FROM iceberg_scan('{base}/entries')")
 con.sql(f"CREATE VIEW features AS SELECT * FROM iceberg_scan('{base}/features')")
 con.sql(f"CREATE VIEW xrefs AS SELECT * FROM iceberg_scan('{base}/xrefs')")
@@ -162,8 +194,8 @@ from pyiceberg.catalog.sql import SqlCatalog
 
 catalog = SqlCatalog(
     "uniprot",
-    uri="sqlite:///datalake/uniprot_lake_test_med/catalog.db",
-    warehouse="datalake/uniprot_lake_test_med/warehouse",
+    uri="sqlite:///results/uniprot_lake/2026_01/catalog.db",
+    warehouse="results/uniprot_lake/2026_01/warehouse",
 )
 entries = catalog.load_table("uniprotkb.entries")
 
@@ -179,14 +211,18 @@ df = entries.scan(
 ```python
 import polars as pl
 
-base = 'datalake/uniprot_lake_test_med/warehouse/uniprotkb'
+base = 'results/uniprot_lake/2026_01/warehouse/uniprotkb'
 df = pl.scan_parquet(f"{base}/entries/data/*.parquet")
 df.filter(pl.col("taxid") == 9606).select("acc", "gene_name").collect()
 ```
 
 ## Versioning
 
-Each release is a full rebuild of the Iceberg tables. The pipeline drops and recreates tables on each run, so there is no snapshot history across releases. Schema changes between releases are caught by the `SCHEMA_CHECK` step, which diffs the inferred schema against the previous release and requires manual review before proceeding.
+Each release is a full rebuild into its own isolated directory (`results/uniprot_lake/<release>/`). Previous releases are preserved untouched. The `manifest.json` in each release directory records provenance: input file checksums, `schema.json` checksum, git commit, row counts, and snapshot IDs.
+
+## Memory model
+
+The pipeline separates process memory (Nextflow directive) from the DuckDB buffer pool. By default, DuckDB gets 75% of the process memory — the remaining 25% provides headroom for the Python interpreter, PyArrow heap, and JSON parsing overhead. Configure via `--process_memory` and `--duckdb_pct`.
 
 ## Tech Stack
 
@@ -194,3 +230,4 @@ Each release is a full rebuild of the Iceberg tables. The pipeline drops and rec
 - **Compute**: DuckDB (JSON parsing, SQL transforms, sorting)
 - **Storage**: Apache Iceberg (PyIceberg + SQLite catalog)
 - **Format**: Parquet (zstd compression), sorted by `reviewed`, `taxid`
+- **Schema**: `schema.json` — single source of truth, human-readable, manually editable

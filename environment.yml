@@ -8,11 +8,10 @@ dependencies:
   - python>=3.11
   - pigz                # Parallel gzip decompression
   - zstd                # Zstandard compression for intermediate JSONL
-  - duckdb              # JSON/Parquet transformation engine
   - pyarrow             # Arrow IPC between DuckDB and PyIceberg
   - pip
   - pip:
       - pyiceberg[pyarrow,sql-sqlite]  # Iceberg table format + SQLite catalog
-      - duckdb                          # Python bindings
+      - duckdb                          # JSON/Parquet engine (Python bindings + C library)
       - orjson                          # Fast JSON serialisation for sorted JSONL
       - ijson                           # Streaming JSON parser

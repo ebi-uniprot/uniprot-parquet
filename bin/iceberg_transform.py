@@ -345,7 +345,12 @@ def get_catalog(catalog_uri: str, warehouse: str) -> SqlCatalog:
 
 
 def ensure_table(catalog, namespace, table_name, schema, sort_order):
-    """Create namespace + table if they don't already exist."""
+    """Create a fresh table, dropping any existing one first.
+
+    Each pipeline run is a full rebuild — appending to a pre-existing table
+    would duplicate data.  We unconditionally drop+recreate to guarantee
+    idempotency: running twice on the same warehouse produces identical results.
+    """
     try:
         catalog.create_namespace(namespace)
         eprint(f"  Created namespace '{namespace}'")
@@ -353,25 +358,37 @@ def ensure_table(catalog, namespace, table_name, schema, sort_order):
         pass
 
     full_name = f"{namespace}.{table_name}"
-    try:
-        table = catalog.create_table(
-            full_name,
-            schema=schema,
-            sort_order=sort_order,
-        )
-        eprint(f"  Created table '{full_name}'")
-    except TableAlreadyExistsError:
-        table = catalog.load_table(full_name)
-        eprint(f"  Loaded existing table '{full_name}'")
 
+    # Drop existing table to prevent data duplication on re-runs
+    try:
+        catalog.drop_table(full_name)
+        eprint(f"  Dropped existing table '{full_name}'")
+    except Exception:
+        pass  # Table didn't exist — fine
+
+    table = catalog.create_table(
+        full_name,
+        schema=schema,
+        sort_order=sort_order,
+    )
+    eprint(f"  Created table '{full_name}'")
     return table
 
 
 def _write_version_hint(table):
     """Write a version-hint.text file so DuckDB's iceberg_scan can find the latest metadata.
 
-    PyIceberg metadata files are named like 00002-<uuid>.metadata.json.
-    The version-hint.text file just contains the version number (e.g. "2").
+    ⚠️  FRAGILE INTEROP WORKAROUND — PyIceberg ↔ DuckDB
+    PyIceberg names metadata files as "00002-<uuid>.metadata.json".
+    DuckDB's iceberg_scan expects "v2.metadata.json" (or version-hint.text).
+    This function bridges the gap by writing the hint file AND creating a
+    symlink.  If either tool changes its naming convention, this will break.
+
+    Do NOT introduce additional Iceberg writers (e.g. Spark) that won't
+    maintain these hint files.  If you need multi-writer support, switch to
+    a REST catalog which handles metadata resolution centrally.
+
+    Tested against: PyIceberg 0.7-0.11, DuckDB 1.1+.
     """
     table_location = table.location().replace("file://", "")
     metadata_dir = os.path.join(table_location, "metadata")

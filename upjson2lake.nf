@@ -33,18 +33,23 @@ nextflow.enable.dsl = 2
 params.inputfile      = "${projectDir}/entries_test.json"
 params.outdir         = "${projectDir}/results/uniprot_lake"
 params.release        = "2026_01"
-params.memory_limit   = '96GB'    // DuckDB memory limit (passed via --memory_limit)
+params.process_memory = '96 GB'   // Total memory for heavy processes (Nextflow directive)
+params.duckdb_pct     = 75        // % of process_memory allocated to DuckDB buffer pool
 params.schema         = "${projectDir}/schema.json"
+params.notify_email   = null      // Email for SLURM failure notifications (null = disabled)
 
 // Final output directory: <outdir>/<release>/
 def release_dir = "${params.outdir}/${params.release}"
 
-/* ── SCRIPTS ──────────────────────────────────────────────────────── */
-stream_script        = "${projectDir}/bin/stream_jsonl.py"
-schema_check_script  = "${projectDir}/bin/schema_check.py"
-transform_script     = "${projectDir}/bin/iceberg_transform.py"
-validate_script      = "${projectDir}/bin/validate_iceberg.py"
-manifest_script      = "${projectDir}/bin/release_manifest.py"
+// Compute DuckDB memory limit as a fraction of process memory, leaving headroom
+// for the Python interpreter, PyArrow heap, and JSON parsing overhead.
+import nextflow.util.MemoryUnit
+def proc_bytes    = MemoryUnit.of(params.process_memory).toBytes()
+def duckdb_bytes  = (long)(proc_bytes * params.duckdb_pct / 100)
+def duckdb_memory = "${(int)(duckdb_bytes / (1024*1024*1024))}GB"
+
+// Scripts live in bin/ which Nextflow adds to $PATH automatically.
+// This allows the pipeline to run from remote URLs (e.g. GitHub).
 
 
 /* ── PROCESS: Stream input to single zstd-compressed JSONL ────────── */
@@ -67,7 +72,7 @@ process STREAM_JSONL {
     echo " .-- STREAM_JSONL BEGUN \$(date)"
 
     pigz -dc ${inputfile} \
-        | python3 ${stream_script} \
+        | stream_jsonl.py \
         | zstd -3 -T${cpus} -o uniprot.jsonl.zst
 
     echo " '-- STREAM_JSONL ENDED \$(date)"
@@ -79,7 +84,7 @@ process STREAM_JSONL {
 process SCHEMA_CHECK {
     tag 'schema_check'
     cpus 4
-    memory "${params.memory_limit.replace('GB', ' GB')}"
+    memory params.process_memory
     time '4h'
 
     input:
@@ -94,9 +99,10 @@ process SCHEMA_CHECK {
     set -euo pipefail
     echo " .-- SCHEMA_CHECK BEGUN \$(date)"
 
-    python3 ${schema_check_script} ${jsonl} \
+    schema_check.py ${jsonl} \
         --duckdb-schema ${duckdb_schema} \
-        --memory-limit ${params.memory_limit}
+        --memory-limit ${duckdb_memory} \
+        --threads ${task.cpus}
 
     echo " '-- SCHEMA_CHECK ENDED \$(date)"
     """
@@ -107,12 +113,14 @@ process SCHEMA_CHECK {
 process ICEBERG_TRANSFORM {
     tag 'transform'
     cpus 4
-    memory "${params.memory_limit.replace('GB', ' GB')}"
+    memory params.process_memory
     time '48h'
 
+    // 'copy' because warehouse/catalog/jsonl are consumed by VALIDATE and MANIFEST;
+    // 'move' would remove them from work/ before downstream staging symlinks resolve.
     publishDir "${release_dir}", mode: 'copy', pattern: 'warehouse'
     publishDir "${release_dir}", mode: 'copy', pattern: 'catalog.db'
-    publishDir "${release_dir}", mode: 'copy', pattern: 'uniprot.jsonl.zst'
+    publishDir "${release_dir}", mode: 'copy', pattern: 'sorted.jsonl.zst'
 
     input:
     path jsonl
@@ -122,21 +130,22 @@ process ICEBERG_TRANSFORM {
     output:
     path "warehouse",         emit: warehouse
     path "catalog.db",        emit: catalog
-    path "uniprot.jsonl.zst", emit: jsonl
+    path "sorted.jsonl.zst",  emit: sorted_jsonl
 
     script:
     """
     set -euo pipefail
     echo " .-- ICEBERG_TRANSFORM BEGUN \$(date)"
 
-    python3 ${transform_script} ${jsonl} \
+    iceberg_transform.py ${jsonl} \
         --schema ${duckdb_schema} \
         --catalog-uri sqlite:///catalog.db \
         --warehouse ./warehouse \
         --namespace uniprotkb \
-        --memory-limit ${params.memory_limit} \
+        --memory-limit ${duckdb_memory} \
+        --threads ${task.cpus} \
         --release ${params.release} \
-        --sorted-jsonl uniprot.jsonl.zst
+        --sorted-jsonl sorted.jsonl.zst
 
     echo " '-- ICEBERG_TRANSFORM ENDED \$(date)"
     """
@@ -149,7 +158,7 @@ process VALIDATE {
     cpus 1
     memory '4 GB'
 
-    publishDir "${release_dir}", mode: 'copy'
+    publishDir "${release_dir}", mode: 'move'
 
     input:
     path warehouse
@@ -162,7 +171,7 @@ process VALIDATE {
     """
     set -euo pipefail
 
-    python3 ${validate_script} \
+    validate_iceberg.py \
         --catalog-uri sqlite:///${catalog} \
         --warehouse ${warehouse} \
         --namespace uniprotkb \
@@ -177,7 +186,7 @@ process MANIFEST {
     cpus 1
     memory '1 GB'
 
-    publishDir "${release_dir}", mode: 'copy'
+    publishDir "${release_dir}", mode: 'move'
 
     input:
     path warehouse
@@ -192,7 +201,7 @@ process MANIFEST {
     """
     set -euo pipefail
 
-    python3 ${manifest_script} \
+    release_manifest.py \
         --catalog-uri sqlite:///${catalog} \
         --warehouse ${warehouse} \
         --namespace uniprotkb \
@@ -214,7 +223,7 @@ workflow {
     Input:      ${params.inputfile}
     Schema:     ${params.schema}
     Output:     ${release_dir}
-    DuckDB mem: ${params.memory_limit}
+    DuckDB mem: ${duckdb_memory} (${params.duckdb_pct}% of ${params.process_memory})
     ─────────────────────────────────────────────────────────────
     """.stripIndent()
 
@@ -224,7 +233,8 @@ workflow {
         System.exit(2)
     }
 
-    schema_ch = Channel.fromPath(params.schema)
+    // Value channel so it can be consumed by multiple processes without exhaustion
+    schema_ch = Channel.value(file(params.schema))
 
     // 1. Stream input → single zstd-compressed JSONL
     input_ch = Channel.fromPath(params.inputfile)
@@ -252,7 +262,7 @@ workflow {
     MANIFEST(
         ICEBERG_TRANSFORM.out.warehouse,
         ICEBERG_TRANSFORM.out.catalog,
-        ICEBERG_TRANSFORM.out.jsonl,
+        ICEBERG_TRANSFORM.out.sorted_jsonl,
         schema_ch,
     )
 }
