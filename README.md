@@ -15,9 +15,9 @@ Each release lands in its own directory (`<outdir>/<release>/`):
 | `catalog.db`                    | SQLite Iceberg catalog                                |
 | `sorted.jsonl.zst`              | JSONL archive sorted by review status then taxid      |
 | `manifest.json`                 | Provenance record (checksums, git commit, row counts) |
-| `validation_report.txt`         | Row counts, snapshot IDs, consistency checks          |
+| `validation_report.txt`         | 8-check production validation (see below)             |
 
-All tables are sorted by `reviewed` then `taxid`. Iceberg handles data skipping via per-file column statistics — queries filtering on either column skip most data files automatically. No Hive partitioning needed.
+All tables are sorted by `reviewed DESC` (Swiss-Prot first) then `taxid ASC`. Iceberg handles data skipping via per-file column statistics — queries filtering on either column skip most data files automatically. No Hive partitioning needed.
 
 ## Setup
 
@@ -32,17 +32,30 @@ Or with pip:
 pip install -r requirements.txt
 ```
 
+## Demo
+
+The quickest way to see the pipeline in action. Downloads ~3,800 reviewed *Drosophila melanogaster* proteins from UniProtKB and builds a complete Iceberg data lake:
+
+```bash
+cd demo && ./run_demo.sh
+```
+
+This creates `demo/lake/2026_01/` with the full output (warehouse, catalog, sorted JSONL, validation report, manifest). The download is cached — re-running skips it. Use `--clean` to wipe the lake and rebuild from scratch.
+
 ## Running
 
 ```bash
-# Small test (25 entries)
-./run_lake.sh test_small
-
-# Medium test (~100k entries)
-./run_lake.sh test_med
+# Local test (uses committed small.json.gz, 44 entries)
+nextflow run upjson2lake.nf -profile local \
+    --inputfile tests/fixtures/small.json.gz \
+    --release test_2026
 
 # Production (SLURM)
-./run_lake.sh prod --input /path/to/UniProtKB.json.gz --outdir /scratch/lake
+nextflow run upjson2lake.nf -profile prod \
+    --inputfile /path/to/UniProtKB.json.gz \
+    --release 2026_02 \
+    --outdir /scratch/uniprot_lake \
+    --duckdb_temp /hps/nobackup/.../tmp
 ```
 
 ## Schema management
@@ -50,6 +63,7 @@ pip install -r requirements.txt
 `schema.json` is the **single source of truth** for column types. It maps each top-level JSON field to its DuckDB type and is used by `read_json(columns={...})` for deterministic parsing. The Iceberg schemas are derived from it at transform time (cheap LIMIT 1 inference, sub-second).
 
 **Bootstrap** (run once on the full dataset):
+
 ```bash
 python bin/schema_bootstrap.py /path/to/full_uniprotkb.jsonl.zst \
     --schema-json-out schema.json \
@@ -75,15 +89,20 @@ UniProtKB.json.gz
 +---------------+   Full-scan JSONL validation against schema.json
 | SCHEMA_CHECK  |   (reads every row with declared types; ~30-60 min)
 +-------+-------+
-        |  (gate: transform only runs if validation passes)
+        |  (gate: sort + transform only run if validation passes)
         v
-+-------------------+   DuckDB (read + transform + sort)
-| ICEBERG_TRANSFORM |   PyIceberg (write Iceberg tables)
-+-------+-----------+   Iceberg schemas inferred cheaply (LIMIT 1)
++------------+   DuckDB out-of-core sort
+| SORT_JSONL |──────────────────────────> sorted.jsonl.zst
++------+-----+
+       |  (pre-sorted input makes DuckDB ORDER BY nearly free)
+       v
++-------------------+   DuckDB + PyIceberg
+| ICEBERG_TRANSFORM |──> warehouse/ + catalog.db
++-------+-----------+
         |
         v
-+----------+   Row counts, snapshot checks, consistency
-| VALIDATE |
++----------+   Completeness, referential integrity, sort order,
+| VALIDATE |   round-trip spot checks, Parquet integrity
 +----+-----+
      |
      v
@@ -94,7 +113,20 @@ UniProtKB.json.gz
 
 DuckDB handles the heavy lifting: JSON parsing, SQL transformations (flattening, unnesting), and sorting. It streams Arrow record batches to PyIceberg, which writes the Iceberg data files and manages the SQLite catalog. Memory stays bounded regardless of dataset size.
 
-The pipeline is **idempotent** — re-running on the same release directory drops and recreates all tables, so row counts are always correct. Each release gets its own isolated directory and catalog.
+The pipeline is **idempotent** — re-running on the same release directory drops and recreates all tables, so row counts are always correct. Each release gets its own isolated directory and catalog. With `--skip-existing`, partially completed runs resume from where they left off (tables already written are preserved).
+
+## Production validation
+
+The `VALIDATE` step runs 8 checks against the source JSONL as ground truth. Any single failure exits 1 and blocks the provenance manifest:
+
+1. **Completeness** — JSONL line count == entries rows; child table counts match `sum(entries.*_count)`
+2. **Uniqueness** — `entries.acc` has zero duplicates
+3. **Null keys** — `acc`, `reviewed`, `taxid` never null across all tables
+4. **Referential integrity** — every `acc` in features/xrefs/comments exists in entries
+5. **Sort order** — all tables sorted by `(reviewed DESC, taxid ASC)`
+6. **Round-trip spot check** — 1000 reservoir-sampled entries verified field-by-field against JSONL
+7. **Parquet file integrity** — every `.parquet` file in the warehouse is readable
+8. **Snapshot sanity** — each table has exactly 1 APPEND snapshot
 
 ## Schema
 
@@ -107,7 +139,7 @@ This means no UniProtKB data is discarded. Users needing isoforms, gene synonyms
 
 Parquet's columnar storage mitigates any read-amplification cost — if a query touches 5 of 30+ columns, only those 5 are read from disk. Supplementary normalized tables (features, xrefs, comments) are provided for high-cardinality relationships that would make the main table unwieldy as arrays.
 
-All four tables are sorted by `reviewed` (Swiss-Prot vs TrEMBL) then `taxid`, and all include denormalized entry-level fields (`acc`, `reviewed`, `taxid`) so most queries don't need joins.
+All four tables are sorted by `reviewed DESC` (Swiss-Prot first) then `taxid ASC`, and all include denormalized entry-level fields (`acc`, `reviewed`, `taxid`) so most queries don't need joins.
 
 **entries** — one row per protein, the primary table for 90% of use cases:
 
@@ -229,5 +261,5 @@ The pipeline separates process memory (Nextflow directive) from the DuckDB buffe
 - **Orchestration**: Nextflow (DSL2, SLURM support)
 - **Compute**: DuckDB (JSON parsing, SQL transforms, sorting)
 - **Storage**: Apache Iceberg (PyIceberg + SQLite catalog)
-- **Format**: Parquet (zstd compression), sorted by `reviewed`, `taxid`
+- **Format**: Parquet (zstd compression), sorted by `reviewed DESC`, `taxid ASC`
 - **Schema**: `schema.json` — single source of truth, human-readable, manually editable

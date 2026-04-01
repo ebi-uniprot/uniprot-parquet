@@ -267,27 +267,39 @@ class TestDataIntegrity:
         assert entries_table.properties.get("uniprot.release") == "test_2026"
 
 
-# ─── Sorted by reviewed, taxid ─────────────────────────────────────
+# ─── Sort order: reviewed DESC, taxid ASC ─────────────────────────
+# Note: small.json.gz contains only reviewed (Swiss-Prot) entries, so
+# the reviewed DESC ordering is trivially satisfied.  The production
+# validator (validate_iceberg.py) tests the full two-column sort on
+# datasets with both reviewed and unreviewed entries.
 
 
 class TestSortOrder:
-    def test_entries_sorted_by_taxid(self, entries_table):
-        """Verify entries are sorted by taxid (ascending)."""
-        arrow = entries_table.scan(selected_fields=("taxid",)).to_arrow()
+    def test_entries_sorted_by_reviewed_desc_taxid_asc(self, entries_table):
+        """Verify entries are sorted by (reviewed DESC, taxid ASC)."""
+        arrow = entries_table.scan(selected_fields=("reviewed", "taxid")).to_arrow()
+        reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
-        assert taxids == sorted(taxids), "Entries not sorted by taxid"
+        pairs = [(not r, t) for r, t in zip(reviewed, taxids)]
+        assert pairs == sorted(pairs), "Entries not sorted by (reviewed DESC, taxid ASC)"
 
-    def test_features_sorted_by_taxid(self, features_table):
-        arrow = features_table.scan(selected_fields=("taxid",)).to_arrow()
+    def test_features_sorted_by_reviewed_desc_taxid_asc(self, features_table):
+        arrow = features_table.scan(selected_fields=("reviewed", "taxid")).to_arrow()
+        reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
-        assert taxids == sorted(taxids), "Features not sorted by taxid"
+        pairs = [(not r, t) for r, t in zip(reviewed, taxids)]
+        assert pairs == sorted(pairs), "Features not sorted by (reviewed DESC, taxid ASC)"
 
-    def test_xrefs_sorted_by_taxid(self, xrefs_table):
-        arrow = xrefs_table.scan(selected_fields=("taxid",)).to_arrow()
+    def test_xrefs_sorted_by_reviewed_desc_taxid_asc(self, xrefs_table):
+        arrow = xrefs_table.scan(selected_fields=("reviewed", "taxid")).to_arrow()
+        reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
-        assert taxids == sorted(taxids), "Xrefs not sorted by taxid"
+        pairs = [(not r, t) for r, t in zip(reviewed, taxids)]
+        assert pairs == sorted(pairs), "Xrefs not sorted by (reviewed DESC, taxid ASC)"
 
-    def test_comments_sorted_by_taxid(self, comments_table):
-        arrow = comments_table.scan(selected_fields=("taxid",)).to_arrow()
+    def test_comments_sorted_by_reviewed_desc_taxid_asc(self, comments_table):
+        arrow = comments_table.scan(selected_fields=("reviewed", "taxid")).to_arrow()
+        reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
-        assert taxids == sorted(taxids), "Comments not sorted by taxid"
+        pairs = [(not r, t) for r, t in zip(reviewed, taxids)]
+        assert pairs == sorted(pairs), "Comments not sorted by (reviewed DESC, taxid ASC)"

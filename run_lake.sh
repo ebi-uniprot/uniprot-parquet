@@ -26,27 +26,31 @@ done
 # ─── Defaults ─────────────────────────────────────────────────────
 case "$MODE" in
     test_small)
-        INPUTFILE="test_json/small.json.gz"
+        INPUTFILE="tests/fixtures/small.json.gz"
         OUTDIR="$(pwd)/datalake/uniprot_lake_test_small"
         MEMORY="8GB"
+        RELEASE="test_small"
         PROFILE="local"
         ;;
     test_med)
-        INPUTFILE="test_json/med.json.gz"
+        INPUTFILE="demo/input.json.gz"
         OUTDIR="$(pwd)/datalake/uniprot_lake_test_med"
         MEMORY="8GB"
+        RELEASE="test_med"
         PROFILE="local"
         ;;
     subset)
         INPUTFILE="~/uniprot100k.json.gz"
         OUTDIR="$(pwd)/datalake"
         MEMORY="16GB"
+        RELEASE="subset"
         PROFILE="short"
         ;;
     prod)
         INPUTFILE="UniProtKB.json.gz"
         OUTDIR="$(pwd)/datalake"
         MEMORY="96GB"
+        RELEASE="2026_01"
         PROFILE="prod"
         ;;
     *)
@@ -60,9 +64,10 @@ esac
 [[ -n "$OUTDIR_OVERRIDE" ]]    && OUTDIR="$OUTDIR_OVERRIDE"
 
 echo "╔═══════════════════════════════════════════════════════╗"
-echo "║  UniProtKB → Iceberg Data Lake  v4.0                  ║"
+echo "║  UniProtKB → Iceberg Data Lake                        ║"
 echo "╠═══════════════════════════════════════════════════════╣"
 echo "║  Mode:      $MODE"
+echo "║  Release:   $RELEASE"
 echo "║  Input:     $INPUTFILE"
 echo "║  Output:    $OUTDIR"
 echo "║  Memory:    $MEMORY"
@@ -73,7 +78,8 @@ echo ""
 COMMAND="nextflow run upjson2lake.nf \
     --inputfile ${INPUTFILE} \
     --outdir ${OUTDIR} \
-    --memory_limit ${MEMORY} \
+    --process_memory '${MEMORY}' \
+    --release ${RELEASE} \
     -profile ${PROFILE} \
     -ansi-log true \
     -resume"

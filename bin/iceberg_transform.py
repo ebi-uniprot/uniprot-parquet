@@ -26,8 +26,7 @@ Usage:
         --warehouse /path/to/warehouse \
         [--namespace uniprotkb] \
         [--memory-limit 16GB] \
-        [--batch-size 1000000] \
-        [--sorted-jsonl /path/to/sorted.jsonl.zst]
+        [--batch-size 1000000]
 
 Requires: duckdb, pyiceberg[pyarrow,sql-sqlite], pyarrow
 """
@@ -44,13 +43,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq  # used by stream_to_iceberg
 
 from pyiceberg.catalog.sql import SqlCatalog
-from pyiceberg.exceptions import (
-    NamespaceAlreadyExistsError,
-    TableAlreadyExistsError,
-)
+from pyiceberg.exceptions import NamespaceAlreadyExistsError
 from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.schema import Schema, assign_fresh_schema_ids
-from pyiceberg.table.sorting import SortOrder, SortField
+from pyiceberg.table.sorting import SortOrder, SortField, SortDirection
 from pyiceberg.transforms import IdentityTransform
 
 
@@ -60,37 +56,46 @@ def eprint(*args, **kwargs):
 
 # ─── DuckDB helpers ──────────────────────────────────────────────────────
 
+def _sql_escape(path: str) -> str:
+    """Escape a file path for use inside a DuckDB SQL string literal."""
+    return path.replace("'", "''")
+
+
 def build_read_clause(jsonl_path: str, schema_path: str | None) -> str:
     """Build the DuckDB read_json SQL fragment.
 
     If a committed schema.json is provided, use explicit column types
     for deterministic parsing.  Otherwise fall back to auto-detect.
     """
+    safe_path = _sql_escape(jsonl_path)
     if schema_path and os.path.exists(schema_path):
         with open(schema_path) as f:
             schema = json.load(f)
         cols = ", ".join(f"'{name}': '{dtype}'" for name, dtype in schema.items())
         return (
-            f"read_json('{jsonl_path}', format='newline_delimited', "
+            f"read_json('{safe_path}', format='newline_delimited', "
             f"maximum_object_size=536870912, columns={{{cols}}})"
         )
     else:
         return (
-            f"read_json_auto('{jsonl_path}', format='newline_delimited', "
+            f"read_json_auto('{safe_path}', format='newline_delimited', "
             f"maximum_object_size=536870912)"
         )
 
 
-def init_duckdb(memory_limit: str, threads: int | None) -> duckdb.DuckDBPyConnection:
+def init_duckdb(memory_limit: str, threads: int | None,
+                 temp_dir: str | None = None) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     con.sql(f"SET memory_limit='{memory_limit}'")
     if threads:
         con.sql(f"SET threads={threads}")
-    # Use SLURM's $TMPDIR (local scratch) if available, else system default
-    temp_dir = os.environ.get("TMPDIR", "/tmp/duckdb_temp")
-    temp_dir = os.path.join(temp_dir, "duckdb_spill")
-    os.makedirs(temp_dir, exist_ok=True)
-    con.sql(f"SET temp_directory='{temp_dir}'")
+    # Priority: explicit --temp-dir > $TMPDIR (SLURM local scratch) > /tmp
+    if temp_dir is None:
+        temp_dir = os.environ.get("TMPDIR", "/tmp/duckdb_temp")
+    spill_dir = os.path.join(temp_dir, "duckdb_spill")
+    os.makedirs(spill_dir, exist_ok=True)
+    con.sql(f"SET temp_directory='{_sql_escape(spill_dir)}'")
+    eprint(f"  DuckDB temp directory: {spill_dir}")
     return con
 
 
@@ -172,7 +177,7 @@ SELECT
     e.geneLocations                                 AS gene_locations
 
 FROM {read_clause} e
-ORDER BY reviewed, e.organism.taxonId
+ORDER BY reviewed DESC, e.organism.taxonId
 """
 
 
@@ -217,7 +222,7 @@ FROM (
     FROM {read_clause} e
     WHERE e.features IS NOT NULL AND len(e.features) > 0
 ) sub, LATERAL unnest(sub.features)
-ORDER BY sub.reviewed, sub.taxid
+ORDER BY sub.reviewed DESC, sub.taxid
 """
 
 
@@ -242,7 +247,7 @@ FROM (
     WHERE e.uniProtKBCrossReferences IS NOT NULL
       AND len(e.uniProtKBCrossReferences) > 0
 ) sub, LATERAL unnest(sub.uniProtKBCrossReferences)
-ORDER BY sub.reviewed, sub.taxid, unnest.database
+ORDER BY sub.reviewed DESC, sub.taxid, unnest.database
 """
 
 
@@ -270,17 +275,9 @@ FROM (
     FROM {read_clause} e
     WHERE e.comments IS NOT NULL AND len(e.comments) > 0
 ) sub, LATERAL unnest(sub.comments)
-ORDER BY sub.reviewed, sub.taxid, unnest.commentType
+ORDER BY sub.reviewed DESC, sub.taxid, unnest.commentType
 """
 
-
-SORTED_JSONL_SQL = """
-SELECT *
-FROM {read_clause} e
-ORDER BY
-    CASE WHEN e.entryType LIKE '%Swiss-Prot%' THEN 0 ELSE 1 END,
-    e.organism.taxonId
-"""
 
 
 # ─── Schema inference ────────────────────────────────────────────────────
@@ -310,7 +307,13 @@ def infer_iceberg_schema(con, sql: str, label: str) -> Schema:
     cheap_sql = _inference_sql(sql)
     result = con.sql(cheap_sql)
     reader = result.to_arrow_reader(batch_size=1)
-    batch = next(reader)
+    try:
+        batch = next(reader)
+    except StopIteration:
+        raise RuntimeError(
+            f"Schema inference for '{label}' returned no rows. "
+            f"The input JSONL may be empty or have no data for this table."
+        )
     del reader, result
 
     raw_schema = _pyarrow_to_schema_without_ids(batch.schema)
@@ -320,14 +323,26 @@ def infer_iceberg_schema(con, sql: str, label: str) -> Schema:
     return iceberg_schema
 
 
-def _sort_order_for(iceberg_schema: Schema, *column_names: str) -> SortOrder:
-    """Build a SortOrder on one or more named columns by looking up their field IDs."""
-    return SortOrder(
-        *(
-            SortField(source_id=iceberg_schema.find_field(name).field_id, transform=IdentityTransform())
-            for name in column_names
-        ),
-    )
+def _sort_order_for(iceberg_schema: Schema, *column_specs) -> SortOrder:
+    """Build a SortOrder on one or more columns by looking up their field IDs.
+
+    Each spec is either a column name (defaults to ASC) or a tuple of
+    (column_name, SortDirection).
+    """
+    fields = []
+    for spec in column_specs:
+        if isinstance(spec, tuple):
+            name, direction = spec
+        else:
+            name, direction = spec, SortDirection.ASC
+        fields.append(
+            SortField(
+                source_id=iceberg_schema.find_field(name).field_id,
+                transform=IdentityTransform(),
+                direction=direction,
+            )
+        )
+    return SortOrder(*fields)
 
 
 
@@ -342,6 +357,20 @@ def get_catalog(catalog_uri: str, warehouse: str) -> SqlCatalog:
             "warehouse": warehouse,
         },
     )
+
+
+def _table_has_data(catalog, namespace, table_name) -> bool:
+    """Check if a table exists and has at least one snapshot with rows."""
+    full_name = f"{namespace}.{table_name}"
+    try:
+        table = catalog.load_table(full_name)
+        snapshot = table.current_snapshot()
+        if snapshot and snapshot.summary:
+            count = int(snapshot.summary.get("total-records", 0))
+            return count > 0
+    except Exception:
+        pass
+    return False
 
 
 def ensure_table(catalog, namespace, table_name, schema, sort_order):
@@ -394,10 +423,6 @@ def _write_version_hint(table):
     metadata_dir = os.path.join(table_location, "metadata")
     if not os.path.isdir(metadata_dir):
         return
-    # Find the highest-numbered metadata file and create DuckDB-compatible symlinks.
-    # PyIceberg writes metadata as "00002-<uuid>.metadata.json" but DuckDB's
-    # iceberg_scan expects "v2.metadata.json".  We write the version-hint.text
-    # AND create a symlink so DuckDB can find it.
     metadata_files = {}
     for fname in os.listdir(metadata_dir):
         if fname.endswith(".metadata.json"):
@@ -438,7 +463,7 @@ def stream_to_iceberg(con, sql, table, batch_size, label="table"):
 
     Returns the total number of rows written.
     """
-    eprint(f"  Querying DuckDB for {label} (sorted by taxid)...")
+    eprint(f"  Querying DuckDB for {label} (sorted by reviewed DESC, taxid)...")
     t0 = time.time()
 
     result = con.sql(sql)
@@ -464,7 +489,8 @@ def stream_to_iceberg(con, sql, table, batch_size, label="table"):
 
         parquet_path = os.path.join(data_dir, f"{label}_{file_num:05d}.parquet")
         t1 = time.time()
-        pq.write_table(arrow_tbl, parquet_path, compression="zstd")
+        pq.write_table(arrow_tbl, parquet_path, compression="zstd",
+                       row_group_size=100_000)
         parquet_files.append(parquet_path)
         eprint(
             f"    batch {file_num}: {n:,} rows "
@@ -509,36 +535,17 @@ def write_comments(con, read_clause, table, batch_size):
     return stream_to_iceberg(con, sql, table, batch_size, label="comments")
 
 
-def write_sorted_jsonl(con, read_clause, output_path):
-    """Write a taxid-sorted JSONL.zst file using DuckDB's native COPY.
-
-    DuckDB handles the JSON serialisation and zstd compression internally,
-    which is faster than streaming through Python and avoids the orjson /
-    subprocess dependency for this code path.
-    """
-    eprint(f"  Writing sorted JSONL to {output_path}...")
-    t0 = time.time()
-
-    sql = SORTED_JSONL_SQL.format(read_clause=read_clause)
-    con.sql(f"""
-        COPY ({sql}) TO '{output_path}'
-        (FORMAT JSON, COMPRESSION ZSTD)
-    """)
-
-    elapsed = time.time() - t0
-    eprint(f"  Wrote sorted JSONL in {elapsed:.1f}s")
-
 
 # ─── Main ───────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Transform UniProtKB JSONL → Iceberg tables (entries + features)"
+        description="Transform UniProtKB JSONL → Iceberg tables (entries, features, xrefs, comments)"
     )
     parser.add_argument("input", help="Input JSONL(.zst) file")
     parser.add_argument(
         "--schema", default=None,
-        help="Committed DuckDB schema JSON (from infer_schema.py). "
+        help="Committed DuckDB schema JSON (from schema_bootstrap.py). "
              "If omitted, DuckDB auto-detects.",
     )
     parser.add_argument(
@@ -560,12 +567,19 @@ def main():
         help="Rows per Arrow batch (controls peak memory; default 1M)",
     )
     parser.add_argument(
-        "--sorted-jsonl", default=None,
-        help="If set, also write a taxid-sorted JSONL.zst file to this path",
-    )
-    parser.add_argument(
         "--release", default=None,
         help="Release label (e.g. 2026_01). Stored as table property.",
+    )
+    parser.add_argument(
+        "--temp-dir", default=None,
+        help="DuckDB spill directory for ORDER BY temp files. "
+             "Defaults to $TMPDIR or /tmp/duckdb_temp.",
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="Skip tables that already have data in the catalog. "
+             "Enables resume after OOM: on retry, previously written "
+             "tables are skipped instead of dropped+recreated.",
     )
     args = parser.parse_args()
 
@@ -584,40 +598,47 @@ def main():
     eprint()
 
     # ── Init DuckDB ──
-    con = init_duckdb(args.memory_limit, args.threads)
+    con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
     read_clause = build_read_clause(jsonl_path, args.schema)
 
     # ── Infer Iceberg schemas (cheap: LIMIT 1, no ORDER BY) ──
     eprint("--- SCHEMA INFERENCE ---")
-    table_names = ["entries", "features", "xrefs", "comments"]
-    table_sqls = [ENTRIES_SQL, FEATURES_SQL, XREFS_SQL, COMMENTS_SQL]
+    TABLE_DEFS = [
+        ("entries",  ENTRIES_SQL,  (("reviewed", SortDirection.DESC), "taxid")),
+        ("features", FEATURES_SQL, (("reviewed", SortDirection.DESC), "taxid")),
+        ("xrefs",    XREFS_SQL,    (("reviewed", SortDirection.DESC), "taxid", "database")),
+        ("comments", COMMENTS_SQL, (("reviewed", SortDirection.DESC), "taxid", "comment_type")),
+    ]
 
     schemas = {}
-    for name, sql_template in zip(table_names, table_sqls):
+    sort_orders = {}
+    for name, sql_template, sort_cols in TABLE_DEFS:
         schemas[name] = infer_iceberg_schema(
             con, sql_template.format(read_clause=read_clause), name
         )
-
-    entries_schema = schemas["entries"]
-    features_schema = schemas["features"]
-    xrefs_schema = schemas["xrefs"]
-    comments_schema = schemas["comments"]
-
-    entries_sort = _sort_order_for(entries_schema, "reviewed", "taxid")
-    features_sort = _sort_order_for(features_schema, "reviewed", "taxid")
-    xrefs_sort = _sort_order_for(xrefs_schema, "reviewed", "taxid", "database")
-    comments_sort = _sort_order_for(comments_schema, "reviewed", "taxid", "comment_type")
+        sort_orders[name] = _sort_order_for(schemas[name], *sort_cols)
 
     # ── Init Iceberg catalog ──
     catalog = get_catalog(args.catalog_uri, warehouse)
+
+    # With --skip-existing, check which tables already have data and skip them.
+    # This enables resume after OOM: on retry, previously written tables
+    # are left intact instead of being dropped+recreated.
+    skip_set = set()
+    if args.skip_existing:
+        for name, _, _ in TABLE_DEFS:
+            if _table_has_data(catalog, args.namespace, name):
+                skip_set.add(name)
+                eprint(f"  SKIP {name} (already has data, --skip-existing)")
+
     tables = {}
-    for name, schema, sort in [
-        ("entries", entries_schema, entries_sort),
-        ("features", features_schema, features_sort),
-        ("xrefs", xrefs_schema, xrefs_sort),
-        ("comments", comments_schema, comments_sort),
-    ]:
-        tables[name] = ensure_table(catalog, args.namespace, name, schema, sort)
+    for name, _, _ in TABLE_DEFS:
+        if name in skip_set:
+            tables[name] = catalog.load_table(f"{args.namespace}.{name}")
+        else:
+            tables[name] = ensure_table(
+                catalog, args.namespace, name, schemas[name], sort_orders[name]
+            )
 
     # Tag release as a table property if provided
     if args.release:
@@ -628,23 +649,23 @@ def main():
 
     # ── Write tables ──
     t_total = time.time()
+    counts = {}
 
-    eprint("\n--- ENTRIES ---")
-    n_entries = write_entries(con, read_clause, tables["entries"], args.batch_size)
+    table_writers = [
+        ("entries",  write_entries),
+        ("features", write_features),
+        ("xrefs",    write_xrefs),
+        ("comments", write_comments),
+    ]
 
-    eprint("\n--- FEATURES ---")
-    n_features = write_features(con, read_clause, tables["features"], args.batch_size)
-
-    eprint("\n--- XREFS ---")
-    n_xrefs = write_xrefs(con, read_clause, tables["xrefs"], args.batch_size)
-
-    eprint("\n--- COMMENTS ---")
-    n_comments = write_comments(con, read_clause, tables["comments"], args.batch_size)
-
-    # ── Sorted JSONL (optional) ──
-    if args.sorted_jsonl:
-        eprint("\n--- SORTED JSONL ---")
-        write_sorted_jsonl(con, read_clause, args.sorted_jsonl)
+    for name, writer_fn in table_writers:
+        eprint(f"\n--- {name.upper()} ---")
+        if name in skip_set:
+            prev = int(tables[name].current_snapshot().summary["total-records"])
+            eprint(f"  Skipped ({prev:,} rows already written)")
+            counts[name] = prev
+        else:
+            counts[name] = writer_fn(con, read_clause, tables[name], args.batch_size)
 
     # ── Write version-hint.text for DuckDB iceberg_scan compatibility ──
     for tbl_name, tbl in tables.items():
@@ -655,10 +676,9 @@ def main():
     elapsed = time.time() - t_total
     eprint("\n" + "=" * 60)
     eprint(f"DONE in {elapsed:.1f}s")
-    eprint(f"  entries:  {n_entries:,} rows")
-    eprint(f"  features: {n_features:,} rows")
-    eprint(f"  xrefs:    {n_xrefs:,} rows")
-    eprint(f"  comments: {n_comments:,} rows")
+    for name in ["entries", "features", "xrefs", "comments"]:
+        status = " (skipped)" if name in skip_set else ""
+        eprint(f"  {name}: {counts[name]:,} rows{status}")
 
     for name, tbl in tables.items():
         eprint(f"  {name} snapshot: {tbl.current_snapshot()}")

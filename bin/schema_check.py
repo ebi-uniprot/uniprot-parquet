@@ -25,8 +25,6 @@ import sys
 import argparse
 import time
 
-import duckdb
-
 # Allow importing from the same bin/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from iceberg_transform import build_read_clause, init_duckdb
@@ -47,6 +45,10 @@ def main():
     )
     parser.add_argument("--memory-limit", default="16GB", help="DuckDB memory limit")
     parser.add_argument("--threads", type=int, default=None, help="DuckDB threads")
+    parser.add_argument(
+        "--temp-dir", default=None,
+        help="DuckDB spill directory. Defaults to $TMPDIR or /tmp/duckdb_temp.",
+    )
     # Kept for Nextflow backward compat but unused:
     parser.add_argument("--release", default=None, help="(ignored, kept for CLI compat)")
     parser.add_argument("--schema-dir", default=None, help="(ignored, kept for CLI compat)")
@@ -67,7 +69,7 @@ def main():
     eprint(f"  Schema: {schema_path}")
 
     # ── Init DuckDB ──
-    con = init_duckdb(args.memory_limit, args.threads)
+    con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
     read_clause = build_read_clause(jsonl_path, schema_path)
 
     # ── Full-scan validation ──

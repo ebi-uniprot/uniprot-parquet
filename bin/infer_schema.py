@@ -29,6 +29,10 @@ import argparse
 import time
 import duckdb
 
+# Allow importing from the same bin/ directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from iceberg_transform import _sql_escape
+
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
@@ -56,8 +60,8 @@ def broader_type(a, b):
 
 def read_json_expr(path, sample_size=-1):
     return (
-        f"read_json('{path}', "
-        f"maximum_object_size=568435456, "
+        f"read_json('{_sql_escape(path)}', "
+        f"maximum_object_size=536870912, "
         f"format='newline_delimited', "
         f"sample_size={sample_size})"
     )

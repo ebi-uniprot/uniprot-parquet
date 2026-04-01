@@ -12,7 +12,7 @@ BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 sys.path.insert(0, BIN_DIR)
 
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
-SMALL_JSON_GZ = os.path.join(PROJECT_ROOT, "test_json", "small.json.gz")
+SMALL_JSON_GZ = os.path.join(os.path.dirname(__file__), "fixtures", "small.json.gz")
 SCHEMA_JSON = os.path.join(PROJECT_ROOT, "schema.json")
 
 
@@ -35,14 +35,6 @@ def small_jsonl(tmp_path_factory):
                 writer.write(orjson.dumps(entry) + b"\n")
 
     return jsonl_path
-
-
-@pytest.fixture(scope="session")
-def small_json_entries():
-    """Load the raw JSON entries for assertion comparisons."""
-    with gzip.open(SMALL_JSON_GZ, "rt") as f:
-        data = json.load(f)
-    return data["results"]
 
 
 @pytest.fixture(scope="session")

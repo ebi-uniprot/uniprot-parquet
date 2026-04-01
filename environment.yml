@@ -15,3 +15,5 @@ dependencies:
       - duckdb                          # JSON/Parquet engine (Python bindings + C library)
       - orjson                          # Fast JSON serialisation for sorted JSONL
       - ijson                           # Streaming JSON parser
+      - zstandard                       # Zstd bindings for test fixtures
+      - pytest                          # Test runner

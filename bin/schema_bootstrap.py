@@ -45,7 +45,7 @@ import duckdb
 
 # Allow importing from the same bin/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from iceberg_transform import init_duckdb
+from iceberg_transform import init_duckdb, _sql_escape
 
 
 def eprint(*args, **kwargs):
@@ -63,9 +63,10 @@ def infer_duckdb_schema(con, jsonl_path, sample_all=True):
     sample_clause = "sample_size=-1" if sample_all else ""
     extra = f", {sample_clause}" if sample_clause else ""
 
+    safe_path = _sql_escape(jsonl_path)
     sql = f"""
         DESCRIBE SELECT * FROM read_json_auto(
-            '{jsonl_path}',
+            '{safe_path}',
             format='newline_delimited',
             maximum_object_size=536870912
             {extra}
@@ -105,6 +106,10 @@ def main():
     )
     parser.add_argument("--memory-limit", default="96GB", help="DuckDB memory limit")
     parser.add_argument("--threads", type=int, default=None, help="DuckDB threads")
+    parser.add_argument(
+        "--temp-dir", default=None,
+        help="DuckDB spill directory. Defaults to $TMPDIR or /tmp/duckdb_temp.",
+    )
     # Kept for backward compat but unused:
     parser.add_argument("--schema-dir", default=None, help="(ignored, kept for CLI compat)")
     args = parser.parse_args()
@@ -123,7 +128,7 @@ def main():
     eprint()
 
     # ── Init DuckDB ──
-    con = init_duckdb(args.memory_limit, args.threads)
+    con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
 
     if args.existing_duckdb_schema and os.path.exists(args.existing_duckdb_schema):
         eprint("--- USING EXISTING SCHEMA ---")
