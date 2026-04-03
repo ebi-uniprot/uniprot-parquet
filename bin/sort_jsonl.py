@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Sort a UniProtKB JSONL(.zst) file by reviewed status (Swiss-Prot first)
-then organism taxon ID.
+Sort a UniProtKB JSONL(.zst) file by reviewed status (Swiss-Prot first),
+then organism taxon ID, then accession.
 
 Uses DuckDB's out-of-core sorting — spills to disk when the dataset exceeds
 memory, so it handles the full 160GB+ UniProtKB in bounded memory.
@@ -37,7 +37,8 @@ FROM {read_clause} e
 ORDER BY
     CASE WHEN e.entryType LIKE '%Swiss-Prot%'
          THEN true ELSE false END DESC,
-    e.organism.taxonId
+    e.organism.taxonId,
+    e.primaryAccession
 """
 
 
@@ -80,7 +81,7 @@ def main():
     sql = SORT_SQL.format(read_clause=read_clause)
     safe_output = _sql_escape(output_path)
 
-    eprint("Sorting (reviewed DESC, taxid ASC) and writing...")
+    eprint("Sorting (reviewed DESC, taxid ASC, acc ASC) and writing...")
     eprint("  DuckDB will spill to disk if the dataset exceeds memory.")
     t0 = time.time()
 

@@ -73,15 +73,20 @@ fi
 
 # ─── 3. Run pipeline ─────────────────────────────────────────────
 echo ""
-echo "╔═══════════════════════════════════════════════════════╗"
-echo "║  UniProtKB Iceberg Demo                                ║"
-echo "║  Entries:  ${ENTRY_COUNT}                              ║"
-echo "║  Release:  ${RELEASE}                                  ║"
-echo "╚═══════════════════════════════════════════════════════╝"
+W=55
+BAR=$(printf '═%.0s' $(seq 1 $W))
+printf "╔%s╗\n" "$BAR"
+printf "║  %-$(( W - 2 ))s║\n" "UniProtKB Iceberg Demo"
+printf "║  %-$(( W - 2 ))s║\n" "Entries:  ${ENTRY_COUNT}"
+printf "║  %-$(( W - 2 ))s║\n" "Release:  ${RELEASE}"
+printf "╚%s╝\n" "$BAR"
 echo ""
 
 PIPELINE="../upjson2lake.nf"
 SCHEMA="../schema.json"
+
+# Ensure report directory exists (Nextflow won't create it)
+mkdir -p "$LAKE_DIR/reports"
 
 nextflow run "$PIPELINE" \
     --inputfile "$(pwd)/$INPUT" \

@@ -177,7 +177,7 @@ SELECT
     e.geneLocations                                 AS gene_locations
 
 FROM {read_clause} e
-ORDER BY reviewed DESC, e.organism.taxonId
+ORDER BY reviewed DESC, e.organism.taxonId, e.primaryAccession
 """
 
 
@@ -222,7 +222,7 @@ FROM (
     FROM {read_clause} e
     WHERE e.features IS NOT NULL AND len(e.features) > 0
 ) sub, LATERAL unnest(sub.features)
-ORDER BY sub.reviewed DESC, sub.taxid
+ORDER BY sub.reviewed DESC, sub.taxid, sub.acc, unnest.location.start.value
 """
 
 
@@ -247,7 +247,7 @@ FROM (
     WHERE e.uniProtKBCrossReferences IS NOT NULL
       AND len(e.uniProtKBCrossReferences) > 0
 ) sub, LATERAL unnest(sub.uniProtKBCrossReferences)
-ORDER BY sub.reviewed DESC, sub.taxid, unnest.database
+ORDER BY sub.reviewed DESC, sub.taxid, sub.acc, unnest.database
 """
 
 
@@ -275,7 +275,7 @@ FROM (
     FROM {read_clause} e
     WHERE e.comments IS NOT NULL AND len(e.comments) > 0
 ) sub, LATERAL unnest(sub.comments)
-ORDER BY sub.reviewed DESC, sub.taxid, unnest.commentType
+ORDER BY sub.reviewed DESC, sub.taxid, sub.acc, unnest.commentType
 """
 
 
@@ -463,7 +463,7 @@ def stream_to_iceberg(con, sql, table, batch_size, label="table"):
 
     Returns the total number of rows written.
     """
-    eprint(f"  Querying DuckDB for {label} (sorted by reviewed DESC, taxid)...")
+    eprint(f"  Querying DuckDB for {label} (sorted by reviewed DESC, taxid, acc)...")
     t0 = time.time()
 
     result = con.sql(sql)
@@ -604,10 +604,10 @@ def main():
     # ── Infer Iceberg schemas (cheap: LIMIT 1, no ORDER BY) ──
     eprint("--- SCHEMA INFERENCE ---")
     TABLE_DEFS = [
-        ("entries",  ENTRIES_SQL,  (("reviewed", SortDirection.DESC), "taxid")),
-        ("features", FEATURES_SQL, (("reviewed", SortDirection.DESC), "taxid")),
-        ("xrefs",    XREFS_SQL,    (("reviewed", SortDirection.DESC), "taxid", "database")),
-        ("comments", COMMENTS_SQL, (("reviewed", SortDirection.DESC), "taxid", "comment_type")),
+        ("entries",  ENTRIES_SQL,  (("reviewed", SortDirection.DESC), "taxid", "acc")),
+        ("features", FEATURES_SQL, (("reviewed", SortDirection.DESC), "taxid", "acc", "start_pos")),
+        ("xrefs",    XREFS_SQL,    (("reviewed", SortDirection.DESC), "taxid", "acc", "database")),
+        ("comments", COMMENTS_SQL, (("reviewed", SortDirection.DESC), "taxid", "acc", "comment_type")),
     ]
 
     schemas = {}

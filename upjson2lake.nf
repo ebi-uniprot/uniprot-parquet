@@ -16,10 +16,11 @@
 //   1. Stream JSON(.gz) → single zstd-compressed JSONL
 //   2. Schema check — full-scan JSONL validation against schema.json
 //      (reads every row with declared types; ~30-60 min on 180GB)
-//   3. Sort JSONL by reviewed DESC, taxid ASC (Swiss-Prot first)
+//   3. Sort JSONL by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
 //   4. Transform sorted JSONL → Iceberg tables via DuckDB + PyIceberg
 //      (pre-sorted input makes DuckDB ORDER BY nearly free for entries;
-//       child tables benefit from input locality after LATERAL unnest)
+//       child tables benefit from input locality after LATERAL unnest;
+//       features additionally sorted by start_pos for positional queries)
 //   5. Production validation: completeness, referential integrity,
 //      sort order, round-trip spot checks, Parquet integrity
 //   6. Generate provenance manifest (only if validation passes)
@@ -28,7 +29,7 @@
 // Run `schema_bootstrap.py` once against the full dataset to generate it.
 // It is human-readable and manually editable.
 // No partitioning — Iceberg handles data skipping via per-file column statistics.
-// All tables sorted by reviewed DESC, taxid ASC (Swiss-Prot first) for query locality.
+// All tables sorted by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first) for query locality.
 
 nextflow.enable.dsl = 2
 
@@ -115,7 +116,7 @@ process SCHEMA_CHECK {
 }
 
 
-/* ── PROCESS: Sort JSONL by reviewed DESC, taxid ASC ──────────────── */
+/* ── PROCESS: Sort JSONL by reviewed DESC, taxid ASC, acc ASC ──────────────── */
 // Sorts the raw JSONL before the Iceberg transform.  Pre-sorted input
 // makes DuckDB's ORDER BY nearly free for the entries table and improves
 // locality for child table sorts after LATERAL unnest.
@@ -156,7 +157,7 @@ process SORT_JSONL {
 
 /* ── PROCESS: Transform sorted JSONL → Iceberg tables ────────────── */
 // Reads the pre-sorted JSONL.  DuckDB's ORDER BY on entries is nearly
-// a no-op since the input is already in (reviewed DESC, taxid ASC) order.
+// a no-op since the input is already in (reviewed DESC, taxid ASC, acc ASC) order.
 // Child tables (features, xrefs, comments) still need their own sort
 // after LATERAL unnest, but benefit from the input locality.
 process ICEBERG_TRANSFORM {
@@ -278,17 +279,20 @@ process MANIFEST {
 
 /* ── WORKFLOW ─────────────────────────────────────────────────────── */
 workflow {
+    def W = 57
+    def bar = '═' * W
+    def line = { String s -> "║  ${s.padRight(W - 2)}║" }
     log.info """
-    ╔═══════════════════════════════════════════════════════════╗
-    ║  UniProtKB → Iceberg Data Lake                            ║
-    ║  Release: ${params.release}                               ║
-    ╚═══════════════════════════════════════════════════════════╝
+    ╔${bar}╗
+    ${line('UniProtKB → Iceberg Data Lake')}
+    ${line("Release: ${params.release}")}
+    ╚${bar}╝
     Input:      ${params.inputfile}
     Schema:     ${params.schema}
     Output:     ${release_dir}
     DuckDB mem: ${duckdb_memory} (${params.duckdb_pct}% of ${params.process_memory})
     DuckDB tmp: ${params.duckdb_temp ?: '(default: \$TMPDIR or /tmp)'}
-    ─────────────────────────────────────────────────────────────
+    ${'─' * (W + 2)}
     """.stripIndent()
 
     // Validate inputs
@@ -308,7 +312,7 @@ workflow {
     //    (gate: sort + transform only run if validation passes)
     SCHEMA_CHECK(STREAM_JSONL.out.jsonl, schema_ch)
 
-    // 3. Sort JSONL by reviewed DESC, taxid ASC
+    // 3. Sort JSONL by reviewed DESC, taxid ASC, acc ASC
     //    Pre-sorting means DuckDB's ORDER BY in the transform is nearly free.
     SORT_JSONL(
         STREAM_JSONL.out.jsonl,

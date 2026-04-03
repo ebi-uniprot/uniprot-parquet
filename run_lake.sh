@@ -14,12 +14,14 @@ shift || true
 # ─── Parse optional flags ─────────────────────────────────────────
 INPUTFILE_OVERRIDE=""
 OUTDIR_OVERRIDE=""
+DUCKDB_TEMP_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --input)  INPUTFILE_OVERRIDE="$2"; shift 2 ;;
-        --outdir) OUTDIR_OVERRIDE="$2";    shift 2 ;;
-        *)        echo "Unknown flag: $1"; exit 1  ;;
+        --input)      INPUTFILE_OVERRIDE="$2";   shift 2 ;;
+        --outdir)     OUTDIR_OVERRIDE="$2";      shift 2 ;;
+        --duckdb-tmp) DUCKDB_TEMP_OVERRIDE="$2"; shift 2 ;;
+        *)            echo "Unknown flag: $1"; exit 1  ;;
     esac
 done
 
@@ -63,28 +65,41 @@ esac
 [[ -n "$INPUTFILE_OVERRIDE" ]] && INPUTFILE="$INPUTFILE_OVERRIDE"
 [[ -n "$OUTDIR_OVERRIDE" ]]    && OUTDIR="$OUTDIR_OVERRIDE"
 
-echo "╔═══════════════════════════════════════════════════════╗"
-echo "║  UniProtKB → Iceberg Data Lake                        ║"
-echo "╠═══════════════════════════════════════════════════════╣"
-echo "║  Mode:      $MODE"
-echo "║  Release:   $RELEASE"
-echo "║  Input:     $INPUTFILE"
-echo "║  Output:    $OUTDIR"
-echo "║  Memory:    $MEMORY"
-echo "║  Profile:   $PROFILE"
-echo "╚═══════════════════════════════════════════════════════╝"
+W=55
+BAR=$(printf '═%.0s' $(seq 1 $W))
+printf "╔%s╗\n" "$BAR"
+printf "║  %-$(( W - 2 ))s║\n" "UniProtKB → Iceberg Data Lake"
+printf "╠%s╣\n" "$BAR"
+printf "║  %-$(( W - 2 ))s║\n" "Mode:      $MODE"
+printf "║  %-$(( W - 2 ))s║\n" "Release:   $RELEASE"
+printf "║  %-$(( W - 2 ))s║\n" "Input:     $INPUTFILE"
+printf "║  %-$(( W - 2 ))s║\n" "Output:    $OUTDIR"
+printf "║  %-$(( W - 2 ))s║\n" "Memory:    $MEMORY"
+printf "║  %-$(( W - 2 ))s║\n" "Profile:   $PROFILE"
+printf "╚%s╝\n" "$BAR"
 echo ""
 
-COMMAND="nextflow run upjson2lake.nf \
-    --inputfile ${INPUTFILE} \
-    --outdir ${OUTDIR} \
-    --process_memory '${MEMORY}' \
-    --release ${RELEASE} \
-    -profile ${PROFILE} \
-    -ansi-log true \
-    -resume"
+# Ensure report directory exists (Nextflow won't create it)
+mkdir -p "$OUTDIR/reports"
 
-echo "Running: $COMMAND"
+# Build command as an array to handle paths with spaces safely
+NF_CMD=(
+    nextflow run upjson2lake.nf
+    --inputfile "$INPUTFILE"
+    --outdir "$OUTDIR"
+    --process_memory "$MEMORY"
+    --release "$RELEASE"
+    -profile "$PROFILE"
+    -ansi-log true
+    -resume
+)
+
+# Add DuckDB temp directory if specified
+if [[ -n "$DUCKDB_TEMP_OVERRIDE" ]]; then
+    NF_CMD+=(--duckdb_temp "$DUCKDB_TEMP_OVERRIDE")
+fi
+
+echo "Running: ${NF_CMD[*]}"
 echo ".-- BEGUN $(date) --."
-eval $COMMAND
+"${NF_CMD[@]}"
 echo "'-- ENDED $(date) --'"

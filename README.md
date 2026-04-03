@@ -13,11 +13,11 @@ Each release lands in its own directory (`<outdir>/<release>/`):
 | `warehouse/uniprotkb/xrefs/`    | Iceberg table — one row per cross-reference           |
 | `warehouse/uniprotkb/comments/` | Iceberg table — one row per comment annotation        |
 | `catalog.db`                    | SQLite Iceberg catalog                                |
-| `sorted.jsonl.zst`              | JSONL archive sorted by review status then taxid      |
+| `sorted.jsonl.zst`              | JSONL archive sorted by review status, taxid, then accession      |
 | `manifest.json`                 | Provenance record (checksums, git commit, row counts) |
 | `validation_report.txt`         | 8-check production validation (see below)             |
 
-All tables are sorted by `reviewed DESC` (Swiss-Prot first) then `taxid ASC`. Iceberg handles data skipping via per-file column statistics — queries filtering on either column skip most data files automatically. No Hive partitioning needed.
+All tables are sorted by `reviewed DESC` (Swiss-Prot first), `taxid ASC`, then `acc ASC`. Iceberg handles data skipping via per-file column statistics — queries filtering on either column skip most data files automatically. No Hive partitioning needed.
 
 ## Setup
 
@@ -44,6 +44,26 @@ This creates `demo/lake/2026_01/` with the full output (warehouse, catalog, sort
 
 ## Running
 
+### Quick start with run_lake.sh
+
+```bash
+./run_lake.sh                    # test_small: 44 entries, local
+./run_lake.sh test_med           # test_med: ~3,800 entries (demo data), local
+./run_lake.sh subset             # subset: 100K entries, SLURM short queue
+./run_lake.sh prod               # production: full UniProtKB, SLURM prod queue
+```
+
+Override defaults with flags:
+
+```bash
+./run_lake.sh prod \
+    --input /path/to/UniProtKB.json.gz \
+    --outdir /scratch/uniprot_lake \
+    --duckdb-tmp /scratch/$USER/duckdb_tmp
+```
+
+### Direct Nextflow invocation
+
 ```bash
 # Local test (uses committed small.json.gz, 44 entries)
 nextflow run upjson2lake.nf -profile local \
@@ -55,8 +75,59 @@ nextflow run upjson2lake.nf -profile prod \
     --inputfile /path/to/UniProtKB.json.gz \
     --release 2026_02 \
     --outdir /scratch/uniprot_lake \
-    --duckdb_temp /hps/nobackup/.../tmp
+    --process_memory '96 GB' \
+    --duckdb_temp /scratch/$USER/duckdb_tmp \
+    --notify_email you@example.com \
+    -resume
 ```
+
+### Pipeline parameters
+
+| Parameter          | Default                    | Description                                                   |
+| ------------------ | -------------------------- | ------------------------------------------------------------- |
+| `--inputfile`      | `entries_test.json`        | Input UniProtKB JSON(.gz) file                                |
+| `--outdir`         | `results/uniprot_lake`     | Output base directory                                         |
+| `--release`        | `2026_01`                  | Release label (output goes to `<outdir>/<release>/`)          |
+| `--process_memory` | `96 GB`                    | Memory for heavy processes (DuckDB gets 75% of this)          |
+| `--duckdb_pct`     | `75`                       | Percentage of process memory allocated to DuckDB buffer pool  |
+| `--schema`         | `schema.json`              | DuckDB schema file (single source of truth for column types)  |
+| `--duckdb_temp`    | `$TMPDIR` or `/tmp`        | DuckDB spill directory for out-of-core sorts                  |
+| `--notify_email`   | `null`                     | Email for SLURM failure/requeue notifications                 |
+
+### Nextflow profiles
+
+| Profile | Executor | Queue        | Default memory | Default time | Notes                                  |
+| ------- | -------- | ------------ | -------------- | ------------ | -------------------------------------- |
+| `local` | local    | —            | —              | —            | For testing on your laptop             |
+| `prod`  | SLURM    | `production` | 16 GB          | 1 day        | Process-level directives take priority |
+| `short` | SLURM    | `short`      | 4 GB           | 4 hours      | For subset runs                        |
+
+In the `prod` and `short` profiles, config-level memory and time act as fallback defaults — process-level directives (e.g. ICEBERG_TRANSFORM's 48h, SORT_JSONL's 24h) take priority.
+
+## Production on SLURM
+
+Before running the full ~250M-entry UniProtKB dataset:
+
+**DuckDB spill directory**: DuckDB's out-of-core sort spills intermediate data to disk. Point `--duckdb_temp` at a large scratch filesystem (1-2 TB free). If your cluster has fast node-local NVMe, that's ideal; shared Lustre/GPFS works but is slower. Create the directory before launch:
+
+```bash
+mkdir -p /scratch/$USER/duckdb_tmp
+```
+
+**OOM recovery**: The `ICEBERG_TRANSFORM` step has `errorStrategy 'retry'` with `maxRetries 1` and uses `--skip-existing` on retry. If it OOMs writing the xrefs table (the largest at ~5B rows), the retry skips already-written tables (entries, features) and resumes from where it left off.
+
+**Resume**: All runs use `-resume` by default. If a SLURM job is killed (wall time, preemption), re-submitting the same command picks up from the last completed process.
+
+**Time budgets** (approximate for the full dataset):
+
+| Process            | Time   | Memory  | Notes                                   |
+| ------------------ | ------ | ------- | --------------------------------------- |
+| STREAM_JSONL       | 2-4h   | 4 GB    | pigz decompression is single-threaded   |
+| SCHEMA_CHECK       | 30-60m | 96 GB   | Full-scan type validation               |
+| SORT_JSONL         | 4-8h   | 96 GB   | DuckDB out-of-core sort, 1 TB disk      |
+| ICEBERG_TRANSFORM  | 12-24h | 96 GB   | 4 full scans of sorted JSONL, 2 TB disk |
+| VALIDATE           | 1-2h   | 96 GB   | Bounded-memory streaming checks         |
+| MANIFEST           | <1m    | 1 GB    | Metadata only                           |
 
 ## Schema management
 
@@ -92,7 +163,7 @@ UniProtKB.json.gz
         |  (gate: sort + transform only run if validation passes)
         v
 +------------+   DuckDB out-of-core sort
-| SORT_JSONL |──────────────────────────> sorted.jsonl.zst
+| SORT_JSONL |─────────────────────────────> sorted.jsonl.zst
 +------+-----+
        |  (pre-sorted input makes DuckDB ORDER BY nearly free)
        v
@@ -117,13 +188,13 @@ The pipeline is **idempotent** — re-running on the same release directory drop
 
 ## Production validation
 
-The `VALIDATE` step runs 8 checks against the source JSONL as ground truth. Any single failure exits 1 and blocks the provenance manifest:
+The `VALIDATE` step runs 8 checks against the source JSONL as ground truth. All checks use bounded-memory streaming (vectorised Arrow compute for sort order, batch-wise null counting, Python set for referential integrity). Any single failure exits 1 and blocks the provenance manifest:
 
 1. **Completeness** — JSONL line count == entries rows; child table counts match `sum(entries.*_count)`
 2. **Uniqueness** — `entries.acc` has zero duplicates
 3. **Null keys** — `acc`, `reviewed`, `taxid` never null across all tables
 4. **Referential integrity** — every `acc` in features/xrefs/comments exists in entries
-5. **Sort order** — all tables sorted by `(reviewed DESC, taxid ASC)`
+5. **Sort order** — all tables sorted by `(reviewed DESC, taxid ASC, acc ASC)`
 6. **Round-trip spot check** — 1000 reservoir-sampled entries verified field-by-field against JSONL
 7. **Parquet file integrity** — every `.parquet` file in the warehouse is readable
 8. **Snapshot sanity** — each table has exactly 1 APPEND snapshot
@@ -139,7 +210,7 @@ This means no UniProtKB data is discarded. Users needing isoforms, gene synonyms
 
 Parquet's columnar storage mitigates any read-amplification cost — if a query touches 5 of 30+ columns, only those 5 are read from disk. Supplementary normalized tables (features, xrefs, comments) are provided for high-cardinality relationships that would make the main table unwieldy as arrays.
 
-All four tables are sorted by `reviewed DESC` (Swiss-Prot first) then `taxid ASC`, and all include denormalized entry-level fields (`acc`, `reviewed`, `taxid`) so most queries don't need joins.
+All four tables are sorted by `reviewed DESC` (Swiss-Prot first), `taxid ASC`, then `acc ASC`, and all include denormalized entry-level fields (`acc`, `reviewed`, `taxid`) so most queries don't need joins.
 
 **entries** — one row per protein, the primary table for 90% of use cases:
 
@@ -148,14 +219,16 @@ All four tables are sorted by `reviewed DESC` (Swiss-Prot first) then `taxid ASC
 - Gene/protein: `gene_name` (first gene only), `protein_name`, `ec_numbers` (recommendedName only), `protein_existence`, `annotation_score`
 - Sequence: `sequence` (canonical only), `seq_length`, `seq_mass`, `seq_md5`, `seq_crc64`
 - Shortcuts: `go_ids` (IDs only), `xref_dbs`, `keyword_ids`, `keyword_names`
-- Versioning: `first_public`, `last_modified`, `entry_version`, `seq_version`
+- Versioning: `first_public`, `last_modified`, `last_seq_modified`, `entry_version`, `seq_version`
+- Counts: `feature_count`, `xref_count`, `comment_count`, `uniparc_id`
 - Full nested: `organism`, `protein_desc`, `genes`, `keywords`, `references`, `organism_hosts`, `gene_locations`
 
-**features** — one row per positional annotation:
+**features** — one row per positional annotation (sorted by `start_pos` within each protein for positional queries):
 
 - `acc`, `reviewed`, `taxid`, `organism_name`, `seq_length`
-- `type`, `start_pos`, `end_pos`, `description`, `feature_id`
-- `evidence_codes`, `ligand_name`, `ligand_id`
+- `type`, `start_pos`, `end_pos`, `start_modifier`, `end_modifier`, `description`, `feature_id`
+- `evidence_codes`, `original_sequence`, `alternative_sequences`
+- `ligand_name`, `ligand_id`, `ligand_label`, `ligand_note`
 
 **xrefs** — one row per cross-reference:
 
@@ -178,7 +251,7 @@ import duckdb
 con = duckdb.connect()
 con.load_extension("iceberg")
 
-base = 'results/uniprot_lake/2026_01/warehouse/uniprotkb'
+base = '<outdir>/<release>/warehouse/uniprotkb'
 con.sql(f"CREATE VIEW entries AS SELECT * FROM iceberg_scan('{base}/entries')")
 con.sql(f"CREATE VIEW features AS SELECT * FROM iceberg_scan('{base}/features')")
 con.sql(f"CREATE VIEW xrefs AS SELECT * FROM iceberg_scan('{base}/xrefs')")
@@ -226,8 +299,8 @@ from pyiceberg.catalog.sql import SqlCatalog
 
 catalog = SqlCatalog(
     "uniprot",
-    uri="sqlite:///results/uniprot_lake/2026_01/catalog.db",
-    warehouse="results/uniprot_lake/2026_01/warehouse",
+    uri="sqlite:///<outdir>/<release>/catalog.db",
+    warehouse="<outdir>/<release>/warehouse",
 )
 entries = catalog.load_table("uniprotkb.entries")
 
@@ -243,23 +316,35 @@ df = entries.scan(
 ```python
 import polars as pl
 
-base = 'results/uniprot_lake/2026_01/warehouse/uniprotkb'
+base = '<outdir>/<release>/warehouse/uniprotkb'
 df = pl.scan_parquet(f"{base}/entries/data/*.parquet")
 df.filter(pl.col("taxid") == 9606).select("acc", "gene_name").collect()
 ```
 
 ## Versioning
 
-Each release is a full rebuild into its own isolated directory (`results/uniprot_lake/<release>/`). Previous releases are preserved untouched. The `manifest.json` in each release directory records provenance: input file checksums, `schema.json` checksum, git commit, row counts, and snapshot IDs.
+Each release is a full rebuild into its own isolated directory (`<outdir>/<release>/`). Previous releases are preserved untouched. The `manifest.json` in each release directory records provenance: input file checksums, `schema.json` checksum, git commit, row counts, and snapshot IDs.
 
 ## Memory model
 
 The pipeline separates process memory (Nextflow directive) from the DuckDB buffer pool. By default, DuckDB gets 75% of the process memory — the remaining 25% provides headroom for the Python interpreter, PyArrow heap, and JSON parsing overhead. Configure via `--process_memory` and `--duckdb_pct`.
+
+DuckDB spills to disk when data exceeds the buffer pool. The spill directory defaults to `$TMPDIR` (which SLURM typically sets to node-local scratch) or `/tmp`. Override with `--duckdb_temp` to point at a large scratch filesystem. The `SORT_JSONL` step requests 1 TB of disk and `ICEBERG_TRANSFORM` requests 2 TB for spill space.
+
+The `VALIDATE` step uses bounded-memory streaming for all checks. Peak memory is ~27 GB for the entry accession set (used by uniqueness and referential integrity checks), well within the 96 GB default.
+
+## Testing
+
+```bash
+python -m pytest tests/ -v
+```
+
+The test suite (33 tests) covers row counts, column schemas, data integrity, sort order, idempotency (drop+recreate), `--skip-existing` resume, and the production validator. Tests use `tests/fixtures/small.json.gz` (44 reviewed entries).
 
 ## Tech Stack
 
 - **Orchestration**: Nextflow (DSL2, SLURM support)
 - **Compute**: DuckDB (JSON parsing, SQL transforms, sorting)
 - **Storage**: Apache Iceberg (PyIceberg + SQLite catalog)
-- **Format**: Parquet (zstd compression), sorted by `reviewed DESC`, `taxid ASC`
+- **Format**: Parquet (zstd compression), sorted by `reviewed DESC`, `taxid ASC`, `acc ASC`
 - **Schema**: `schema.json` — single source of truth, human-readable, manually editable

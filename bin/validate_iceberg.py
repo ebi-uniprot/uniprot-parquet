@@ -29,7 +29,7 @@ Checks (in order):
      - Every acc in comments exists in entries
 
   5. SORT ORDER
-     - All tables sorted by (reviewed DESC, taxid ASC)
+     - All tables sorted by (reviewed DESC, taxid ASC, acc ASC)
 
   6. ROUND-TRIP SPOT CHECK
      - Sample N accessions from the JSONL
@@ -63,7 +63,6 @@ import argparse
 import time
 from datetime import datetime, timezone
 
-import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pyiceberg.catalog.sql import SqlCatalog
@@ -193,23 +192,13 @@ class ValidationReport:
 
 # ─── Individual check implementations ─────────────────────────────────
 
-def _build_entry_acc_set(catalog, namespace):
-    """Build a Python set of all entry accessions, streaming in batches.
-
-    At production scale (~250M entries, ~110 bytes per acc string + set overhead),
-    this uses ~27 GB — fits comfortably in 96 GB process memory.
-    """
-    entries = catalog.load_table(f"{namespace}.entries")
-    acc_set = set()
-    for batch in entries.scan(
-        selected_fields=("acc",)
-    ).to_arrow_batch_reader():
-        acc_set.update(batch.column("acc").to_pylist())
-    return acc_set
-
 
 def check_completeness(report, catalog, namespace, jsonl_count):
-    """Verify row counts match the JSONL ground truth."""
+    """Verify row counts match the JSONL ground truth.
+
+    Scans entries once for all three count columns (feature_count,
+    xref_count, comment_count) rather than three separate passes.
+    """
     report.checks.append("\n--- 1. COMPLETENESS ---")
     eprint("\n--- 1. COMPLETENESS ---")
 
@@ -223,30 +212,31 @@ def check_completeness(report, catalog, namespace, jsonl_count):
         f"entries={entries_count:,}, jsonl={jsonl_count:,}"
     )
 
-    # Child table count consistency via entries aggregate columns
+    # Sum all three count columns in a single scan of entries
+    count_cols = ["feature_count", "xref_count", "comment_count"]
+    agg_sums = {col: 0 for col in count_cols}
+    for batch in entries.scan(
+        selected_fields=tuple(count_cols)
+    ).to_arrow_batch_reader():
+        for col in count_cols:
+            s = pc.sum(batch.column(col)).as_py()
+            if s is not None:
+                agg_sums[col] += s
+
+    # Child table count consistency
     for child_name, count_col in [
         ("features", "feature_count"),
         ("xrefs", "xref_count"),
         ("comments", "comment_count"),
     ]:
-        # Sum the count column from entries
-        agg_sum = 0
-        for batch in entries.scan(
-            selected_fields=(count_col,)
-        ).to_arrow_batch_reader():
-            s = pc.sum(batch.column(count_col)).as_py()
-            if s is not None:
-                agg_sum += s
-
-        # Get child table row count
         child = catalog.load_table(f"{namespace}.{child_name}")
         child_snap = child.current_snapshot()
         child_count = int(child_snap.summary["total-records"]) if child_snap else 0
 
         report.check(
             f"sum(entries.{count_col}) == {child_name} rows",
-            agg_sum == child_count,
-            f"sum={agg_sum:,}, {child_name}={child_count:,}"
+            agg_sums[count_col] == child_count,
+            f"sum={agg_sums[count_col]:,}, {child_name}={child_count:,}"
         )
 
 
@@ -255,6 +245,9 @@ def check_uniqueness(report, catalog, namespace):
 
     Streams batches and maintains a running set — bounded by O(unique accs)
     which is ~27 GB for 250M entries.  Never materialises full columns.
+
+    Returns the acc set so check_referential_integrity can reuse it
+    (avoids a second full scan of entries).
     """
     report.checks.append("\n--- 2. UNIQUENESS ---")
     eprint("\n--- 2. UNIQUENESS ---")
@@ -280,6 +273,7 @@ def check_uniqueness(report, catalog, namespace):
         dupes == 0,
         f"total={total:,}, unique={len(seen):,}, dupes={dupes:,}"
     )
+    return seen
 
 
 def check_null_keys(report, catalog, namespace):
@@ -317,19 +311,16 @@ def check_null_keys(report, catalog, namespace):
             )
 
 
-def check_referential_integrity(report, catalog, namespace):
+def check_referential_integrity(report, catalog, namespace, entries_accs):
     """Verify every acc in child tables exists in entries.
 
-    Builds the entry acc set once (~27 GB for 250M entries), then streams
-    each child table batch-by-batch checking membership.  Child table accs
-    are never fully materialised — only one batch at a time.
+    Accepts the entry acc set built by check_uniqueness (avoids a second
+    full scan of entries).  Streams each child table batch-by-batch
+    checking membership — only one batch in memory at a time.
     """
     report.checks.append("\n--- 4. REFERENTIAL INTEGRITY ---")
     eprint("\n--- 4. REFERENTIAL INTEGRITY ---")
-
-    eprint("  Building entry accession set...")
-    entries_accs = _build_entry_acc_set(catalog, namespace)
-    eprint(f"  Entry acc set: {len(entries_accs):,} accessions")
+    eprint(f"  Using entry acc set: {len(entries_accs):,} accessions")
 
     for child_name in ["features", "xrefs", "comments"]:
         child = catalog.load_table(f"{namespace}.{child_name}")
@@ -353,10 +344,10 @@ def check_referential_integrity(report, catalog, namespace):
 
 
 def check_sort_order(report, catalog, namespace):
-    """Verify all tables are sorted by (reviewed DESC, taxid ASC).
+    """Verify all tables are sorted by (reviewed DESC, taxid ASC, acc ASC).
 
     Swiss-Prot (reviewed=True) entries come first, then TrEMBL (reviewed=False),
-    each group sorted by taxid ascending.
+    each group sorted by taxid ascending, then accession ascending.
 
     Uses vectorised Arrow compute within each batch and scalar boundary
     checks between batches.  Memory is bounded to one batch at a time.
@@ -371,9 +362,10 @@ def check_sort_order(report, catalog, namespace):
         row_offset = 0
         prev_last_reviewed = None
         prev_last_taxid = None
+        prev_last_acc = None
 
         for batch in table.scan(
-            selected_fields=("reviewed", "taxid")
+            selected_fields=("reviewed", "taxid", "acc")
         ).to_arrow_batch_reader():
             n = batch.num_rows
             if n == 0:
@@ -381,35 +373,44 @@ def check_sort_order(report, catalog, namespace):
 
             reviewed = batch.column("reviewed")
             taxids = batch.column("taxid")
+            accs = batch.column("acc")
 
             # Check boundary between previous batch and this batch
             if prev_last_reviewed is not None:
                 first_reviewed = reviewed[0].as_py()
                 first_taxid = taxids[0].as_py()
-                prev_key = (not prev_last_reviewed, prev_last_taxid)
-                curr_key = (not first_reviewed, first_taxid)
+                first_acc = accs[0].as_py()
+                prev_key = (not prev_last_reviewed, prev_last_taxid, prev_last_acc)
+                curr_key = (not first_reviewed, first_taxid, first_acc)
                 if prev_key > curr_key:
                     is_sorted = False
                     disorder_detail = (
                         f"disorder at row {row_offset}: "
                         f"reviewed={prev_last_reviewed}→{first_reviewed}, "
-                        f"taxid={prev_last_taxid}→{first_taxid}"
+                        f"taxid={prev_last_taxid}→{first_taxid}, "
+                        f"acc={prev_last_acc}→{first_acc}"
                     )
                     break
 
             # Vectorised within-batch check:
-            # Sort key is (NOT reviewed, taxid).  The sequence is sorted iff
+            # Sort key is (NOT reviewed, taxid, acc).  The sequence is sorted iff
             # for every consecutive pair (i, i+1):
-            #   (NOT reviewed[i], taxid[i]) <= (NOT reviewed[i+1], taxid[i+1])
+            #   (NOT reviewed[i], taxid[i], acc[i]) <= (NOT reviewed[i+1], taxid[i+1], acc[i+1])
             #
-            # This is equivalent to: there is NO i where
-            #   reviewed[i] < reviewed[i+1]  (True→False is OK, False→True is not)
-            #   OR (reviewed[i] == reviewed[i+1] AND taxid[i] > taxid[i+1])
+            # Disorder occurs when:
+            #   reviewed[i] < reviewed[i+1]  (False→True: disorder in DESC)
+            #   OR (reviewed equal AND taxid[i] > taxid[i+1])
+            #   OR (reviewed equal AND taxid equal AND acc[i] > acc[i+1])
             if n > 1:
                 rev_prev = reviewed.slice(0, n - 1)
                 rev_next = reviewed.slice(1, n - 1)
                 tax_prev = taxids.slice(0, n - 1)
                 tax_next = taxids.slice(1, n - 1)
+                acc_prev = accs.slice(0, n - 1)
+                acc_next = accs.slice(1, n - 1)
+
+                rev_equal = pc.equal(rev_prev, rev_next)
+                tax_equal = pc.equal(tax_prev, tax_next)
 
                 # reviewed went from False to True (disorder in DESC)
                 rev_disorder = pc.and_(
@@ -418,10 +419,15 @@ def check_sort_order(report, catalog, namespace):
                 )
                 # Same reviewed, but taxid decreased (disorder in ASC)
                 tax_disorder = pc.and_(
-                    pc.equal(rev_prev, rev_next),
+                    rev_equal,
                     pc.greater(tax_prev, tax_next),
                 )
-                any_disorder = pc.or_(rev_disorder, tax_disorder)
+                # Same reviewed and taxid, but acc decreased (disorder in ASC)
+                acc_disorder = pc.and_(
+                    pc.and_(rev_equal, tax_equal),
+                    pc.greater(acc_prev, acc_next),
+                )
+                any_disorder = pc.or_(pc.or_(rev_disorder, tax_disorder), acc_disorder)
 
                 if pc.any(any_disorder).as_py():
                     # Find first disorder index for reporting
@@ -430,19 +436,23 @@ def check_sort_order(report, catalog, namespace):
                     r1 = reviewed[idx + 1].as_py()
                     t0 = taxids[idx].as_py()
                     t1 = taxids[idx + 1].as_py()
+                    a0 = accs[idx].as_py()
+                    a1 = accs[idx + 1].as_py()
                     is_sorted = False
                     disorder_detail = (
                         f"disorder at row {row_offset + idx + 1}: "
-                        f"reviewed={r0}→{r1}, taxid={t0}→{t1}"
+                        f"reviewed={r0}→{r1}, taxid={t0}→{t1}, "
+                        f"acc={a0}→{a1}"
                     )
                     break
 
             prev_last_reviewed = reviewed[n - 1].as_py()
             prev_last_taxid = taxids[n - 1].as_py()
+            prev_last_acc = accs[n - 1].as_py()
             row_offset += n
 
         report.check(
-            f"{table_name} sorted by (reviewed DESC, taxid ASC)",
+            f"{table_name} sorted by (reviewed DESC, taxid ASC, acc ASC)",
             is_sorted,
             disorder_detail
         )
@@ -563,8 +573,7 @@ def check_parquet_integrity(report, warehouse):
             total_files += 1
             fpath = os.path.join(root, fname)
             try:
-                meta = pq.read_metadata(fpath)
-                # Also verify we can read the schema
+                pq.read_metadata(fpath)
                 pq.read_schema(fpath)
             except Exception as e:
                 corrupt_files.append((fpath, str(e)))
@@ -644,9 +653,9 @@ def main():
 
     # ── Run all checks ──
     check_completeness(report, catalog, args.namespace, jsonl_count)
-    check_uniqueness(report, catalog, args.namespace)
+    entry_accs = check_uniqueness(report, catalog, args.namespace)
     check_null_keys(report, catalog, args.namespace)
-    check_referential_integrity(report, catalog, args.namespace)
+    check_referential_integrity(report, catalog, args.namespace, entry_accs)
     check_sort_order(report, catalog, args.namespace)
     check_round_trip(
         report, catalog, args.namespace,

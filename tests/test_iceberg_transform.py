@@ -267,39 +267,46 @@ class TestDataIntegrity:
         assert entries_table.properties.get("uniprot.release") == "test_2026"
 
 
-# ─── Sort order: reviewed DESC, taxid ASC ─────────────────────────
+# ─── Sort order: reviewed DESC, taxid ASC, acc ASC ───────────────
 # Note: small.json.gz contains only reviewed (Swiss-Prot) entries, so
 # the reviewed DESC ordering is trivially satisfied.  The production
-# validator (validate_iceberg.py) tests the full two-column sort on
+# validator (validate_iceberg.py) tests the full three-column sort on
 # datasets with both reviewed and unreviewed entries.
 
 
 class TestSortOrder:
-    def test_entries_sorted_by_reviewed_desc_taxid_asc(self, entries_table):
-        """Verify entries are sorted by (reviewed DESC, taxid ASC)."""
-        arrow = entries_table.scan(selected_fields=("reviewed", "taxid")).to_arrow()
+    def test_entries_sorted_by_reviewed_desc_taxid_asc_acc_asc(self, entries_table):
+        """Verify entries are sorted by (reviewed DESC, taxid ASC, acc ASC)."""
+        arrow = entries_table.scan(selected_fields=("reviewed", "taxid", "acc")).to_arrow()
         reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
-        pairs = [(not r, t) for r, t in zip(reviewed, taxids)]
-        assert pairs == sorted(pairs), "Entries not sorted by (reviewed DESC, taxid ASC)"
+        accs = arrow.column("acc").to_pylist()
+        keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
+        assert keys == sorted(keys), "Entries not sorted by (reviewed DESC, taxid ASC, acc ASC)"
 
-    def test_features_sorted_by_reviewed_desc_taxid_asc(self, features_table):
-        arrow = features_table.scan(selected_fields=("reviewed", "taxid")).to_arrow()
+    def test_features_sorted_by_reviewed_desc_taxid_asc_acc_asc_start_pos(self, features_table):
+        arrow = features_table.scan(selected_fields=("reviewed", "taxid", "acc", "start_pos")).to_arrow()
         reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
-        pairs = [(not r, t) for r, t in zip(reviewed, taxids)]
-        assert pairs == sorted(pairs), "Features not sorted by (reviewed DESC, taxid ASC)"
+        accs = arrow.column("acc").to_pylist()
+        # start_pos can be null for some feature types; DuckDB sorts NULLs last
+        # in ASC order, so use a large sentinel for sort comparison
+        start_pos = [p if p is not None else float('inf') for p in arrow.column("start_pos").to_pylist()]
+        keys = [(not r, t, a, s) for r, t, a, s in zip(reviewed, taxids, accs, start_pos)]
+        assert keys == sorted(keys), "Features not sorted by (reviewed DESC, taxid ASC, acc ASC, start_pos ASC)"
 
-    def test_xrefs_sorted_by_reviewed_desc_taxid_asc(self, xrefs_table):
-        arrow = xrefs_table.scan(selected_fields=("reviewed", "taxid")).to_arrow()
+    def test_xrefs_sorted_by_reviewed_desc_taxid_asc_acc_asc(self, xrefs_table):
+        arrow = xrefs_table.scan(selected_fields=("reviewed", "taxid", "acc")).to_arrow()
         reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
-        pairs = [(not r, t) for r, t in zip(reviewed, taxids)]
-        assert pairs == sorted(pairs), "Xrefs not sorted by (reviewed DESC, taxid ASC)"
+        accs = arrow.column("acc").to_pylist()
+        keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
+        assert keys == sorted(keys), "Xrefs not sorted by (reviewed DESC, taxid ASC, acc ASC)"
 
-    def test_comments_sorted_by_reviewed_desc_taxid_asc(self, comments_table):
-        arrow = comments_table.scan(selected_fields=("reviewed", "taxid")).to_arrow()
+    def test_comments_sorted_by_reviewed_desc_taxid_asc_acc_asc(self, comments_table):
+        arrow = comments_table.scan(selected_fields=("reviewed", "taxid", "acc")).to_arrow()
         reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
-        pairs = [(not r, t) for r, t in zip(reviewed, taxids)]
-        assert pairs == sorted(pairs), "Comments not sorted by (reviewed DESC, taxid ASC)"
+        accs = arrow.column("acc").to_pylist()
+        keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
+        assert keys == sorted(keys), "Comments not sorted by (reviewed DESC, taxid ASC, acc ASC)"
