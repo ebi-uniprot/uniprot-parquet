@@ -1,4 +1,4 @@
-"""Shared fixtures for UniProtKB Iceberg pipeline tests."""
+"""Shared fixtures for UniProtKB Parquet data lake tests."""
 
 import os
 import sys
@@ -38,26 +38,19 @@ def small_jsonl(tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
-def iceberg_lake(small_jsonl, tmp_path_factory):
-    """Run the full iceberg_transform pipeline once, return (catalog, warehouse) paths."""
+def parquet_lake(small_jsonl, tmp_path_factory):
+    """Run the full parquet_transform pipeline once, return lake directory path."""
     lake_dir = tmp_path_factory.mktemp("lake")
-    warehouse = str(lake_dir / "warehouse")
-    catalog_db = str(lake_dir / "catalog.db")
-    catalog_uri = f"sqlite:///{catalog_db}"
+    outdir = str(lake_dir / "output")
 
-    transform_script = os.path.join(BIN_DIR, "iceberg_transform.py")
+    transform_script = os.path.join(BIN_DIR, "parquet_transform.py")
     env = os.environ.copy()
     env["PYTHONPATH"] = BIN_DIR + ":" + env.get("PYTHONPATH", "")
 
-    # Schema is now inferred from the data — no --schema needed for the
-    # Iceberg schema.  We still pass --schema for the DuckDB read_json
-    # column hints (avoids sampling issues on tiny test files).
     cmd = [
         sys.executable, transform_script, small_jsonl,
         "--schema", SCHEMA_JSON,
-        "--catalog-uri", catalog_uri,
-        "--warehouse", warehouse,
-        "--namespace", "uniprotkb",
+        "--outdir", outdir,
         "--memory-limit", "4GB",
         "--batch-size", "50",
         "--release", "test_2026",
@@ -65,10 +58,9 @@ def iceberg_lake(small_jsonl, tmp_path_factory):
 
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
-        pytest.fail(f"iceberg_transform failed:\n{result.stderr}")
+        pytest.fail(f"parquet_transform failed:\n{result.stderr}")
 
     return {
-        "catalog_uri": catalog_uri,
-        "warehouse": warehouse,
+        "lake_dir": outdir,
         "stderr": result.stderr,
     }

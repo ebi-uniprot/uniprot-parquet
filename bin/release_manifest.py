@@ -6,20 +6,18 @@ Records everything needed to reproduce and audit a pipeline run:
   - Input file checksums (MD5)
   - schema.json checksum
   - Pipeline version (git commit)
-  - Row counts per Iceberg table
-  - Snapshot IDs
+  - Row counts per table (from lake manifest.json)
   - Timestamps
 
-Produces: manifest.json
+Produces: provenance.json
 
 Usage:
     release_manifest.py \
-        --catalog-uri sqlite:///catalog.db \
-        --warehouse /path/to/warehouse \
+        --lake /path/to/lake \
         --input-jsonl uniprot.jsonl.zst \
         --schema schema.json \
         --release 2026_01 \
-        [-o manifest.json]
+        [-o provenance.json]
 """
 
 import os
@@ -29,8 +27,6 @@ import hashlib
 import argparse
 import subprocess
 from datetime import datetime, timezone
-
-from pyiceberg.catalog.sql import SqlCatalog
 
 
 def eprint(*args, **kwargs):
@@ -71,14 +67,9 @@ def main():
         description="Generate a release manifest for provenance tracking"
     )
     parser.add_argument(
-        "--catalog-uri", required=True,
-        help="SQLite catalog URI",
+        "--lake", required=True,
+        help="Lake directory (contains entries/, features/, manifest.json)",
     )
-    parser.add_argument(
-        "--warehouse", required=True,
-        help="Iceberg warehouse directory",
-    )
-    parser.add_argument("--namespace", default="uniprotkb")
     parser.add_argument(
         "--input-jsonl", required=True,
         help="Path to the input JSONL(.zst) file",
@@ -88,7 +79,7 @@ def main():
         help="Path to schema.json",
     )
     parser.add_argument("--release", required=True, help="Release label")
-    parser.add_argument("-o", "--output", default="manifest.json")
+    parser.add_argument("-o", "--output", default="provenance.json")
     args = parser.parse_args()
 
     eprint("Generating release manifest...")
@@ -116,55 +107,40 @@ def main():
     else:
         manifest["pipeline"] = {"commit": "unknown", "dirty": None}
 
-    # ── Iceberg table stats ──
-    eprint("  Reading Iceberg metadata...")
-    catalog = SqlCatalog(
-        "uniprot",
-        **{"uri": args.catalog_uri, "warehouse": args.warehouse},
-    )
+    # ── Lake table stats (from manifest.json) ──
+    eprint("  Reading lake manifest...")
+    lake_manifest_path = os.path.join(args.lake, "manifest.json")
+    if os.path.exists(lake_manifest_path):
+        with open(lake_manifest_path) as f:
+            lake_manifest = json.load(f)
 
-    tables_info = {}
-    for table_name in ["entries", "features", "xrefs", "comments"]:
-        full_name = f"{args.namespace}.{table_name}"
-        try:
-            table = catalog.load_table(full_name)
-        except Exception as e:
-            eprint(f"    WARNING: could not load {full_name}: {e}")
-            continue
-
-        info = {"columns": len(table.schema().fields)}
-
-        snapshot = table.current_snapshot()
-        if snapshot:
-            info["snapshot_id"] = snapshot.snapshot_id
-            info["snapshot_ts"] = datetime.fromtimestamp(
-                snapshot.timestamp_ms / 1000, tz=timezone.utc
-            ).isoformat()
-            if snapshot.summary:
-                summary = snapshot.summary.ser_model()
-                total = summary.get("total-records")
-                if total is not None:
-                    info["row_count"] = int(total)
-
-        # Data file sizes
-        try:
-            data_files = list(table.inspect.data_files())
-            if data_files:
-                info["data_files"] = len(data_files)
-                info["total_size_bytes"] = sum(
-                    f["file_size_in_bytes"] for f in data_files
+        tables_info = {}
+        for table_name in ["entries", "features", "xrefs", "comments", "references"]:
+            table_data = lake_manifest.get("tables", {}).get(table_name, {})
+            info = {
+                "row_count": table_data.get("row_count", 0),
+                "data_files": len(table_data.get("files", [])),
+                "columns": len(table_data.get("columns", [])),
+                "sort_order": table_data.get("sort_order", []),
+            }
+            # Compute total file sizes on disk
+            table_dir = os.path.join(args.lake, table_name)
+            if os.path.isdir(table_dir):
+                total_size = sum(
+                    os.path.getsize(os.path.join(table_dir, f))
+                    for f in os.listdir(table_dir) if f.endswith(".parquet")
                 )
-        except Exception:
-            pass
+                info["total_size_bytes"] = total_size
+            tables_info[table_name] = info
 
-        tables_info[table_name] = info
-
-    manifest["tables"] = tables_info
-
-    # ── Summary row counts ──
-    manifest["total_rows"] = sum(
-        t.get("row_count", 0) for t in tables_info.values()
-    )
+        manifest["tables"] = tables_info
+        manifest["total_rows"] = sum(
+            t.get("row_count", 0) for t in tables_info.values()
+        )
+    else:
+        eprint("    WARNING: manifest.json not found in lake directory")
+        manifest["tables"] = {}
+        manifest["total_rows"] = 0
 
     # ── Write manifest ──
     with open(args.output, "w") as f:
@@ -172,7 +148,7 @@ def main():
 
     eprint(f"  Saved: {args.output}")
     eprint(f"  Release {args.release}: {manifest['total_rows']:,} total rows "
-           f"across {len(tables_info)} tables")
+           f"across {len(manifest.get('tables', {}))} tables")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pre-flight JSONL validation for UniProtKB Iceberg pipeline.
+Pre-flight JSONL validation for UniProtKB Parquet data lake pipeline.
 
 Validates the new release's JSONL data against the committed schema.json
 (DuckDB column types).  If every row conforms, exit 0.  If any row has a
@@ -8,9 +8,9 @@ type mismatch, DuckDB throws and we exit 1.
 
 This is the "belt and suspenders" that catches type drift even in the very
 last of 250M entries — cheap insurance (~30-60 min) vs the 18-30 hour
-Iceberg transform.
+Parquet transform.
 
-The Iceberg schema is deterministically derived from schema.json + the SQL
+The Parquet schema is deterministically derived from schema.json + the SQL
 transforms, so validating the JSONL against schema.json is sufficient to
 guarantee downstream correctness.
 
@@ -27,7 +27,7 @@ import time
 
 # Allow importing from the same bin/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from iceberg_transform import build_read_clause, init_duckdb
+from parquet_transform import build_read_clause, init_duckdb
 
 
 def eprint(*args, **kwargs):
@@ -36,7 +36,7 @@ def eprint(*args, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Pre-flight JSONL validation for UniProtKB Iceberg pipeline"
+        description="Pre-flight JSONL validation for UniProtKB Parquet data lake pipeline"
     )
     parser.add_argument("input", help="Input JSONL(.zst) file")
     parser.add_argument(

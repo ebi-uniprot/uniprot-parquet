@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Production validation for the UniProtKB Iceberg data lake.
+Production validation for the UniProtKB Parquet data lake.
 
 Designed for pharma and bioinformatics consumers who need absolute confidence
 that no data was lost, corrupted, or malformed during the transform.
 
-Uses the source JSONL(.zst) as ground truth and verifies the Iceberg tables
+Uses the source JSONL(.zst) as ground truth and verifies the Parquet tables
 against it.  Exits 1 on ANY failure — Nextflow gates the provenance manifest
 behind this.
 
@@ -16,6 +16,7 @@ Checks (in order):
      - sum(entries.feature_count) == features row count
      - sum(entries.xref_count) == xrefs row count
      - sum(entries.comment_count) == comments row count
+     - sum(entries.reference_count) == references row count
 
   2. UNIQUENESS
      - entries.acc has zero duplicates
@@ -27,26 +28,22 @@ Checks (in order):
      - Every acc in features exists in entries
      - Every acc in xrefs exists in entries
      - Every acc in comments exists in entries
+     - Every acc in references exists in entries
 
   5. SORT ORDER
      - All tables sorted by (reviewed DESC, taxid ASC, acc ASC)
 
   6. ROUND-TRIP SPOT CHECK
      - Sample N accessions from the JSONL
-     - For each, verify acc, taxid, seq_length, feature_count match Iceberg
+     - For each, verify acc, taxid, seq_length, feature_count match lake
 
   7. PARQUET FILE INTEGRITY
-     - Every data file in the warehouse is a readable Parquet file
-
-  8. SNAPSHOT SANITY
-     - Each table has exactly 1 APPEND snapshot (no accidental double-writes)
+     - Every data file in the lake is a readable Parquet file
 
 Usage:
-    validate_iceberg.py \
-        --catalog-uri sqlite:///catalog.db \
-        --warehouse /path/to/warehouse \
+    validate_lake.py \
+        --lake /path/to/lake \
         --jsonl /path/to/uniprot.jsonl.zst \
-        [--namespace uniprotkb] \
         [--spot-check-n 1000] \
         [-o validation_report.txt]
 
@@ -63,14 +60,29 @@ import argparse
 import time
 from datetime import datetime, timezone
 
+import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-from pyiceberg.catalog.sql import SqlCatalog
-from pyiceberg.table.snapshots import Operation
+import pyarrow.dataset as ds
 
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
+
+
+# ─── Parquet reading helpers ──────────────────────────────────────────
+
+def open_table(lake_dir, table_name):
+    """Open a Parquet dataset from the lake directory."""
+    table_dir = os.path.join(lake_dir, table_name)
+    if not os.path.isdir(table_dir):
+        raise FileNotFoundError(f"Table directory not found: {table_dir}")
+    return ds.dataset(table_dir, format="parquet")
+
+
+def count_rows(dataset):
+    """Count total rows in a Parquet dataset."""
+    return dataset.count_rows()
 
 
 # ─── JSONL ground truth helpers ────────────────────────────────────────
@@ -92,7 +104,6 @@ def count_jsonl_lines(jsonl_path: str) -> int:
                         break
                     buf += chunk
                     lines = buf.split(b"\n")
-                    # Last element is incomplete (or empty if chunk ended on \n)
                     count += len(lines) - 1
                     buf = lines[-1]
     else:
@@ -118,11 +129,7 @@ def _open_jsonl_lines(jsonl_path: str):
 
 def sample_jsonl_entries(jsonl_path: str, n: int,
                          seed: int = 42) -> list[dict]:
-    """Reservoir-sample N parsed entries from a JSONL(.zst) file.
-
-    Uses reservoir sampling so we only stream the file once, and each entry
-    has equal probability of being selected regardless of file order.
-    """
+    """Reservoir-sample N parsed entries from a JSONL(.zst) file."""
     rng = random.Random(seed)
     reservoir = []
     idx = 0
@@ -159,7 +166,6 @@ class ValidationReport:
         if detail:
             entry += f"  —  {detail}"
         self.checks.append(entry)
-        # Also print to stderr for live monitoring on SLURM
         eprint(entry)
 
     def passed(self) -> bool:
@@ -176,7 +182,7 @@ class ValidationReport:
     def full_report(self) -> str:
         lines = [
             "=" * 70,
-            "UNIPROT ICEBERG DATA LAKE — PRODUCTION VALIDATION REPORT",
+            "UNIPROT PARQUET DATA LAKE — PRODUCTION VALIDATION REPORT",
             f"Generated: {datetime.now(timezone.utc).isoformat()}",
             "=" * 70,
         ]
@@ -193,45 +199,36 @@ class ValidationReport:
 # ─── Individual check implementations ─────────────────────────────────
 
 
-def check_completeness(report, catalog, namespace, jsonl_count):
-    """Verify row counts match the JSONL ground truth.
-
-    Scans entries once for all three count columns (feature_count,
-    xref_count, comment_count) rather than three separate passes.
-    """
+def check_completeness(report, lake_dir, jsonl_count):
+    """Verify row counts match the JSONL ground truth."""
     report.checks.append("\n--- 1. COMPLETENESS ---")
     eprint("\n--- 1. COMPLETENESS ---")
 
-    # entries count == JSONL lines
-    entries = catalog.load_table(f"{namespace}.entries")
-    snap = entries.current_snapshot()
-    entries_count = int(snap.summary["total-records"]) if snap else 0
+    entries_ds = open_table(lake_dir, "entries")
+    entries_count = count_rows(entries_ds)
     report.check(
         "entries count == JSONL line count",
         entries_count == jsonl_count,
         f"entries={entries_count:,}, jsonl={jsonl_count:,}"
     )
 
-    # Sum all three count columns in a single scan of entries
-    count_cols = ["feature_count", "xref_count", "comment_count"]
+    # Sum all four count columns in a single scan of entries
+    count_cols = ["feature_count", "xref_count", "comment_count", "reference_count"]
     agg_sums = {col: 0 for col in count_cols}
-    for batch in entries.scan(
-        selected_fields=tuple(count_cols)
-    ).to_arrow_batch_reader():
+    for batch in entries_ds.to_batches(columns=count_cols):
         for col in count_cols:
             s = pc.sum(batch.column(col)).as_py()
             if s is not None:
                 agg_sums[col] += s
 
-    # Child table count consistency
     for child_name, count_col in [
         ("features", "feature_count"),
         ("xrefs", "xref_count"),
         ("comments", "comment_count"),
+        ("references", "reference_count"),
     ]:
-        child = catalog.load_table(f"{namespace}.{child_name}")
-        child_snap = child.current_snapshot()
-        child_count = int(child_snap.summary["total-records"]) if child_snap else 0
+        child_ds = open_table(lake_dir, child_name)
+        child_count = count_rows(child_ds)
 
         report.check(
             f"sum(entries.{count_col}) == {child_name} rows",
@@ -240,26 +237,17 @@ def check_completeness(report, catalog, namespace, jsonl_count):
         )
 
 
-def check_uniqueness(report, catalog, namespace):
-    """Verify entries.acc has no duplicates.
-
-    Streams batches and maintains a running set — bounded by O(unique accs)
-    which is ~27 GB for 250M entries.  Never materialises full columns.
-
-    Returns the acc set so check_referential_integrity can reuse it
-    (avoids a second full scan of entries).
-    """
+def check_uniqueness(report, lake_dir):
+    """Verify entries.acc has no duplicates.  Returns the acc set."""
     report.checks.append("\n--- 2. UNIQUENESS ---")
     eprint("\n--- 2. UNIQUENESS ---")
 
-    entries = catalog.load_table(f"{namespace}.entries")
+    entries_ds = open_table(lake_dir, "entries")
     seen = set()
     total = 0
     dupes = 0
 
-    for batch in entries.scan(
-        selected_fields=("acc",)
-    ).to_arrow_batch_reader():
+    for batch in entries_ds.to_batches(columns=["acc"]):
         accs = batch.column("acc").to_pylist()
         total += len(accs)
         for acc in accs:
@@ -276,29 +264,24 @@ def check_uniqueness(report, catalog, namespace):
     return seen
 
 
-def check_null_keys(report, catalog, namespace):
-    """Verify critical columns are never null.
-
-    Streams batches and accumulates null counts — never materialises
-    full columns.  Memory cost is O(1) per table.
-    """
+def check_null_keys(report, lake_dir):
+    """Verify critical columns are never null."""
     report.checks.append("\n--- 3. NULL KEYS ---")
     eprint("\n--- 3. NULL KEYS ---")
 
     key_checks = [
-        ("entries",  ["acc", "reviewed", "taxid"]),
-        ("features", ["acc", "reviewed", "taxid", "type"]),
-        ("xrefs",    ["acc", "reviewed", "taxid", "database", "id"]),
-        ("comments", ["acc", "reviewed", "taxid", "comment_type"]),
+        ("entries",    ["acc", "reviewed", "taxid", "entry_type"]),
+        ("features",   ["acc", "from_reviewed", "taxid", "type"]),
+        ("xrefs",      ["acc", "from_reviewed", "taxid", "database", "id"]),
+        ("comments",   ["acc", "from_reviewed", "taxid", "comment_type"]),
+        ("references", ["acc", "from_reviewed", "taxid", "citation_type", "reference_number"]),
     ]
 
     for table_name, columns in key_checks:
-        table = catalog.load_table(f"{namespace}.{table_name}")
+        dataset = open_table(lake_dir, table_name)
         null_counts = {col: 0 for col in columns}
 
-        for batch in table.scan(
-            selected_fields=tuple(columns)
-        ).to_arrow_batch_reader():
+        for batch in dataset.to_batches(columns=columns):
             for col_name in columns:
                 null_counts[col_name] += batch.column(col_name).null_count
 
@@ -311,24 +294,17 @@ def check_null_keys(report, catalog, namespace):
             )
 
 
-def check_referential_integrity(report, catalog, namespace, entries_accs):
-    """Verify every acc in child tables exists in entries.
-
-    Accepts the entry acc set built by check_uniqueness (avoids a second
-    full scan of entries).  Streams each child table batch-by-batch
-    checking membership — only one batch in memory at a time.
-    """
+def check_referential_integrity(report, lake_dir, entries_accs):
+    """Verify every acc in child tables exists in entries."""
     report.checks.append("\n--- 4. REFERENTIAL INTEGRITY ---")
     eprint("\n--- 4. REFERENTIAL INTEGRITY ---")
     eprint(f"  Using entry acc set: {len(entries_accs):,} accessions")
 
-    for child_name in ["features", "xrefs", "comments"]:
-        child = catalog.load_table(f"{namespace}.{child_name}")
+    for child_name in ["features", "xrefs", "comments", "references"]:
+        child_ds = open_table(lake_dir, child_name)
         orphans = set()
 
-        for batch in child.scan(
-            selected_fields=("acc",)
-        ).to_arrow_batch_reader():
+        for batch in child_ds.to_batches(columns=["acc"]):
             for acc in batch.column("acc").to_pylist():
                 if acc not in entries_accs:
                     orphans.add(acc)
@@ -343,20 +319,21 @@ def check_referential_integrity(report, catalog, namespace, entries_accs):
             report.checks.append(f"    orphan examples: {examples}")
 
 
-def check_sort_order(report, catalog, namespace):
-    """Verify all tables are sorted by (reviewed DESC, taxid ASC, acc ASC).
-
-    Swiss-Prot (reviewed=True) entries come first, then TrEMBL (reviewed=False),
-    each group sorted by taxid ascending, then accession ascending.
-
-    Uses vectorised Arrow compute within each batch and scalar boundary
-    checks between batches.  Memory is bounded to one batch at a time.
-    """
+def check_sort_order(report, lake_dir):
+    """Verify all tables are sorted by (reviewed/from_reviewed DESC, taxid ASC, acc ASC)."""
     report.checks.append("\n--- 5. SORT ORDER ---")
     eprint("\n--- 5. SORT ORDER ---")
 
-    for table_name in ["entries", "features", "xrefs", "comments"]:
-        table = catalog.load_table(f"{namespace}.{table_name}")
+    sort_check_tables = [
+        ("entries",    "reviewed"),
+        ("features",   "from_reviewed"),
+        ("xrefs",      "from_reviewed"),
+        ("comments",   "from_reviewed"),
+        ("references", "from_reviewed"),
+    ]
+
+    for table_name, rev_col in sort_check_tables:
+        dataset = open_table(lake_dir, table_name)
         is_sorted = True
         disorder_detail = ""
         row_offset = 0
@@ -364,14 +341,12 @@ def check_sort_order(report, catalog, namespace):
         prev_last_taxid = None
         prev_last_acc = None
 
-        for batch in table.scan(
-            selected_fields=("reviewed", "taxid", "acc")
-        ).to_arrow_batch_reader():
+        for batch in dataset.to_batches(columns=[rev_col, "taxid", "acc"]):
             n = batch.num_rows
             if n == 0:
                 continue
 
-            reviewed = batch.column("reviewed")
+            reviewed = batch.column(rev_col)
             taxids = batch.column("taxid")
             accs = batch.column("acc")
 
@@ -386,21 +361,13 @@ def check_sort_order(report, catalog, namespace):
                     is_sorted = False
                     disorder_detail = (
                         f"disorder at row {row_offset}: "
-                        f"reviewed={prev_last_reviewed}→{first_reviewed}, "
+                        f"{rev_col}={prev_last_reviewed}→{first_reviewed}, "
                         f"taxid={prev_last_taxid}→{first_taxid}, "
                         f"acc={prev_last_acc}→{first_acc}"
                     )
                     break
 
-            # Vectorised within-batch check:
-            # Sort key is (NOT reviewed, taxid, acc).  The sequence is sorted iff
-            # for every consecutive pair (i, i+1):
-            #   (NOT reviewed[i], taxid[i], acc[i]) <= (NOT reviewed[i+1], taxid[i+1], acc[i+1])
-            #
-            # Disorder occurs when:
-            #   reviewed[i] < reviewed[i+1]  (False→True: disorder in DESC)
-            #   OR (reviewed equal AND taxid[i] > taxid[i+1])
-            #   OR (reviewed equal AND taxid equal AND acc[i] > acc[i+1])
+            # Vectorised within-batch check
             if n > 1:
                 rev_prev = reviewed.slice(0, n - 1)
                 rev_next = reviewed.slice(1, n - 1)
@@ -412,17 +379,14 @@ def check_sort_order(report, catalog, namespace):
                 rev_equal = pc.equal(rev_prev, rev_next)
                 tax_equal = pc.equal(tax_prev, tax_next)
 
-                # reviewed went from False to True (disorder in DESC)
                 rev_disorder = pc.and_(
                     pc.invert(rev_prev),
                     rev_next,
                 )
-                # Same reviewed, but taxid decreased (disorder in ASC)
                 tax_disorder = pc.and_(
                     rev_equal,
                     pc.greater(tax_prev, tax_next),
                 )
-                # Same reviewed and taxid, but acc decreased (disorder in ASC)
                 acc_disorder = pc.and_(
                     pc.and_(rev_equal, tax_equal),
                     pc.greater(acc_prev, acc_next),
@@ -430,7 +394,6 @@ def check_sort_order(report, catalog, namespace):
                 any_disorder = pc.or_(pc.or_(rev_disorder, tax_disorder), acc_disorder)
 
                 if pc.any(any_disorder).as_py():
-                    # Find first disorder index for reporting
                     idx = pc.index(any_disorder, True).as_py()
                     r0 = reviewed[idx].as_py()
                     r1 = reviewed[idx + 1].as_py()
@@ -441,7 +404,7 @@ def check_sort_order(report, catalog, namespace):
                     is_sorted = False
                     disorder_detail = (
                         f"disorder at row {row_offset + idx + 1}: "
-                        f"reviewed={r0}→{r1}, taxid={t0}→{t1}, "
+                        f"{rev_col}={r0}→{r1}, taxid={t0}→{t1}, "
                         f"acc={a0}→{a1}"
                     )
                     break
@@ -452,13 +415,13 @@ def check_sort_order(report, catalog, namespace):
             row_offset += n
 
         report.check(
-            f"{table_name} sorted by (reviewed DESC, taxid ASC, acc ASC)",
+            f"{table_name} sorted by ({rev_col} DESC, taxid ASC, acc ASC)",
             is_sorted,
             disorder_detail
         )
 
 
-def check_round_trip(report, catalog, namespace, jsonl_path, n):
+def check_round_trip(report, lake_dir, jsonl_path, n):
     """Spot-check N entries against the JSONL ground truth."""
     report.checks.append(f"\n--- 6. ROUND-TRIP SPOT CHECK (n={n}) ---")
     eprint(f"\n--- 6. ROUND-TRIP SPOT CHECK (n={n}) ---")
@@ -472,7 +435,7 @@ def check_round_trip(report, catalog, namespace, jsonl_path, n):
         report.check("round-trip sample non-empty", False, "no entries sampled")
         return
 
-    # Build lookup from JSONL: acc → {taxid, seq_length, feature_count}
+    # Build lookup from JSONL
     jsonl_lookup = {}
     for entry in sampled:
         acc = entry.get("primaryAccession")
@@ -488,6 +451,8 @@ def check_round_trip(report, catalog, namespace, jsonl_path, n):
         xref_count = len(xrefs) if xrefs else 0
         comments = entry.get("comments", [])
         comment_count = len(comments) if comments else 0
+        references = entry.get("references", [])
+        reference_count = len(references) if references else 0
 
         jsonl_lookup[acc] = {
             "taxid": taxid,
@@ -495,49 +460,50 @@ def check_round_trip(report, catalog, namespace, jsonl_path, n):
             "feature_count": feature_count,
             "xref_count": xref_count,
             "comment_count": comment_count,
+            "reference_count": reference_count,
         }
 
-    # Read matching entries from Iceberg
-    entries_table = catalog.load_table(f"{namespace}.entries")
-    fields = ("acc", "taxid", "seq_length", "feature_count",
-              "xref_count", "comment_count")
-    iceberg_lookup = {}
-    for batch in entries_table.scan(selected_fields=fields).to_arrow_batch_reader():
+    # Read matching entries from lake
+    entries_ds = open_table(lake_dir, "entries")
+    fields = ["acc", "taxid", "seq_length", "feature_count",
+              "xref_count", "comment_count", "reference_count"]
+    lake_lookup = {}
+    for batch in entries_ds.to_batches(columns=fields):
         accs = batch.column("acc").to_pylist()
         taxids = batch.column("taxid").to_pylist()
         seq_lens = batch.column("seq_length").to_pylist()
         fc = batch.column("feature_count").to_pylist()
         xc = batch.column("xref_count").to_pylist()
         cc = batch.column("comment_count").to_pylist()
+        rc = batch.column("reference_count").to_pylist()
         for i, acc in enumerate(accs):
             if acc in jsonl_lookup:
-                iceberg_lookup[acc] = {
+                lake_lookup[acc] = {
                     "taxid": taxids[i],
                     "seq_length": seq_lens[i],
                     "feature_count": fc[i],
                     "xref_count": xc[i],
                     "comment_count": cc[i],
+                    "reference_count": rc[i],
                 }
 
-    # Check that all sampled accessions were found
-    missing = set(jsonl_lookup.keys()) - set(iceberg_lookup.keys())
+    missing = set(jsonl_lookup.keys()) - set(lake_lookup.keys())
     report.check(
-        f"all {len(jsonl_lookup)} sampled accessions found in Iceberg",
+        f"all {len(jsonl_lookup)} sampled accessions found in lake",
         len(missing) == 0,
         f"{len(missing)} missing" if missing else ""
     )
     if missing:
         report.checks.append(f"    missing examples: {sorted(missing)[:5]}")
 
-    # Field-level comparison
     mismatches = {"taxid": 0, "seq_length": 0, "feature_count": 0,
-                  "xref_count": 0, "comment_count": 0}
+                  "xref_count": 0, "comment_count": 0, "reference_count": 0}
     mismatch_examples = {}
 
     for acc, expected in jsonl_lookup.items():
-        if acc not in iceberg_lookup:
+        if acc not in lake_lookup:
             continue
-        actual = iceberg_lookup[acc]
+        actual = lake_lookup[acc]
         for field in mismatches:
             if expected[field] != actual[field]:
                 mismatches[field] += 1
@@ -558,20 +524,23 @@ def check_round_trip(report, catalog, namespace, jsonl_path, n):
         )
 
 
-def check_parquet_integrity(report, warehouse):
-    """Verify every Parquet file in the warehouse is readable."""
+def check_parquet_integrity(report, lake_dir):
+    """Verify every Parquet file in the lake is readable."""
     report.checks.append("\n--- 7. PARQUET FILE INTEGRITY ---")
     eprint("\n--- 7. PARQUET FILE INTEGRITY ---")
 
     total_files = 0
     corrupt_files = []
 
-    for root, dirs, files in os.walk(warehouse):
-        for fname in files:
+    for table_name in ["entries", "features", "xrefs", "comments", "references"]:
+        table_dir = os.path.join(lake_dir, table_name)
+        if not os.path.isdir(table_dir):
+            continue
+        for fname in os.listdir(table_dir):
             if not fname.endswith(".parquet"):
                 continue
             total_files += 1
-            fpath = os.path.join(root, fname)
+            fpath = os.path.join(table_dir, fname)
             try:
                 pq.read_metadata(fpath)
                 pq.read_schema(fpath)
@@ -587,22 +556,37 @@ def check_parquet_integrity(report, warehouse):
         report.checks.append(f"    CORRUPT: {fpath} — {err}")
 
 
-def check_snapshots(report, catalog, namespace):
-    """Verify each table has exactly 1 APPEND snapshot."""
-    report.checks.append("\n--- 8. SNAPSHOT SANITY ---")
-    eprint("\n--- 8. SNAPSHOT SANITY ---")
+def check_manifest(report, lake_dir):
+    """Verify manifest.json exists and is consistent with actual files."""
+    report.checks.append("\n--- 8. MANIFEST CONSISTENCY ---")
+    eprint("\n--- 8. MANIFEST CONSISTENCY ---")
 
-    for table_name in ["entries", "features", "xrefs", "comments"]:
-        table = catalog.load_table(f"{namespace}.{table_name}")
-        snapshots = list(table.metadata.snapshots)
-        append_snapshots = [
-            s for s in snapshots
-            if s.summary and s.summary.operation == Operation.APPEND
-        ]
+    manifest_path = os.path.join(lake_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        report.check("manifest.json exists", False, "file not found")
+        return
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    report.check("manifest.json exists", True)
+
+    # Check each table's files match what's on disk
+    for table_name in ["entries", "features", "xrefs", "comments", "references"]:
+        table_info = manifest.get("tables", {}).get(table_name, {})
+        manifest_files = set(table_info.get("files", []))
+        table_dir = os.path.join(lake_dir, table_name)
+
+        if os.path.isdir(table_dir):
+            actual_files = {f for f in os.listdir(table_dir) if f.endswith(".parquet")}
+        else:
+            actual_files = set()
+
         report.check(
-            f"{table_name} has exactly 1 APPEND snapshot",
-            len(append_snapshots) == 1,
-            f"got {len(append_snapshots)}" if len(append_snapshots) != 1 else ""
+            f"{table_name} manifest files match disk",
+            manifest_files == actual_files,
+            f"manifest={len(manifest_files)}, disk={len(actual_files)}"
+            if manifest_files != actual_files else ""
         )
 
 
@@ -610,21 +594,16 @@ def check_snapshots(report, catalog, namespace):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Production validation for UniProtKB Iceberg data lake"
+        description="Production validation for UniProtKB Parquet data lake"
     )
     parser.add_argument(
-        "--catalog-uri", required=True,
-        help="SQLite catalog URI (e.g. sqlite:///catalog.db)",
-    )
-    parser.add_argument(
-        "--warehouse", required=True,
-        help="Iceberg warehouse directory",
+        "--lake", required=True,
+        help="Lake directory (contains entries/, features/, etc.)",
     )
     parser.add_argument(
         "--jsonl", required=True,
         help="Source JSONL(.zst) file — ground truth for validation",
     )
-    parser.add_argument("--namespace", default="uniprotkb")
     parser.add_argument(
         "--spot-check-n", type=int, default=1000,
         help="Number of entries to spot-check against JSONL (default: 1000)",
@@ -634,14 +613,8 @@ def main():
 
     t_start = time.time()
     eprint("=" * 70)
-    eprint("PRODUCTION VALIDATION — UniProtKB Iceberg Data Lake")
+    eprint("PRODUCTION VALIDATION — UniProtKB Parquet Data Lake")
     eprint("=" * 70)
-
-    # Connect to catalog
-    catalog = SqlCatalog(
-        "uniprot",
-        **{"uri": args.catalog_uri, "warehouse": args.warehouse},
-    )
 
     report = ValidationReport()
 
@@ -652,17 +625,14 @@ def main():
     eprint(f"  JSONL: {jsonl_count:,} lines ({time.time()-t0:.1f}s)")
 
     # ── Run all checks ──
-    check_completeness(report, catalog, args.namespace, jsonl_count)
-    entry_accs = check_uniqueness(report, catalog, args.namespace)
-    check_null_keys(report, catalog, args.namespace)
-    check_referential_integrity(report, catalog, args.namespace, entry_accs)
-    check_sort_order(report, catalog, args.namespace)
-    check_round_trip(
-        report, catalog, args.namespace,
-        args.jsonl, args.spot_check_n,
-    )
-    check_parquet_integrity(report, args.warehouse)
-    check_snapshots(report, catalog, args.namespace)
+    check_completeness(report, args.lake, jsonl_count)
+    entry_accs = check_uniqueness(report, args.lake)
+    check_null_keys(report, args.lake)
+    check_referential_integrity(report, args.lake, entry_accs)
+    check_sort_order(report, args.lake)
+    check_round_trip(report, args.lake, args.jsonl, args.spot_check_n)
+    check_parquet_integrity(report, args.lake)
+    check_manifest(report, args.lake)
 
     # ── Write report ──
     elapsed = time.time() - t_start

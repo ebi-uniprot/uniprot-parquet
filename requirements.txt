@@ -1,5 +1,4 @@
 duckdb>=1.1,<2
-pyiceberg[pyarrow,sql-sqlite]>=0.7,<1
 pyarrow>=14.0,<18
 orjson>=3.9,<4
 ijson>=3.2,<4

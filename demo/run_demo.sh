@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# ─── UniProtKB Iceberg Demo ──────────────────────────────────────
+# ─── UniProtKB Parquet Data Lake Demo ───────────────────────────
 #
 # Downloads reviewed Drosophila melanogaster entries (~3,800 proteins)
-# from UniProtKB and builds a complete Iceberg data lake from scratch.
+# from UniProtKB and builds a complete Parquet data lake from scratch.
 #
 # Output (all inside demo/):
 #   input.json.gz           Downloaded UniProtKB JSON (kept for re-runs)
-#   lake/2026_01/           Iceberg data lake + sorted JSONL + manifest
+#   lake/2026_01/           Parquet data lake + sorted JSONL + provenance
 #
 # Usage:
 #   cd demo && ./run_demo.sh            # default: Drosophila reviewed
@@ -76,7 +76,7 @@ echo ""
 W=55
 BAR=$(printf '═%.0s' $(seq 1 $W))
 printf "╔%s╗\n" "$BAR"
-printf "║  %-$(( W - 2 ))s║\n" "UniProtKB Iceberg Demo"
+printf "║  %-$(( W - 2 ))s║\n" "UniProtKB Parquet Data Lake Demo"
 printf "║  %-$(( W - 2 ))s║\n" "Entries:  ${ENTRY_COUNT}"
 printf "║  %-$(( W - 2 ))s║\n" "Release:  ${RELEASE}"
 printf "╚%s╝\n" "$BAR"
@@ -107,18 +107,15 @@ if [[ -f "$RELEASE_DIR/validation_report.txt" ]]; then
     tail -3 "$RELEASE_DIR/validation_report.txt"
     echo ""
 fi
-echo "  Lake:       $RELEASE_DIR/"
-echo "  Catalog:    $RELEASE_DIR/catalog.db"
+echo "  Lake:         $RELEASE_DIR/lake/"
 echo "  Sorted JSONL: $RELEASE_DIR/sorted.jsonl.zst"
-if [[ -f "$RELEASE_DIR/manifest.json" ]]; then
-    echo "  Manifest:   $RELEASE_DIR/manifest.json"
+if [[ -f "$RELEASE_DIR/provenance.json" ]]; then
+    echo "  Provenance:   $RELEASE_DIR/provenance.json"
 fi
 echo ""
 echo "Query with DuckDB:"
 echo ""
-echo "import duckdb"
-echo "con = duckdb.connect()"
-echo "con.install_extension('iceberg'); con.load_extension('iceberg')"
-echo "base = '$(pwd)/$RELEASE_DIR/warehouse/uniprotkb'"
-echo "con.sql(f\"SELECT * FROM iceberg_scan('{base}/entries') LIMIT 5\").show()"
+echo "  import duckdb"
+echo "  con = duckdb.connect()"
+echo "  con.sql(\"SELECT * FROM read_parquet('$(pwd)/$RELEASE_DIR/lake/entries/*.parquet') LIMIT 5\").show()"
 echo ""

@@ -1,4 +1,4 @@
-"""Tests for the production validation script (validate_iceberg.py).
+"""Tests for the production validation script (validate_lake.py).
 
 Runs the full transform pipeline, then runs the validator against the
 resulting lake + source JSONL.  Verifies that all checks pass.
@@ -14,9 +14,9 @@ BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 SCHEMA_JSON = os.path.join(os.path.dirname(__file__), "..", "schema.json")
 
 
-def test_validate_passes_on_good_lake(small_jsonl, iceberg_lake, tmp_path):
+def test_validate_passes_on_good_lake(small_jsonl, parquet_lake, tmp_path):
     """The validator should pass on a correctly built lake."""
-    validate_script = os.path.join(BIN_DIR, "validate_iceberg.py")
+    validate_script = os.path.join(BIN_DIR, "validate_lake.py")
     env = os.environ.copy()
     env["PYTHONPATH"] = BIN_DIR + ":" + env.get("PYTHONPATH", "")
 
@@ -24,10 +24,8 @@ def test_validate_passes_on_good_lake(small_jsonl, iceberg_lake, tmp_path):
 
     cmd = [
         sys.executable, validate_script,
-        "--catalog-uri", iceberg_lake["catalog_uri"],
-        "--warehouse", iceberg_lake["warehouse"],
+        "--lake", parquet_lake["lake_dir"],
         "--jsonl", small_jsonl,
-        "--namespace", "uniprotkb",
         "--spot-check-n", "10",
         "-o", report_path,
     ]
@@ -37,8 +35,9 @@ def test_validate_passes_on_good_lake(small_jsonl, iceberg_lake, tmp_path):
     # Print stderr for debugging if it fails
     if result.returncode != 0:
         print("STDERR:", result.stderr)
-        with open(report_path) as f:
-            print("REPORT:", f.read())
+        if os.path.exists(report_path):
+            with open(report_path) as f:
+                print("REPORT:", f.read())
 
     assert result.returncode == 0, (
         f"Validator failed on a correct lake:\n{result.stderr}"

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-One-time DuckDB schema bootstrap for UniProtKB Iceberg pipeline.
+One-time DuckDB schema bootstrap for UniProtKB Parquet data lake pipeline.
 
 Run this ONCE against the full UniProtKB JSONL to generate the authoritative
 schema.json — the single source of truth for all downstream processing.
 
 schema.json maps each top-level JSON field to its DuckDB type.  It is used by
-DuckDB's read_json(columns={...}) for deterministic parsing, and the Iceberg
+DuckDB's read_json(columns={...}) for deterministic parsing, and the Parquet
 schemas are derived from it at transform time (cheap LIMIT 1 inference).
 
 By default, scans EVERY row (sample_size=-1) so that type unification accounts
@@ -45,7 +45,7 @@ import duckdb
 
 # Allow importing from the same bin/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from iceberg_transform import init_duckdb, _sql_escape
+from parquet_transform import init_duckdb, _sql_escape
 
 
 def eprint(*args, **kwargs):
@@ -84,7 +84,7 @@ def infer_duckdb_schema(con, jsonl_path, sample_all=True):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="One-time DuckDB schema bootstrap for UniProtKB Iceberg pipeline"
+        description="One-time DuckDB schema bootstrap for UniProtKB Parquet data lake pipeline"
     )
     parser.add_argument("input", help="Input JSONL(.zst) file (use the full dataset)")
     parser.add_argument(
@@ -162,8 +162,8 @@ def main():
     eprint()
     eprint("On future releases, the pipeline will:")
     eprint("  1. Validate every JSONL row against schema.json (full scan, ~30-60 min)")
-    eprint("  2. Infer Iceberg schemas cheaply from schema.json + SQL (LIMIT 1, sub-second)")
-    eprint("  3. Transform and write Iceberg tables")
+    eprint("  2. Infer Parquet schemas cheaply from schema.json + SQL (LIMIT 1, sub-second)")
+    eprint("  3. Transform and write Parquet tables")
     eprint("=" * 60)
 
 

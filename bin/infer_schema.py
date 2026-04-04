@@ -31,7 +31,7 @@ import duckdb
 
 # Allow importing from the same bin/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from iceberg_transform import _sql_escape
+from parquet_transform import _sql_escape
 
 
 def eprint(*args, **kwargs):

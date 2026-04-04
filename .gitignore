@@ -5,8 +5,6 @@ work/
 
 # Pipeline outputs
 datalake/
-warehouse/
-catalog.db
 *.parquet
 *.jsonl
 *.jsonl.zst

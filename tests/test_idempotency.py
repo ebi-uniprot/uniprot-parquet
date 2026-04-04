@@ -1,36 +1,33 @@
-"""Test that running the pipeline twice on the same warehouse produces identical results.
+"""Test that running the pipeline twice on the same output produces identical results.
 
-This verifies the idempotency fix: ensure_table drops and recreates tables
-rather than appending to them.  Without this, a second run would duplicate
-all data.
+This verifies idempotency: a second run overwrites the previous Parquet files,
+so row counts remain correct (no duplication).
 """
 
 import os
 import sys
 import subprocess
 
+import pyarrow.dataset as ds
 import pytest
-from pyiceberg.catalog.sql import SqlCatalog
 
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 SCHEMA_JSON = os.path.join(os.path.dirname(__file__), "..", "schema.json")
 
 EXPECTED_ENTRIES = 44
-TABLE_NAMES = ["entries", "features", "xrefs", "comments"]
+TABLE_NAMES = ["entries", "features", "xrefs", "comments", "references"]
 
 
-def _run_transform(small_jsonl, warehouse, catalog_db, extra_args=None):
-    """Run iceberg_transform.py once and return the subprocess result."""
-    transform_script = os.path.join(BIN_DIR, "iceberg_transform.py")
+def _run_transform(small_jsonl, outdir, extra_args=None):
+    """Run parquet_transform.py once and return the subprocess result."""
+    transform_script = os.path.join(BIN_DIR, "parquet_transform.py")
     env = os.environ.copy()
     env["PYTHONPATH"] = BIN_DIR + ":" + env.get("PYTHONPATH", "")
 
     cmd = [
         sys.executable, transform_script, small_jsonl,
         "--schema", SCHEMA_JSON,
-        "--catalog-uri", f"sqlite:///{catalog_db}",
-        "--warehouse", warehouse,
-        "--namespace", "uniprotkb",
+        "--outdir", outdir,
         "--memory-limit", "4GB",
         "--batch-size", "50",
         "--release", "idempotency_test",
@@ -40,40 +37,35 @@ def _run_transform(small_jsonl, warehouse, catalog_db, extra_args=None):
     return subprocess.run(cmd, env=env, capture_output=True, text=True)
 
 
-def _get_row_counts(catalog_uri, warehouse):
-    """Return dict of {table_name: row_count} from Iceberg metadata."""
-    catalog = SqlCatalog(
-        "uniprot", **{"uri": catalog_uri, "warehouse": warehouse}
-    )
+def _get_row_counts(outdir):
+    """Return dict of {table_name: row_count} from Parquet files."""
     counts = {}
     for name in TABLE_NAMES:
-        table = catalog.load_table(f"uniprotkb.{name}")
-        snapshot = table.current_snapshot()
-        if snapshot and snapshot.summary:
-            counts[name] = int(snapshot.summary["total-records"])
+        table_dir = os.path.join(outdir, name)
+        if os.path.isdir(table_dir):
+            dataset = ds.dataset(table_dir, format="parquet")
+            counts[name] = dataset.count_rows()
         else:
             counts[name] = 0
     return counts
 
 
 def test_idempotency(small_jsonl, tmp_path_factory):
-    """Running the pipeline twice on the same warehouse should not duplicate data."""
+    """Running the pipeline twice on the same output should not duplicate data."""
     lake_dir = tmp_path_factory.mktemp("idempotency")
-    warehouse = str(lake_dir / "warehouse")
-    catalog_db = str(lake_dir / "catalog.db")
-    catalog_uri = f"sqlite:///{catalog_db}"
+    outdir = str(lake_dir / "output")
 
     # First run
-    result1 = _run_transform(small_jsonl, warehouse, catalog_db)
+    result1 = _run_transform(small_jsonl, outdir)
     if result1.returncode != 0:
         pytest.fail(f"First run failed:\n{result1.stderr}")
-    counts1 = _get_row_counts(catalog_uri, warehouse)
+    counts1 = _get_row_counts(outdir)
 
-    # Second run — same warehouse, same catalog
-    result2 = _run_transform(small_jsonl, warehouse, catalog_db)
+    # Second run — same output directory
+    result2 = _run_transform(small_jsonl, outdir)
     if result2.returncode != 0:
         pytest.fail(f"Second run failed:\n{result2.stderr}")
-    counts2 = _get_row_counts(catalog_uri, warehouse)
+    counts2 = _get_row_counts(outdir)
 
     # Row counts must be identical (not doubled)
     for name in TABLE_NAMES:
@@ -86,62 +78,28 @@ def test_idempotency(small_jsonl, tmp_path_factory):
     assert counts2["entries"] == EXPECTED_ENTRIES
 
 
-def test_single_append_snapshot_after_rerun(small_jsonl, tmp_path_factory):
-    """After two runs, each table should still have exactly one APPEND snapshot."""
-    from pyiceberg.table.snapshots import Operation
-
-    lake_dir = tmp_path_factory.mktemp("idempotency_snapshots")
-    warehouse = str(lake_dir / "warehouse")
-    catalog_db = str(lake_dir / "catalog.db")
-    catalog_uri = f"sqlite:///{catalog_db}"
-
-    # Run twice
-    for i in range(2):
-        result = _run_transform(small_jsonl, warehouse, catalog_db)
-        if result.returncode != 0:
-            pytest.fail(f"Run {i+1} failed:\n{result.stderr}")
-
-    catalog = SqlCatalog(
-        "uniprot", **{"uri": catalog_uri, "warehouse": warehouse}
-    )
-    for name in TABLE_NAMES:
-        table = catalog.load_table(f"uniprotkb.{name}")
-        snapshots = list(table.metadata.snapshots)
-        append_snapshots = [
-            s for s in snapshots
-            if s.summary and s.summary.operation == Operation.APPEND
-        ]
-        assert len(append_snapshots) == 1, (
-            f"{name}: expected 1 APPEND snapshot after re-run, "
-            f"got {len(append_snapshots)}"
-        )
-
-
 def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
-    """--skip-existing skips tables that already have data, preserving row counts."""
+    """--skip-existing skips tables that already have Parquet files."""
     lake_dir = tmp_path_factory.mktemp("skip_existing")
-    warehouse = str(lake_dir / "warehouse")
-    catalog_db = str(lake_dir / "catalog.db")
-    catalog_uri = f"sqlite:///{catalog_db}"
+    outdir = str(lake_dir / "output")
 
     # First run — writes all tables
-    result1 = _run_transform(small_jsonl, warehouse, catalog_db)
+    result1 = _run_transform(small_jsonl, outdir)
     if result1.returncode != 0:
         pytest.fail(f"First run failed:\n{result1.stderr}")
-    counts1 = _get_row_counts(catalog_uri, warehouse)
+    counts1 = _get_row_counts(outdir)
 
-    # Record snapshot IDs from first run
-    catalog = SqlCatalog(
-        "uniprot", **{"uri": catalog_uri, "warehouse": warehouse}
-    )
-    snapshots1 = {}
+    # Record modification times from first run
+    mtimes1 = {}
     for name in TABLE_NAMES:
-        table = catalog.load_table(f"uniprotkb.{name}")
-        snapshots1[name] = table.current_snapshot().snapshot_id
+        table_dir = os.path.join(outdir, name)
+        files = sorted(f for f in os.listdir(table_dir) if f.endswith(".parquet"))
+        if files:
+            mtimes1[name] = os.path.getmtime(os.path.join(table_dir, files[0]))
 
     # Second run with --skip-existing — should skip all tables
     result2 = _run_transform(
-        small_jsonl, warehouse, catalog_db, extra_args=["--skip-existing"]
+        small_jsonl, outdir, extra_args=["--skip-existing"]
     )
     if result2.returncode != 0:
         pytest.fail(f"Second run failed:\n{result2.stderr}")
@@ -153,16 +111,16 @@ def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
         )
 
     # Row counts must be identical
-    counts2 = _get_row_counts(catalog_uri, warehouse)
+    counts2 = _get_row_counts(outdir)
     for name in TABLE_NAMES:
         assert counts1[name] == counts2[name]
 
-    # Snapshot IDs must be the same (tables were not recreated)
-    catalog2 = SqlCatalog(
-        "uniprot", **{"uri": catalog_uri, "warehouse": warehouse}
-    )
+    # File modification times must be the same (files were not rewritten)
     for name in TABLE_NAMES:
-        table = catalog2.load_table(f"uniprotkb.{name}")
-        assert table.current_snapshot().snapshot_id == snapshots1[name], (
-            f"{name}: snapshot ID changed — table was recreated instead of skipped"
-        )
+        table_dir = os.path.join(outdir, name)
+        files = sorted(f for f in os.listdir(table_dir) if f.endswith(".parquet"))
+        if files:
+            mtime2 = os.path.getmtime(os.path.join(table_dir, files[0]))
+            assert mtime2 == mtimes1[name], (
+                f"{name}: file was modified — table was rewritten instead of skipped"
+            )

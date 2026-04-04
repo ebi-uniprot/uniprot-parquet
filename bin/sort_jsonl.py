@@ -24,7 +24,7 @@ import time
 
 # Allow importing from the same bin/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from iceberg_transform import build_read_clause, init_duckdb, _sql_escape
+from parquet_transform import build_read_clause, init_duckdb, _sql_escape
 
 
 def eprint(*args, **kwargs):

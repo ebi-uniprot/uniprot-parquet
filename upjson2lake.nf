@@ -1,35 +1,38 @@
 #!/usr/bin/env nextflow
 
-// UniProtKB JSON → JSONL.zst + Iceberg tables (entries, features, xrefs, comments)
+// UniProtKB JSON → JSONL.zst + sorted Parquet data lake
 //
 // Produces (inside <outdir>/<release>/):
-//   sorted.jsonl.zst               (reviewed+taxid-sorted JSONL archive)
-//   warehouse/uniprotkb/entries/   (Iceberg table: one row per protein)
-//   warehouse/uniprotkb/features/  (Iceberg table: one row per feature)
-//   warehouse/uniprotkb/xrefs/     (Iceberg table: one row per xref)
-//   warehouse/uniprotkb/comments/  (Iceberg table: one row per comment)
-//   catalog.db                     (SQLite Iceberg catalog)
-//   validation_report.txt          (row counts, snapshot IDs)
-//   manifest.json                  (provenance: checksums, git, row counts)
+//   sorted.jsonl.zst                  (reviewed+taxid-sorted JSONL archive)
+//   lake/entries/entries_*.parquet     (one row per protein)
+//   lake/features/features_*.parquet  (one row per feature)
+//   lake/xrefs/xrefs_*.parquet        (one row per cross-reference)
+//   lake/comments/comments_*.parquet  (one row per comment annotation)
+//   lake/references/refs_*.parquet    (one row per citation)
+//   lake/manifest.json                (file list, schemas, row counts, sort orders)
+//   validation_report.txt             (7-check production validation)
+//   provenance.json                   (checksums, git commit, row counts)
 //
 // Architecture:
 //   1. Stream JSON(.gz) → single zstd-compressed JSONL
-//   2. Schema check — full-scan JSONL validation against schema.json
+//   2. Schema drift detection — fast sample (10K rows, ~60s)
+//      (catches new/removed/changed fields vs committed schema.json)
+//   3. Schema check — full-scan JSONL validation against schema.json
 //      (reads every row with declared types; ~30-60 min on 180GB)
-//   3. Sort JSONL by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
-//   4. Transform sorted JSONL → Iceberg tables via DuckDB + PyIceberg
+//   4. Sort JSONL by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
+//   5. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow
 //      (pre-sorted input makes DuckDB ORDER BY nearly free for entries;
 //       child tables benefit from input locality after LATERAL unnest;
 //       features additionally sorted by start_pos for positional queries)
-//   5. Production validation: completeness, referential integrity,
+//   6. Production validation: completeness, referential integrity,
 //      sort order, round-trip spot checks, Parquet integrity
-//   6. Generate provenance manifest (only if validation passes)
+//   7. Generate provenance manifest (only if validation passes)
 //
 // Schema management: schema.json is the single source of truth (committed to repo).
 // Run `schema_bootstrap.py` once against the full dataset to generate it.
 // It is human-readable and manually editable.
-// No partitioning — Iceberg handles data skipping via per-file column statistics.
-// All tables sorted by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first) for query locality.
+// All tables sorted by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
+// for query locality via Parquet row group statistics.
 
 nextflow.enable.dsl = 2
 
@@ -42,6 +45,7 @@ params.duckdb_pct     = 75        // % of process_memory allocated to DuckDB buf
 params.schema         = "${projectDir}/schema.json"
 params.notify_email   = null      // Email for SLURM failure notifications (null = disabled)
 params.duckdb_temp    = null      // DuckDB spill directory (null = use $TMPDIR or /tmp)
+params.expected_count = null      // Expected entry count (from UniProt release stats, null = skip)
 
 // Final output directory: <outdir>/<release>/
 def release_dir = "${params.outdir}/${params.release}"
@@ -58,6 +62,10 @@ def duckdb_memory = "${(int)(duckdb_bytes / (1024*1024*1024))}GB"
 
 
 /* ── PROCESS: Stream input to single zstd-compressed JSONL ────────── */
+// Emits a sidecar entry_count.txt for downstream processes.
+// Post-hoc verification: decompresses the output and counts lines
+// to catch pipe-level data loss between stream_jsonl and zstd.
+// Optionally checks against params.expected_count (from release metadata).
 process STREAM_JSONL {
     tag 'stream'
     cpus 4
@@ -69,18 +77,69 @@ process STREAM_JSONL {
 
     output:
     path "uniprot.jsonl.zst", emit: jsonl
+    path "entry_count.txt",   emit: count_file
 
     script:
     def cpus = task.cpus
+    def expected_flag = params.expected_count ? "--expected-count ${params.expected_count}" : ''
     """
     set -euo pipefail
     echo " .-- STREAM_JSONL BEGUN \$(date)"
 
     pigz -dc ${inputfile} \
-        | stream_jsonl.py \
+        | stream_jsonl.py --count-file entry_count.txt ${expected_flag} \
         | zstd -3 -T${cpus} -o uniprot.jsonl.zst
 
+    # Post-hoc verification: line count of compressed output must match
+    # the count stream_jsonl.py wrote.  Catches pipe-level data loss.
+    EXPECTED=\$(cat entry_count.txt)
+    ACTUAL=\$(zstd -dc uniprot.jsonl.zst | wc -l)
+    if [ "\$EXPECTED" != "\$ACTUAL" ]; then
+        echo "FATAL: JSONL line count mismatch after compression" >&2
+        echo "  stream_jsonl wrote: \$EXPECTED entries" >&2
+        echo "  zstd output has:    \$ACTUAL lines" >&2
+        exit 1
+    fi
+    echo "  Verified: \$ACTUAL lines in compressed output match stream_jsonl count"
+
     echo " '-- STREAM_JSONL ENDED \$(date)"
+    """
+}
+
+
+/* ── PROCESS: Detect schema drift before committing to full validation ── */
+// Samples 10K rows (fast — under 60s) and compares against schema.json.
+// Fails if the data has new fields, removed fields, or type changes.
+// This catches the case where UniProt adds a field that read_json(columns={...})
+// would silently drop.  Run schema_bootstrap.py to update schema.json.
+process SCHEMA_DIFF {
+    tag 'schema_diff'
+    cpus 2
+    memory '4 GB'
+    time '10m'
+
+    publishDir "${release_dir}", mode: 'copy', pattern: 'schema_diff.json'
+
+    input:
+    path jsonl
+    path duckdb_schema
+
+    output:
+    path "schema_diff.json", emit: report
+    val true,                emit: checked
+
+    script:
+    """
+    set -euo pipefail
+    echo " .-- SCHEMA_DIFF BEGUN \$(date)"
+
+    schema_diff.py ${jsonl} \
+        --committed-schema ${duckdb_schema} \
+        --sample-size 10000 \
+        --strict \
+        -o schema_diff.json
+
+    echo " '-- SCHEMA_DIFF ENDED \$(date)"
     """
 }
 
@@ -117,7 +176,7 @@ process SCHEMA_CHECK {
 
 
 /* ── PROCESS: Sort JSONL by reviewed DESC, taxid ASC, acc ASC ──────────────── */
-// Sorts the raw JSONL before the Iceberg transform.  Pre-sorted input
+// Sorts the raw JSONL before the Parquet transform.  Pre-sorted input
 // makes DuckDB's ORDER BY nearly free for the entries table and improves
 // locality for child table sorts after LATERAL unnest.
 // Also the published deliverable for end users.
@@ -134,6 +193,7 @@ process SORT_JSONL {
     path jsonl
     path duckdb_schema
     val schema_ok
+    val schema_drift_ok
 
     output:
     path "sorted.jsonl.zst", emit: sorted_jsonl
@@ -155,12 +215,14 @@ process SORT_JSONL {
 }
 
 
-/* ── PROCESS: Transform sorted JSONL → Iceberg tables ────────────── */
-// Reads the pre-sorted JSONL.  DuckDB's ORDER BY on entries is nearly
+/* ── PROCESS: Transform sorted JSONL → Parquet tables ───────────── */
+// Stages the sorted JSONL to Parquet once (single JSON parse), then all
+// five table queries read from the staged Parquet — roughly 2× faster than
+// re-parsing JSON for each table.  DuckDB's ORDER BY on entries is nearly
 // a no-op since the input is already in (reviewed DESC, taxid ASC, acc ASC) order.
-// Child tables (features, xrefs, comments) still need their own sort
+// Child tables (features, xrefs, comments, references) still need their own sort
 // after LATERAL unnest, but benefit from the input locality.
-process ICEBERG_TRANSFORM {
+process PARQUET_TRANSFORM {
     tag 'transform'
     cpus 4
     memory params.process_memory
@@ -169,42 +231,38 @@ process ICEBERG_TRANSFORM {
     errorStrategy 'retry'
     maxRetries 1
 
-    publishDir "${release_dir}", mode: 'copy', pattern: 'warehouse'
-    publishDir "${release_dir}", mode: 'copy', pattern: 'catalog.db'
+    publishDir "${release_dir}", mode: 'copy', pattern: 'lake'
 
     input:
     path sorted_jsonl
     path duckdb_schema
 
     output:
-    path "warehouse",    emit: warehouse
-    path "catalog.db",   emit: catalog
+    path "lake", emit: lake
 
     script:
     """
     set -euo pipefail
-    echo " .-- ICEBERG_TRANSFORM BEGUN \$(date)"
+    echo " .-- PARQUET_TRANSFORM BEGUN \$(date)"
 
-    iceberg_transform.py ${sorted_jsonl} \
+    parquet_transform.py ${sorted_jsonl} \
         --schema ${duckdb_schema} \
-        --catalog-uri sqlite:///catalog.db \
-        --warehouse ./warehouse \
-        --namespace uniprotkb \
+        --outdir ./lake \
         --memory-limit ${duckdb_memory} \
         --threads ${task.cpus} \
         --release ${params.release} \
         --skip-existing \
         ${params.duckdb_temp ? "--temp-dir ${params.duckdb_temp}" : ''}
 
-    echo " '-- ICEBERG_TRANSFORM ENDED \$(date)"
+    echo " '-- PARQUET_TRANSFORM ENDED \$(date)"
     """
 }
 
 
-/* ── PROCESS: Production validation of the Iceberg data lake ─────── */
+/* ── PROCESS: Production validation of the Parquet data lake ─────── */
 // Validates completeness, uniqueness, referential integrity, sort order,
 // round-trip spot checks against the source JSONL, Parquet file integrity,
-// and snapshot sanity.  Exits 1 on ANY failure.
+// and manifest consistency.  Exits 1 on ANY failure.
 // Uses the sorted JSONL as ground truth (same entries, same count).
 process VALIDATE {
     tag 'validate'
@@ -215,8 +273,7 @@ process VALIDATE {
     publishDir "${release_dir}", mode: 'move'
 
     input:
-    path warehouse
-    path catalog
+    path lake
     path sorted_jsonl
 
     output:
@@ -228,11 +285,9 @@ process VALIDATE {
     set -euo pipefail
     echo " .-- VALIDATE BEGUN \$(date)"
 
-    validate_iceberg.py \
-        --catalog-uri sqlite:///${catalog} \
-        --warehouse ${warehouse} \
+    validate_lake.py \
+        --lake ${lake} \
         --jsonl ${sorted_jsonl} \
-        --namespace uniprotkb \
         --spot-check-n 1000 \
         -o validation_report.txt
 
@@ -242,37 +297,34 @@ process VALIDATE {
 
 
 /* ── PROCESS: Generate provenance manifest ───────────────────────── */
-// MANIFEST depends on VALIDATE (via validation_ok gate) so that a manifest
+// PROVENANCE depends on VALIDATE (via validation_ok gate) so that it
 // is only published if the data lake passes validation.
-process MANIFEST {
-    tag 'manifest'
+process PROVENANCE {
+    tag 'provenance'
     cpus 1
     memory '1 GB'
 
     publishDir "${release_dir}", mode: 'move'
 
     input:
-    path warehouse
-    path catalog
+    path lake
     path sorted_jsonl
     path duckdb_schema
     val validation_ok
 
     output:
-    path "manifest.json", emit: manifest
+    path "provenance.json", emit: provenance
 
     script:
     """
     set -euo pipefail
 
     release_manifest.py \
-        --catalog-uri sqlite:///${catalog} \
-        --warehouse ${warehouse} \
-        --namespace uniprotkb \
+        --lake ${lake} \
         --input-jsonl ${sorted_jsonl} \
         --schema ${duckdb_schema} \
         --release ${params.release} \
-        -o manifest.json
+        -o provenance.json
     """
 }
 
@@ -284,7 +336,7 @@ workflow {
     def line = { String s -> "║  ${s.padRight(W - 2)}║" }
     log.info """
     ╔${bar}╗
-    ${line('UniProtKB → Iceberg Data Lake')}
+    ${line('UniProtKB → Parquet Data Lake')}
     ${line("Release: ${params.release}")}
     ╚${bar}╝
     Input:      ${params.inputfile}
@@ -292,6 +344,7 @@ workflow {
     Output:     ${release_dir}
     DuckDB mem: ${duckdb_memory} (${params.duckdb_pct}% of ${params.process_memory})
     DuckDB tmp: ${params.duckdb_temp ?: '(default: \$TMPDIR or /tmp)'}
+    Expected:   ${params.expected_count ?: '(not set — post-hoc verification only)'}
     ${'─' * (W + 2)}
     """.stripIndent()
 
@@ -308,38 +361,43 @@ workflow {
     input_ch = Channel.fromPath(params.inputfile)
     STREAM_JSONL(input_ch)
 
-    // 2. Schema check — full-scan JSONL validation against schema.json
-    //    (gate: sort + transform only run if validation passes)
+    // 2. Schema drift detection — fast sample (10K rows, ~60s)
+    //    Fails if the data has new/removed/changed fields vs schema.json.
+    //    Catches silent field drops before the expensive full-scan.
+    SCHEMA_DIFF(STREAM_JSONL.out.jsonl, schema_ch)
+
+    // 3. Schema check — full-scan JSONL validation against schema.json
+    //    (gate: sort + transform only run if both checks pass)
     SCHEMA_CHECK(STREAM_JSONL.out.jsonl, schema_ch)
 
-    // 3. Sort JSONL by reviewed DESC, taxid ASC, acc ASC
+    // 4. Sort JSONL by reviewed DESC, taxid ASC, acc ASC
     //    Pre-sorting means DuckDB's ORDER BY in the transform is nearly free.
+    //    Gated on both schema checks passing.
     SORT_JSONL(
         STREAM_JSONL.out.jsonl,
         schema_ch,
         SCHEMA_CHECK.out.validated,
+        SCHEMA_DIFF.out.checked,
     )
 
-    // 4. Transform sorted JSONL → Iceberg tables
+    // 5. Transform sorted JSONL → Parquet tables
     //    Reads pre-sorted input; entries ORDER BY is a no-op,
     //    child tables benefit from input locality after unnest.
-    ICEBERG_TRANSFORM(
+    PARQUET_TRANSFORM(
         SORT_JSONL.out.sorted_jsonl,
         schema_ch,
     )
 
-    // 5. Validate the Iceberg lake (uses sorted JSONL as ground truth —
+    // 6. Validate the Parquet lake (uses sorted JSONL as ground truth —
     //    same entries, same count, just reordered)
     VALIDATE(
-        ICEBERG_TRANSFORM.out.warehouse,
-        ICEBERG_TRANSFORM.out.catalog,
+        PARQUET_TRANSFORM.out.lake,
         SORT_JSONL.out.sorted_jsonl,
     )
 
-    // 6. Generate provenance manifest (only after validation passes)
-    MANIFEST(
-        ICEBERG_TRANSFORM.out.warehouse,
-        ICEBERG_TRANSFORM.out.catalog,
+    // 7. Generate provenance record (only after validation passes)
+    PROVENANCE(
+        PARQUET_TRANSFORM.out.lake,
         SORT_JSONL.out.sorted_jsonl,
         schema_ch,
         VALIDATE.out.validated,

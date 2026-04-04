@@ -1,44 +1,40 @@
 #!/usr/bin/env bash
-# ─── UniProtKB → Iceberg Data Lake Pipeline ─────────────────────
+# ─── UniProtKB → Parquet Data Lake Pipeline ─────────────────────
 # Usage:
-#   ./run_lake.sh                                         # test mode
-#   ./run_lake.sh prod                                    # production
-#   ./run_lake.sh prod --input /path/to/UniProtKB.json.gz
-#   ./run_lake.sh prod --outdir /scratch/results
+#   ./run_lake.sh                                         # small: ~4K entries, local
+#   ./run_lake.sh subset                                  # subset: 100K entries, SLURM short
+#   ./run_lake.sh full --expected-count 248799253          # full UniProtKB, SLURM prod
+#   ./run_lake.sh full --expected-count 248799253 --input /path/to/UniProtKB.json.gz
+#   ./run_lake.sh full --expected-count 248799253 --outdir /scratch/results
 
 set -euo pipefail
 
-MODE="${1:-test_small}"
+MODE="${1:-small}"
 shift || true
 
 # ─── Parse optional flags ─────────────────────────────────────────
 INPUTFILE_OVERRIDE=""
 OUTDIR_OVERRIDE=""
 DUCKDB_TEMP_OVERRIDE=""
+EXPECTED_COUNT=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --input)      INPUTFILE_OVERRIDE="$2";   shift 2 ;;
-        --outdir)     OUTDIR_OVERRIDE="$2";      shift 2 ;;
-        --duckdb-tmp) DUCKDB_TEMP_OVERRIDE="$2"; shift 2 ;;
-        *)            echo "Unknown flag: $1"; exit 1  ;;
+        --input)          INPUTFILE_OVERRIDE="$2";   shift 2 ;;
+        --outdir)         OUTDIR_OVERRIDE="$2";      shift 2 ;;
+        --duckdb-tmp)     DUCKDB_TEMP_OVERRIDE="$2"; shift 2 ;;
+        --expected-count) EXPECTED_COUNT="$2";        shift 2 ;;
+        *)                echo "Unknown flag: $1"; exit 1  ;;
     esac
 done
 
 # ─── Defaults ─────────────────────────────────────────────────────
 case "$MODE" in
-    test_small)
-        INPUTFILE="tests/fixtures/small.json.gz"
-        OUTDIR="$(pwd)/datalake/uniprot_lake_test_small"
-        MEMORY="8GB"
-        RELEASE="test_small"
-        PROFILE="local"
-        ;;
-    test_med)
+    small)
         INPUTFILE="demo/input.json.gz"
-        OUTDIR="$(pwd)/datalake/uniprot_lake_test_med"
+        OUTDIR="$(pwd)/datalake"
         MEMORY="8GB"
-        RELEASE="test_med"
+        RELEASE="small"
         PROFILE="local"
         ;;
     subset)
@@ -48,7 +44,7 @@ case "$MODE" in
         RELEASE="subset"
         PROFILE="short"
         ;;
-    prod)
+    full)
         INPUTFILE="UniProtKB.json.gz"
         OUTDIR="$(pwd)/datalake"
         MEMORY="96GB"
@@ -56,10 +52,19 @@ case "$MODE" in
         PROFILE="prod"
         ;;
     *)
-        echo "Usage: $0 {test_small|test_med|prod|subset} [--input FILE] [--outdir DIR]"
+        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N]"
         exit 1
         ;;
 esac
+
+# In full mode, --expected-count is mandatory to guard against silent data loss.
+# Get the expected count from UniProt release statistics before launching.
+if [[ "$MODE" == "full" && -z "$EXPECTED_COUNT" ]]; then
+    echo "ERROR: --expected-count is required for full mode."
+    echo "  Get the entry count from the UniProt release notes, then run:"
+    echo "    $0 full --expected-count <N>"
+    exit 1
+fi
 
 # Apply overrides
 [[ -n "$INPUTFILE_OVERRIDE" ]] && INPUTFILE="$INPUTFILE_OVERRIDE"
@@ -68,7 +73,7 @@ esac
 W=55
 BAR=$(printf '═%.0s' $(seq 1 $W))
 printf "╔%s╗\n" "$BAR"
-printf "║  %-$(( W - 2 ))s║\n" "UniProtKB → Iceberg Data Lake"
+printf "║  %-$(( W - 2 ))s║\n" "UniProtKB → Parquet Data Lake"
 printf "╠%s╣\n" "$BAR"
 printf "║  %-$(( W - 2 ))s║\n" "Mode:      $MODE"
 printf "║  %-$(( W - 2 ))s║\n" "Release:   $RELEASE"
@@ -97,6 +102,11 @@ NF_CMD=(
 # Add DuckDB temp directory if specified
 if [[ -n "$DUCKDB_TEMP_OVERRIDE" ]]; then
     NF_CMD+=(--duckdb_temp "$DUCKDB_TEMP_OVERRIDE")
+fi
+
+# Add expected entry count if specified (verified during STREAM_JSONL)
+if [[ -n "$EXPECTED_COUNT" ]]; then
+    NF_CMD+=(--expected_count "$EXPECTED_COUNT")
 fi
 
 echo "Running: ${NF_CMD[*]}"
