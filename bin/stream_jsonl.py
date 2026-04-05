@@ -84,6 +84,10 @@ def main():
         pass
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"  stream_jsonl: FATAL — {type(e).__name__} after {count:,} entries: {e}",
+              file=sys.stderr)
+        sys.exit(1)
 
     elapsed = time.time() - t0
     print(f"  stream_jsonl: DONE — {count:,} entries in {elapsed:.1f}s",

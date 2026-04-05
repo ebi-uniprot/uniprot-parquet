@@ -16,3 +16,8 @@ dependencies:
       - ijson                           # Streaming JSON parser
       - zstandard                       # Zstd bindings for test fixtures
       - pytest                          # Test runner
+      # ── Demo notebook (demo/demo_datalake.ipynb) ──
+      - notebook                         # Jupyter notebook server
+      - polars                           # DataFrame library
+      - pandas                           # DataFrame library
+      - matplotlib                       # Plotting

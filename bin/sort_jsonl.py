@@ -70,27 +70,30 @@ def main():
     eprint()
 
     con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
-    read_clause = build_read_clause(jsonl_path)
+    try:
+        read_clause = build_read_clause(jsonl_path)
 
-    sql = SORT_SQL.format(read_clause=read_clause)
-    safe_output = _sql_escape(output_path)
+        sql = SORT_SQL.format(read_clause=read_clause)
+        safe_output = _sql_escape(output_path)
 
-    eprint("Sorting (reviewed DESC, taxid ASC, acc ASC) and writing...")
-    eprint("  DuckDB will spill to disk if the dataset exceeds memory.")
-    t0 = time.time()
+        eprint("Sorting (reviewed DESC, taxid ASC, acc ASC) and writing...")
+        eprint("  DuckDB will spill to disk if the dataset exceeds memory.")
+        t0 = time.time()
 
-    con.sql(f"""
-        COPY ({sql}) TO '{safe_output}'
-        (FORMAT JSON, COMPRESSION ZSTD)
-    """)
+        con.sql(f"""
+            COPY ({sql}) TO '{safe_output}'
+            (FORMAT JSON, COMPRESSION ZSTD)
+        """)
 
-    elapsed = time.time() - t0
-    eprint(f"  Done in {elapsed:.1f}s")
+        elapsed = time.time() - t0
+        eprint(f"  Done in {elapsed:.1f}s")
 
-    # Quick sanity: report output size
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    eprint(f"  Output: {size_mb:.1f} MB")
-    eprint("=" * 60)
+        # Quick sanity: report output size
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        eprint(f"  Output: {size_mb:.1f} MB")
+        eprint("=" * 60)
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":

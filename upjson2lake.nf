@@ -10,7 +10,7 @@
 //   lake/comments/comments_*.parquet  (one row per comment annotation)
 //   lake/references/refs_*.parquet    (one row per citation)
 //   lake/manifest.json                (file list, schemas, row counts, sort orders)
-//   validation_report.txt             (7-check production validation)
+//   validation_report.txt             (12-check production validation)
 //   provenance.json                   (checksums, git commit, row counts)
 //
 // Architecture:

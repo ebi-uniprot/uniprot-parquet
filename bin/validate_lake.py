@@ -21,8 +21,9 @@ Checks (in order):
   2. UNIQUENESS
      - entries.acc has zero duplicates
 
-  3. NULL KEYS
+  3. NULL KEYS AND EMPTY STRINGS
      - acc, reviewed, taxid never null in any table
+     - Identity columns (acc, id, sequence) never empty strings
 
   4. REFERENTIAL INTEGRITY
      - Every acc in features exists in entries
@@ -39,6 +40,22 @@ Checks (in order):
 
   7. PARQUET FILE INTEGRITY
      - Every data file in the lake is a readable Parquet file
+
+  8. MANIFEST CONSISTENCY
+     - manifest.json file lists match actual files on disk
+
+  9. DENORMALIZED COLUMN SYNC
+     - taxid and from_reviewed in child tables match entries
+
+  10. SEQUENCE INTEGRITY
+      - len(sequence) == seq_length for every entry
+      - No entries with seq_length == 0
+
+  11. FEATURE COORDINATE BOUNDARIES
+      - start_pos <= end_pos where both are non-null
+
+  12. SCHEMA TYPE PROTECTION
+      - Critical columns have expected Arrow types (not silently cast)
 
 Usage:
     validate_lake.py \
@@ -265,9 +282,9 @@ def check_uniqueness(report, lake_dir):
 
 
 def check_null_keys(report, lake_dir):
-    """Verify critical columns are never null."""
-    report.checks.append("\n--- 3. NULL KEYS ---")
-    eprint("\n--- 3. NULL KEYS ---")
+    """Verify critical columns are never null and identity columns have no empty strings."""
+    report.checks.append("\n--- 3. NULL KEYS AND EMPTY STRINGS ---")
+    eprint("\n--- 3. NULL KEYS AND EMPTY STRINGS ---")
 
     key_checks = [
         ("entries",    ["acc", "reviewed", "taxid", "entry_type"]),
@@ -275,6 +292,15 @@ def check_null_keys(report, lake_dir):
         ("xrefs",      ["acc", "from_reviewed", "taxid", "database", "id"]),
         ("comments",   ["acc", "from_reviewed", "taxid", "comment_type"]),
         ("references", ["acc", "from_reviewed", "taxid", "citation_type", "reference_number"]),
+    ]
+
+    # Identity columns that must never be empty strings
+    empty_string_checks = [
+        ("entries",    ["acc", "id", "sequence"]),
+        ("features",   ["acc"]),
+        ("xrefs",      ["acc", "id"]),
+        ("comments",   ["acc"]),
+        ("references", ["acc"]),
     ]
 
     for table_name, columns in key_checks:
@@ -291,6 +317,24 @@ def check_null_keys(report, lake_dir):
                 f"{table_name}.{col_name} has no nulls",
                 nc == 0,
                 f"null_count={nc:,}" if nc > 0 else ""
+            )
+
+    for table_name, columns in empty_string_checks:
+        dataset = open_table(lake_dir, table_name)
+        empty_counts = {col: 0 for col in columns}
+
+        for batch in dataset.to_batches(columns=columns):
+            for col_name in columns:
+                empty_counts[col_name] += pc.sum(
+                    pc.equal(batch.column(col_name), "")
+                ).as_py()
+
+        for col_name in columns:
+            ec = empty_counts[col_name]
+            report.check(
+                f"{table_name}.{col_name} has no empty strings",
+                ec == 0,
+                f"empty_count={ec:,}" if ec > 0 else ""
             )
 
 
@@ -590,6 +634,210 @@ def check_manifest(report, lake_dir):
         )
 
 
+def check_denormalized_sync(report, lake_dir):
+    """Verify that denormalized parent columns in child tables match entries."""
+    report.checks.append("\n--- 9. DENORMALIZED COLUMN SYNC ---")
+    eprint("\n--- 9. DENORMALIZED COLUMN SYNC ---")
+
+    # Build lookup: acc → (reviewed, taxid) from entries
+    entries_ds = open_table(lake_dir, "entries")
+    entry_lookup = {}
+    for batch in entries_ds.to_batches(columns=["acc", "reviewed", "taxid"]):
+        accs = batch.column("acc").to_pylist()
+        revs = batch.column("reviewed").to_pylist()
+        taxids = batch.column("taxid").to_pylist()
+        for i, acc in enumerate(accs):
+            entry_lookup[acc] = (revs[i], taxids[i])
+
+    for child_name in ["features", "xrefs", "comments", "references"]:
+        child_ds = open_table(lake_dir, child_name)
+        taxid_mismatches = 0
+        reviewed_mismatches = 0
+        mismatch_examples = []
+
+        for batch in child_ds.to_batches(
+            columns=["acc", "from_reviewed", "taxid"]
+        ):
+            accs = batch.column("acc").to_pylist()
+            revs = batch.column("from_reviewed").to_pylist()
+            taxids = batch.column("taxid").to_pylist()
+            for i, acc in enumerate(accs):
+                parent = entry_lookup.get(acc)
+                if parent is None:
+                    continue  # orphan — caught by referential integrity check
+                if taxids[i] != parent[1]:
+                    taxid_mismatches += 1
+                    if len(mismatch_examples) < 3:
+                        mismatch_examples.append(
+                            f"{acc}: child taxid={taxids[i]}, "
+                            f"parent taxid={parent[1]}"
+                        )
+                if revs[i] != parent[0]:
+                    reviewed_mismatches += 1
+
+        report.check(
+            f"{child_name}.taxid matches entries.taxid",
+            taxid_mismatches == 0,
+            f"{taxid_mismatches:,} mismatches" if taxid_mismatches else ""
+        )
+        report.check(
+            f"{child_name}.from_reviewed matches entries.reviewed",
+            reviewed_mismatches == 0,
+            f"{reviewed_mismatches:,} mismatches" if reviewed_mismatches else ""
+        )
+        if mismatch_examples:
+            for ex in mismatch_examples:
+                report.checks.append(f"    {ex}")
+
+
+def check_sequence_integrity(report, lake_dir):
+    """Verify sequence string length equals seq_length integer."""
+    report.checks.append("\n--- 10. SEQUENCE INTEGRITY ---")
+    eprint("\n--- 10. SEQUENCE INTEGRITY ---")
+
+    entries_ds = open_table(lake_dir, "entries")
+    mismatches = 0
+    zero_length = 0
+    mismatch_examples = []
+
+    for batch in entries_ds.to_batches(columns=["acc", "sequence", "seq_length"]):
+        seq_lens = batch.column("seq_length")
+        str_lens = pc.utf8_length(batch.column("sequence"))
+        is_equal = pc.equal(seq_lens, str_lens)
+        n_bad = pc.sum(pc.invert(is_equal)).as_py()
+        if n_bad > 0:
+            mismatches += n_bad
+            if len(mismatch_examples) < 3:
+                accs = batch.column("acc").to_pylist()
+                sls = seq_lens.to_pylist()
+                stls = str_lens.to_pylist()
+                for i, eq in enumerate(is_equal.to_pylist()):
+                    if not eq and len(mismatch_examples) < 3:
+                        mismatch_examples.append(
+                            f"{accs[i]}: seq_length={sls[i]}, "
+                            f"len(sequence)={stls[i]}"
+                        )
+
+        zero_length += pc.sum(pc.equal(seq_lens, 0)).as_py()
+
+    report.check(
+        "len(sequence) == seq_length for all entries",
+        mismatches == 0,
+        f"{mismatches:,} mismatches" if mismatches else ""
+    )
+    for ex in mismatch_examples:
+        report.checks.append(f"    {ex}")
+
+    report.check(
+        "no entries with seq_length == 0",
+        zero_length == 0,
+        f"{zero_length:,} entries with seq_length=0" if zero_length else ""
+    )
+
+
+def check_feature_coordinates(report, lake_dir):
+    """Verify feature start_pos <= end_pos where both are non-null."""
+    report.checks.append("\n--- 11. FEATURE COORDINATE BOUNDARIES ---")
+    eprint("\n--- 11. FEATURE COORDINATE BOUNDARIES ---")
+
+    features_ds = open_table(lake_dir, "features")
+    inverted = 0
+    inversion_examples = []
+
+    for batch in features_ds.to_batches(
+        columns=["acc", "type", "start_pos", "end_pos"]
+    ):
+        starts = batch.column("start_pos")
+        ends = batch.column("end_pos")
+        # Only check where both are non-null
+        both_present = pc.and_(
+            pc.is_valid(starts),
+            pc.is_valid(ends),
+        )
+        start_gt_end = pc.and_(
+            both_present,
+            pc.greater(starts, ends),
+        )
+        n_bad = pc.sum(start_gt_end).as_py()
+        if n_bad > 0:
+            inverted += n_bad
+            if len(inversion_examples) < 3:
+                accs = batch.column("acc").to_pylist()
+                types = batch.column("type").to_pylist()
+                ss = starts.to_pylist()
+                es = ends.to_pylist()
+                for i, bad in enumerate(start_gt_end.to_pylist()):
+                    if bad and len(inversion_examples) < 3:
+                        inversion_examples.append(
+                            f"{accs[i]} ({types[i]}): "
+                            f"start={ss[i]} > end={es[i]}"
+                        )
+
+    report.check(
+        "features: start_pos <= end_pos (where both non-null)",
+        inverted == 0,
+        f"{inverted:,} inverted coordinates" if inverted else ""
+    )
+    for ex in inversion_examples:
+        report.checks.append(f"    {ex}")
+
+
+def check_schema_types(report, lake_dir):
+    """Verify critical columns have expected Arrow types after schema inference."""
+    report.checks.append("\n--- 12. SCHEMA TYPE PROTECTION ---")
+    eprint("\n--- 12. SCHEMA TYPE PROTECTION ---")
+
+    # Expected types for critical columns (Arrow type string prefixes)
+    # Using startswith() to allow int32/int64 flexibility
+    expected_types = {
+        "entries": {
+            "acc":              "string",
+            "reviewed":         "bool",
+            "taxid":            "int",
+            "seq_length":       "int",
+            "sequence":         "string",
+            "annotation_score": ("double", "float"),
+        },
+        "features": {
+            "acc":              "string",
+            "from_reviewed":    "bool",
+            "taxid":            "int",
+            "type":             "string",
+            "start_pos":        "int",
+            "end_pos":          "int",
+        },
+        "xrefs": {
+            "acc":              "string",
+            "from_reviewed":    "bool",
+            "taxid":            "int",
+            "database":         "string",
+            "id":               "string",
+        },
+    }
+
+    for table_name, columns in expected_types.items():
+        dataset = open_table(lake_dir, table_name)
+        schema = dataset.schema
+        for col_name, expected in columns.items():
+            idx = schema.get_field_index(col_name)
+            if idx == -1:
+                report.check(
+                    f"{table_name}.{col_name} exists in schema",
+                    False, "column missing"
+                )
+                continue
+            actual_type = str(schema.field(idx).type)
+            if isinstance(expected, tuple):
+                matches = any(actual_type.startswith(e) for e in expected)
+            else:
+                matches = actual_type.startswith(expected)
+            report.check(
+                f"{table_name}.{col_name} type is {expected}",
+                matches,
+                f"actual={actual_type}" if not matches else ""
+            )
+
+
 # ─── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -633,6 +881,10 @@ def main():
     check_round_trip(report, args.lake, args.jsonl, args.spot_check_n)
     check_parquet_integrity(report, args.lake)
     check_manifest(report, args.lake)
+    check_denormalized_sync(report, args.lake)
+    check_sequence_integrity(report, args.lake)
+    check_feature_coordinates(report, args.lake)
+    check_schema_types(report, args.lake)
 
     # ── Write report ──
     elapsed = time.time() - t_start

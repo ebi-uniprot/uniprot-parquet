@@ -608,118 +608,121 @@ def main():
 
     # ── Init DuckDB ──
     con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
-    json_read_clause = build_read_clause(jsonl_path)
-
-    # ── Determine which tables to write ──
-    skip_set = set()
-    if args.skip_existing:
-        for name, _, _ in TABLE_DEFS:
-            table_dir = os.path.join(outdir, name)
-            if os.path.isdir(table_dir):
-                existing = [f for f in os.listdir(table_dir) if f.endswith(".parquet")]
-                if existing:
-                    skip_set.add(name)
-                    eprint(f"  SKIP {name} (already has {len(existing)} Parquet files, --skip-existing)")
-
-    tables_to_write = {name for name, _, _ in TABLE_DEFS} - skip_set
-
-    # ── Stage JSONL → Parquet (parse JSON once, read Parquet 5× faster) ──
     staging_dir = os.path.join(outdir, ".staging")
     staging_path = os.path.join(staging_dir, "staged.parquet")
 
-    if tables_to_write:
-        eprint("\n--- PARQUET STAGING ---")
-        os.makedirs(staging_dir, exist_ok=True)
-        read_clause = stage_to_parquet(con, json_read_clause, staging_path)
-    else:
-        eprint("\n--- PARQUET STAGING (skipped — all tables already written) ---")
-        read_clause = json_read_clause
+    try:
+        json_read_clause = build_read_clause(jsonl_path)
 
-    # ── Discover available columns (for optional field handling) ──
-    available_cols = get_available_columns(con, read_clause)
-    missing_optional = _OPTIONAL_ENTRY_FIELDS - available_cols
-    if missing_optional:
-        eprint(f"  Optional fields not in data (will be NULL): {', '.join(sorted(missing_optional))}")
+        # ── Determine which tables to write ──
+        skip_set = set()
+        if args.skip_existing:
+            for name, _, _ in TABLE_DEFS:
+                table_dir = os.path.join(outdir, name)
+                if os.path.isdir(table_dir):
+                    existing = [f for f in os.listdir(table_dir) if f.endswith(".parquet")]
+                    if existing:
+                        skip_set.add(name)
+                        eprint(f"  SKIP {name} (already has {len(existing)} Parquet files, --skip-existing)")
 
-    # ── Write tables ──
-    t_total = time.time()
-    manifest_tables = {}
+        tables_to_write = {name for name, _, _ in TABLE_DEFS} - skip_set
 
-    for name, sql_template, sort_order in TABLE_DEFS:
-        eprint(f"\n--- {name.upper()} ---")
-        table_dir = os.path.join(outdir, name)
-
-        meta = TABLE_META.get(name, {})
-
-        if name in skip_set:
-            existing = sorted(f for f in os.listdir(table_dir) if f.endswith(".parquet"))
-            # Count rows from existing files
-            row_count = 0
-            for fname in existing:
-                fmeta = pq.read_metadata(os.path.join(table_dir, fname))
-                row_count += fmeta.num_rows
-            eprint(f"  Skipped ({row_count:,} rows in {len(existing)} existing files)")
-            # Read schema from first file
-            schema = pq.read_schema(os.path.join(table_dir, existing[0]))
-            manifest_tables[name] = {
-                "description": meta.get("description", ""),
-                "primary_key": meta.get("primary_key", []),
-                "foreign_keys": meta.get("foreign_keys", {}),
-                "files": existing,
-                "row_count": row_count,
-                "sort_order": sort_order,
-                "columns": _schema_to_dict(schema),
-                "column_categories": meta.get("columns", {}),
-            }
+        # ── Stage JSONL → Parquet (parse JSON once, read Parquet 5× faster) ──
+        if tables_to_write:
+            eprint("\n--- PARQUET STAGING ---")
+            os.makedirs(staging_dir, exist_ok=True)
+            read_clause = stage_to_parquet(con, json_read_clause, staging_path)
         else:
-            # Entries SQL is built dynamically to handle optional fields
-            if sql_template is None:
-                sql_template = _build_entries_sql(available_cols)
-            sql = sql_template.format(read_clause=read_clause)
-            row_count, files, arrow_schema = stream_to_parquet(
-                con, sql, table_dir, args.batch_size, label=name
-            )
-            manifest_tables[name] = {
-                "description": meta.get("description", ""),
-                "primary_key": meta.get("primary_key", []),
-                "foreign_keys": meta.get("foreign_keys", {}),
-                "files": files,
-                "row_count": row_count,
-                "sort_order": sort_order,
-                "columns": _schema_to_dict(arrow_schema) if arrow_schema else [],
-                "column_categories": meta.get("columns", {}),
-            }
+            eprint("\n--- PARQUET STAGING (skipped — all tables already written) ---")
+            read_clause = json_read_clause
 
-    # ── Clean up staging file ──
-    if os.path.exists(staging_path):
-        os.remove(staging_path)
-        eprint(f"\n  Removed staging file: {staging_path}")
-    if os.path.isdir(staging_dir) and not os.listdir(staging_dir):
-        os.rmdir(staging_dir)
+        # ── Discover available columns (for optional field handling) ──
+        available_cols = get_available_columns(con, read_clause)
+        missing_optional = _OPTIONAL_ENTRY_FIELDS - available_cols
+        if missing_optional:
+            eprint(f"  Optional fields not in data (will be NULL): {', '.join(sorted(missing_optional))}")
 
-    # ── Write manifest.json ──
-    manifest = {
-        "format": "uniprot-parquet-lake",
-        "version": 1,
-        "release": args.release,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "tables": manifest_tables,
-        "total_rows": sum(t["row_count"] for t in manifest_tables.values()),
-    }
-    manifest_path = os.path.join(outdir, "manifest.json")
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-    eprint(f"  Wrote {manifest_path}")
+        # ── Write tables ──
+        t_total = time.time()
+        manifest_tables = {}
 
-    # ── Summary ──
-    elapsed = time.time() - t_total
-    eprint("\n" + "=" * 60)
-    eprint(f"DONE in {elapsed:.1f}s")
-    for name, _, _ in TABLE_DEFS:
-        status = " (skipped)" if name in skip_set else ""
-        eprint(f"  {name}: {manifest_tables[name]['row_count']:,} rows{status}")
-    eprint(f"  Total: {manifest['total_rows']:,} rows")
-    eprint("=" * 60)
+        for name, sql_template, sort_order in TABLE_DEFS:
+            eprint(f"\n--- {name.upper()} ---")
+            table_dir = os.path.join(outdir, name)
+
+            meta = TABLE_META.get(name, {})
+
+            if name in skip_set:
+                existing = sorted(f for f in os.listdir(table_dir) if f.endswith(".parquet"))
+                # Count rows from existing files
+                row_count = 0
+                for fname in existing:
+                    fmeta = pq.read_metadata(os.path.join(table_dir, fname))
+                    row_count += fmeta.num_rows
+                eprint(f"  Skipped ({row_count:,} rows in {len(existing)} existing files)")
+                # Read schema from first file
+                schema = pq.read_schema(os.path.join(table_dir, existing[0]))
+                manifest_tables[name] = {
+                    "description": meta.get("description", ""),
+                    "primary_key": meta.get("primary_key", []),
+                    "foreign_keys": meta.get("foreign_keys", {}),
+                    "files": existing,
+                    "row_count": row_count,
+                    "sort_order": sort_order,
+                    "columns": _schema_to_dict(schema),
+                    "column_categories": meta.get("columns", {}),
+                }
+            else:
+                # Entries SQL is built dynamically to handle optional fields
+                if sql_template is None:
+                    sql_template = _build_entries_sql(available_cols)
+                sql = sql_template.format(read_clause=read_clause)
+                row_count, files, arrow_schema = stream_to_parquet(
+                    con, sql, table_dir, args.batch_size, label=name
+                )
+                manifest_tables[name] = {
+                    "description": meta.get("description", ""),
+                    "primary_key": meta.get("primary_key", []),
+                    "foreign_keys": meta.get("foreign_keys", {}),
+                    "files": files,
+                    "row_count": row_count,
+                    "sort_order": sort_order,
+                    "columns": _schema_to_dict(arrow_schema) if arrow_schema else [],
+                    "column_categories": meta.get("columns", {}),
+                }
+
+        # ── Write manifest.json ──
+        manifest = {
+            "format": "uniprot-parquet-lake",
+            "version": 1,
+            "release": args.release,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "tables": manifest_tables,
+            "total_rows": sum(t["row_count"] for t in manifest_tables.values()),
+        }
+        manifest_path = os.path.join(outdir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        eprint(f"  Wrote {manifest_path}")
+
+        # ── Summary ──
+        elapsed = time.time() - t_total
+        eprint("\n" + "=" * 60)
+        eprint(f"DONE in {elapsed:.1f}s")
+        for name, _, _ in TABLE_DEFS:
+            status = " (skipped)" if name in skip_set else ""
+            eprint(f"  {name}: {manifest_tables[name]['row_count']:,} rows{status}")
+        eprint(f"  Total: {manifest['total_rows']:,} rows")
+        eprint("=" * 60)
+
+    finally:
+        # Clean up staging file (also on crash, to avoid leaking 160GB+ to disk)
+        if os.path.exists(staging_path):
+            os.remove(staging_path)
+            eprint(f"\n  Removed staging file: {staging_path}")
+        if os.path.isdir(staging_dir) and not os.listdir(staging_dir):
+            os.rmdir(staging_dir)
+        con.close()
 
 
 if __name__ == "__main__":

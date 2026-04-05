@@ -12,9 +12,8 @@
 #   cd demo && ./run_demo.sh            # default: Drosophila reviewed
 #   cd demo && ./run_demo.sh --clean    # wipe lake/ and rebuild
 #
-# For the Jupyter notebook (demo_datalake.ipynb):
-#   pip install -r requirements.txt     # notebook, polars, pandas, matplotlib
-#   jupyter notebook
+# For the Jupyter notebook (demo.ipynb):
+#   cd demo && jupyter notebook
 #
 # The download is skipped if input.json.gz already exists.
 # The pipeline is idempotent — re-running overwrites the lake.
