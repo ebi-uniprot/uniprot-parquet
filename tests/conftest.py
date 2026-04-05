@@ -13,7 +13,6 @@ sys.path.insert(0, BIN_DIR)
 
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
 SMALL_JSON_GZ = os.path.join(os.path.dirname(__file__), "fixtures", "small.json.gz")
-SCHEMA_JSON = os.path.join(PROJECT_ROOT, "schema.json")
 
 
 @pytest.fixture(scope="session")
@@ -49,7 +48,6 @@ def parquet_lake(small_jsonl, tmp_path_factory):
 
     cmd = [
         sys.executable, transform_script, small_jsonl,
-        "--schema", SCHEMA_JSON,
         "--outdir", outdir,
         "--memory-limit", "4GB",
         "--batch-size", "50",

@@ -6,17 +6,17 @@ Pipeline to transform UniProtKB JSON dumps into sorted, analysis-ready Parquet t
 
 Each release lands in its own directory (`<outdir>/<release>/`):
 
-| Output                               | Description                                                  |
-| ------------------------------------ | ------------------------------------------------------------ |
-| `lake/entries/entries_*.parquet`      | One row per protein                                          |
-| `lake/features/features_*.parquet`   | One row per positional feature                               |
-| `lake/xrefs/xrefs_*.parquet`        | One row per cross-reference                                  |
-| `lake/comments/comments_*.parquet`   | One row per comment annotation                               |
-| `lake/references/references_*.parquet` | One row per literature citation                            |
-| `lake/manifest.json`                 | File list, schemas, row counts, sort orders                  |
-| `sorted.jsonl.zst`                   | JSONL archive sorted by review status, taxid, then accession |
-| `provenance.json`                    | Provenance record (checksums, git commit, row counts)        |
-| `validation_report.txt`             | 8-check production validation (see below)                    |
+| Output                                 | Description                                                    |
+| -------------------------------------- | -------------------------------------------------------------- |
+| `lake/entries/entries_*.parquet`       | One row per protein                                            |
+| `lake/features/features_*.parquet`     | One row per positional feature                                 |
+| `lake/xrefs/xrefs_*.parquet`           | One row per cross-reference                                    |
+| `lake/comments/comments_*.parquet`     | One row per comment annotation                                 |
+| `lake/references/references_*.parquet` | One row per literature citation                                |
+| `lake/manifest.json`                   | File list, schemas, row counts, sort orders, semantic metadata |
+| `sorted.jsonl.zst`                     | JSONL archive sorted by review status, taxid, then accession   |
+| `provenance.json`                      | Provenance record (checksums, git commit, row counts)          |
+| `validation_report.txt`                | 8-check production validation (see below)                      |
 
 All five tables are sorted by Swiss-Prot first (`reviewed`/`from_reviewed DESC`), then `taxid ASC`, then `acc ASC`. The boolean column is called `reviewed` on the entries table and `from_reviewed` on child tables (features, xrefs, comments, references) to clarify that it's inherited from the parent entry, not an independent review status.
 
@@ -56,7 +56,7 @@ with open('setup_views.sql') as f:
 
 ### Helper macros
 
-`setup_views.sql` also defines parameterised table macros for common patterns:
+Both `uniprot_lake.py` and `setup_views.sql` define parameterised table macros for common patterns:
 
 ```sql
 -- Annotation card for a single protein
@@ -80,7 +80,7 @@ SELECT * FROM entries_with_xrefs(9606, ['PDB', 'Ensembl']);
 
 ### Direct access (no setup file)
 
-You can also query the Parquet files directly without the setup script:
+You can also query the Parquet files directly without any setup:
 
 ```python
 # DuckDB
@@ -95,7 +95,7 @@ pd.read_parquet("lake/entries/", filters=[("taxid", "==", 9606)])
 
 ### Metadata
 
-The `manifest.json` inside the lake directory lists every Parquet file, its schema, row count, and sort order. Tools and LLM agents can read this to discover the data without scanning files.
+The `manifest.json` inside the lake directory lists every Parquet file, its schema, row count, sort order, and semantic metadata (table descriptions, primary keys, foreign keys, column categories). Tools and LLM agents can read this to discover the data and generate correct joins without scanning files.
 
 ### JSONL (universal fallback)
 
@@ -170,17 +170,16 @@ nextflow run upjson2lake.nf -profile prod \
 
 ### Pipeline parameters
 
-| Parameter          | Default                | Description                                                  |
-| ------------------ | ---------------------- | ------------------------------------------------------------ |
-| `--inputfile`      | `entries_test.json`    | Input UniProtKB JSON(.gz) file                               |
-| `--outdir`         | `results/uniprot_lake` | Output base directory                                        |
-| `--release`        | `2026_01`              | Release label (output goes to `<outdir>/<release>/`)         |
-| `--process_memory` | `96 GB`                | Memory for heavy processes (DuckDB gets 75% of this)         |
-| `--duckdb_pct`     | `75`                   | Percentage of process memory allocated to DuckDB buffer pool |
-| `--schema`         | `schema.json`          | DuckDB schema file (single source of truth for column types) |
-| `--duckdb_temp`    | `$TMPDIR` or `/tmp`    | DuckDB spill directory for out-of-core sorts                 |
+| Parameter          | Default                | Description                                                                                |
+| ------------------ | ---------------------- | ------------------------------------------------------------------------------------------ |
+| `--inputfile`      | `entries_test.json`    | Input UniProtKB JSON(.gz) file                                                             |
+| `--outdir`         | `results/uniprot_lake` | Output base directory                                                                      |
+| `--release`        | `2026_01`              | Release label (output goes to `<outdir>/<release>/`)                                       |
+| `--process_memory` | `96 GB`                | Memory for heavy processes (DuckDB gets 75% of this)                                       |
+| `--duckdb_pct`     | `75`                   | Percentage of process memory allocated to DuckDB buffer pool                               |
+| `--duckdb_temp`    | `$TMPDIR` or `/tmp`    | DuckDB spill directory for out-of-core sorts                                               |
 | `--expected_count` | `null`                 | Expected entry count for integrity verification (required for full mode via `run_lake.sh`) |
-| `--notify_email`   | `null`                 | Email for SLURM failure/requeue notifications                |
+| `--notify_email`   | `null`                 | Email for SLURM failure/requeue notifications                                              |
 
 ### Nextflow profiles
 
@@ -189,6 +188,43 @@ nextflow run upjson2lake.nf -profile prod \
 | `local` | local    | —            | —              | —            | For testing on your laptop             |
 | `prod`  | SLURM    | `production` | 16 GB          | 1 day        | Process-level directives take priority |
 | `short` | SLURM    | `short`      | 4 GB           | 4 hours      | For subset runs                        |
+
+## Architecture
+
+```
+UniProtKB.json.gz
+    |
+    v
++---------------+   pigz + ijson + zstd
+| STREAM_JSONL  |------------------------> uniprot.jsonl.zst (+ entry_count.txt)
++-------+-------+   --expected-count verified, post-hoc line count check
+        |
+        v
++------------+   DuckDB out-of-core sort (schema inferred via read_json_auto)
+| SORT_JSONL |─────────────────────────────> sorted.jsonl.zst
++------+-----+
+       |  (pre-sorted input makes DuckDB ORDER BY nearly free)
+       v
++--------------------+   DuckDB + PyArrow
+| PARQUET_TRANSFORM  |──> lake/ + manifest.json
++--------+-----------+   (JSONL staged to Parquet once, then 5 fast reads)
+         |
+         v
++----------+   8 checks: completeness, uniqueness, null keys,
+| VALIDATE |   referential integrity, sort order, round-trip,
++----+-----+   Parquet integrity, manifest consistency
+     |
+     v
++------------+   Checksums, git commit, row counts
+| PROVENANCE |
++------------+
+```
+
+DuckDB handles the heavy lifting: JSON parsing (with automatic schema inference via `read_json_auto`), SQL transformations (flattening, unnesting), and sorting. It streams Arrow record batches to PyArrow, which writes zstd-compressed Parquet files directly. Memory stays bounded regardless of dataset size.
+
+There is no committed schema file — the data is a JSON dump from production, so whatever schema it has is what we use. DuckDB infers types directly from the data at the start of each pipeline run. Each release is a full rebuild. Optional fields that may not appear in all datasets (e.g. `organismHosts` in virus-only entries) are handled gracefully with NULL substitution.
+
+The pipeline is **idempotent** — re-running on the same release directory overwrites the Parquet files, so row counts are always correct. Each release gets its own isolated directory. With `--skip-existing`, partially completed runs resume from where they left off.
 
 ## Production on SLURM
 
@@ -204,69 +240,13 @@ Before running the full ~250M-entry UniProtKB dataset:
 
 **Time budgets** (approximate for the full dataset):
 
-| Process            | Time   | Memory | Notes                                   |
-| ------------------ | ------ | ------ | --------------------------------------- |
-| STREAM_JSONL       | 2-4h   | 4 GB   | pigz decompression is single-threaded   |
-| SCHEMA_CHECK       | 30-60m | 96 GB  | Full-scan type validation               |
-| SORT_JSONL         | 4-8h   | 96 GB  | DuckDB out-of-core sort, 1 TB disk      |
-| PARQUET_TRANSFORM  | 6-12h  | 96 GB  | 1 JSON parse → staged Parquet, then 5 fast Parquet reads, 2 TB disk |
-| VALIDATE           | 1-2h   | 96 GB  | Bounded-memory streaming checks         |
-| PROVENANCE         | <1m    | 1 GB   | Metadata only                           |
-
-## Schema management
-
-`schema.json` is the **single source of truth** for column types. It maps each top-level JSON field to its DuckDB type and is used by `read_json(columns={...})` for deterministic parsing. The Parquet schemas are derived from it at transform time (cheap LIMIT 1 inference, sub-second).
-
-**Bootstrap** (run once on the full dataset):
-
-```bash
-python bin/schema_bootstrap.py /path/to/full_uniprotkb.jsonl.zst \
-    --schema-json-out schema.json \
-    --release 2026_01
-git add schema.json && git commit -m "chore: bootstrap schema.json for 2026_01"
-```
-
-**Validation** (runs automatically in the pipeline): the `SCHEMA_CHECK` step reads every row with the declared types from `schema.json`. If any entry doesn't conform, DuckDB throws a type error and the pipeline stops before the expensive transform.
-
-## Architecture
-
-```
-UniProtKB.json.gz
-    |
-    v
-+---------------+   pigz + ijson + zstd
-| STREAM_JSONL  |------------------------> uniprot.jsonl.zst (+ entry_count.txt)
-+-------+-------+   --expected-count verified, post-hoc line count check
-        |
-        v
-+---------------+   Full-scan JSONL validation against schema.json
-| SCHEMA_CHECK  |   (reads every row with declared types; ~30-60 min)
-+-------+-------+
-        |  (gate: sort + transform only run if validation passes)
-        v
-+------------+   DuckDB out-of-core sort
-| SORT_JSONL |─────────────────────────────> sorted.jsonl.zst
-+------+-----+
-       |  (pre-sorted input makes DuckDB ORDER BY nearly free)
-       v
-+--------------------+   DuckDB + PyArrow
-| PARQUET_TRANSFORM  |──> lake/ + manifest.json
-+--------+-----------+   (JSONL staged to Parquet once, then 5 fast reads)
-         |
-         v
-+----------+   Completeness, referential integrity, sort order,
-| VALIDATE |   round-trip spot checks, Parquet integrity, manifest
-+----+-----+
-     |
-     v
-+------------+   Checksums, git commit, row counts
-| PROVENANCE |
-+------------+
-```
-
-DuckDB handles the heavy lifting: JSON parsing, SQL transformations (flattening, unnesting), and sorting. It streams Arrow record batches to PyArrow, which writes zstd-compressed Parquet files directly. Memory stays bounded regardless of dataset size.
-
-The pipeline is **idempotent** — re-running on the same release directory overwrites the Parquet files, so row counts are always correct. Each release gets its own isolated directory. With `--skip-existing`, partially completed runs resume from where they left off.
+| Process           | Time  | Memory | Notes                                                               |
+| ----------------- | ----- | ------ | ------------------------------------------------------------------- |
+| STREAM_JSONL      | 2-4h  | 4 GB   | pigz decompression is single-threaded                               |
+| SORT_JSONL        | 4-8h  | 96 GB  | DuckDB out-of-core sort, 1 TB disk                                  |
+| PARQUET_TRANSFORM | 6-12h | 96 GB  | 1 JSON parse → staged Parquet, then 5 fast Parquet reads, 2 TB disk |
+| VALIDATE          | 1-2h  | 96 GB  | Bounded-memory streaming checks                                     |
+| PROVENANCE        | <1m   | 1 GB   | Metadata only                                                       |
 
 ## Production validation
 
@@ -281,14 +261,14 @@ The `VALIDATE` step runs 8 checks against the source JSONL as ground truth. All 
 7. **Parquet file integrity** — every `.parquet` file in the lake is readable
 8. **Manifest consistency** — `manifest.json` file list matches actual files on disk
 
-## Schema
+## Schema design
 
 We adopt a **denormalized-first + full nested** design. Each table has two layers:
 
 1. **Flattened convenience columns** (e.g. `gene_name`, `gene_synonyms`, `ec_numbers`, `go_ids`) — cover the 90% use case with simple SQL. These are intentionally lossy shortcuts: `gene_name` is only the first gene's primary name, `ec_numbers` are only from `recommendedName`, and `go_ids` are IDs without aspect/evidence.
 2. **Full nested structures** (e.g. `genes`, `protein_desc`, `comment`, `feature`, `reference`) — preserve all upstream data for power users and lossless JSONL reconstruction. DuckDB's struct/list syntax makes these queryable without ETL.
 
-This means no UniProtKB data is discarded. Users needing isoforms, GO aspects, EC numbers from alternative names, multi-paragraph comments, or evidence codes can always query the nested columns.
+No UniProtKB data is discarded. Users needing isoforms, GO aspects, EC numbers from alternative names, multi-paragraph comments, or evidence codes can always query the nested columns.
 
 Parquet's columnar storage mitigates any read-amplification cost — if a query touches 5 of 40+ columns, only those 5 are read from disk. Normalized child tables (features, xrefs, comments, references) are provided for high-cardinality relationships that would make the main table unwieldy as arrays.
 
@@ -331,15 +311,9 @@ All five tables are sorted by Swiss-Prot first, then `taxid ASC`, then `acc ASC`
 
 ## Example queries
 
-After running `setup_views.sql` (see "Accessing the data" above):
-
 ```python
-import duckdb
-
-con = duckdb.connect()
-base = '/path/to/2026_01/lake'
-with open('setup_views.sql') as f:
-    con.sql(f.read().replace('${BASE}', base))
+from uniprot_lake import connect
+con = connect('/path/to/2026_01/lake')
 
 # All human kinases
 con.sql("""
@@ -387,7 +361,7 @@ con.sql("SELECT reviewed, count(*) as n FROM entries GROUP BY reviewed").show()
 
 ## Versioning
 
-Each release is a full rebuild into its own isolated directory (`<outdir>/<release>/`). Previous releases are preserved untouched. The `provenance.json` in each release directory records provenance: input file checksums, `schema.json` checksum, git commit, and row counts.
+Each release is a full rebuild into its own isolated directory (`<outdir>/<release>/`). Previous releases are preserved untouched. The `provenance.json` in each release directory records input file checksums, git commit, and row counts.
 
 ## Memory model
 
@@ -403,10 +377,11 @@ python -m pytest tests/ -v
 
 The test suite (43 tests) covers row counts, column schemas, data integrity, sort order, manifest consistency, idempotency, `--skip-existing` resume, and the production validator across all five tables. Tests use `tests/fixtures/small.json.gz` (44 reviewed entries).
 
-## Tech Stack
+## Tech stack
 
 - **Orchestration**: Nextflow (DSL2, SLURM support)
-- **Compute**: DuckDB (JSON parsing, SQL transforms, sorting)
+- **Compute**: DuckDB (JSON parsing via `read_json_auto`, SQL transforms, out-of-core sorting)
 - **Storage**: Parquet (zstd compression, sorted by `reviewed`/`from_reviewed DESC`, `taxid ASC`, `acc ASC`)
-- **Manifest**: `manifest.json` — file list, schemas, sort orders (similar to Hugging Face datasets)
-- **Schema**: `schema.json` — single source of truth, human-readable, manually editable
+- **Streaming**: PyArrow (bounded-memory Arrow record batch → Parquet writing)
+- **Manifest**: `manifest.json` — file list, schemas, sort orders, semantic metadata (similar to Hugging Face datasets)
+- **Schema**: Inferred from data via DuckDB `read_json_auto` — no committed schema file needed

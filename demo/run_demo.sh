@@ -83,7 +83,6 @@ printf "╚%s╝\n" "$BAR"
 echo ""
 
 PIPELINE="../upjson2lake.nf"
-SCHEMA="../schema.json"
 
 # Ensure report directory exists (Nextflow won't create it)
 mkdir -p "$LAKE_DIR/reports"
@@ -93,7 +92,6 @@ nextflow run "$PIPELINE" \
     --outdir "$(pwd)/$LAKE_DIR" \
     --release "$RELEASE" \
     --process_memory "$MEMORY" \
-    --schema "$SCHEMA" \
     -profile local \
     -ansi-log true \
     -resume
@@ -115,7 +113,9 @@ fi
 echo ""
 echo "Query with DuckDB:"
 echo ""
-echo "  import duckdb"
-echo "  con = duckdb.connect()"
-echo "  con.sql(\"SELECT * FROM read_parquet('$(pwd)/$RELEASE_DIR/lake/entries/*.parquet') LIMIT 5\").show()"
+cat <<EOF
+import duckdb
+con = duckdb.connect()
+con.sql("SELECT * FROM read_parquet('$(pwd)/$RELEASE_DIR/lake/entries/*.parquet') LIMIT 5").show()
+EOF
 echo ""

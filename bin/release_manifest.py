@@ -4,7 +4,6 @@ Generate a release manifest for provenance tracking.
 
 Records everything needed to reproduce and audit a pipeline run:
   - Input file checksums (MD5)
-  - schema.json checksum
   - Pipeline version (git commit)
   - Row counts per table (from lake manifest.json)
   - Timestamps
@@ -15,7 +14,6 @@ Usage:
     release_manifest.py \
         --lake /path/to/lake \
         --input-jsonl uniprot.jsonl.zst \
-        --schema schema.json \
         --release 2026_01 \
         [-o provenance.json]
 """
@@ -74,10 +72,6 @@ def main():
         "--input-jsonl", required=True,
         help="Path to the input JSONL(.zst) file",
     )
-    parser.add_argument(
-        "--schema", required=True,
-        help="Path to schema.json",
-    )
     parser.add_argument("--release", required=True, help="Release label")
     parser.add_argument("-o", "--output", default="provenance.json")
     args = parser.parse_args()
@@ -92,7 +86,7 @@ def main():
     # ── Input checksums ──
     eprint("  Computing input checksums...")
     manifest["inputs"] = {}
-    for label, path in [("jsonl", args.input_jsonl), ("schema", args.schema)]:
+    for label, path in [("jsonl", args.input_jsonl)]:
         abspath = os.path.abspath(path)
         manifest["inputs"][label] = {
             "path": os.path.basename(abspath),

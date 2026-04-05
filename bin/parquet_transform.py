@@ -27,6 +27,8 @@ Output layout:
     references/references_00001.parquet, ...
     manifest.json
 
+Schema is inferred automatically from the data via DuckDB's read_json_auto.
+
 Usage:
     parquet_transform.py <input.jsonl.zst> \
         --outdir /path/to/lake \
@@ -37,7 +39,6 @@ Requires: duckdb, pyarrow
 """
 
 import os
-import re
 import sys
 import argparse
 import time
@@ -60,26 +61,18 @@ def _sql_escape(path: str) -> str:
     return path.replace("'", "''")
 
 
-def build_read_clause(jsonl_path: str, schema_path: str | None) -> str:
-    """Build the DuckDB read_json SQL fragment.
+def build_read_clause(jsonl_path: str) -> str:
+    """Build the DuckDB read_json_auto SQL fragment.
 
-    If a committed schema.json is provided, use explicit column types
-    for deterministic parsing.  Otherwise fall back to auto-detect.
+    DuckDB infers column names and types from the data itself.
+    This is the right approach for UniProtKB: the data is a JSON dump
+    from production, so whatever schema it has is what we use.
     """
     safe_path = _sql_escape(jsonl_path)
-    if schema_path and os.path.exists(schema_path):
-        with open(schema_path) as f:
-            schema = json.load(f)
-        cols = ", ".join(f"'{name}': '{dtype}'" for name, dtype in schema.items())
-        return (
-            f"read_json('{safe_path}', format='newline_delimited', "
-            f"maximum_object_size=536870912, columns={{{cols}}})"
-        )
-    else:
-        return (
-            f"read_json_auto('{safe_path}', format='newline_delimited', "
-            f"maximum_object_size=536870912)"
-        )
+    return (
+        f"read_json_auto('{safe_path}', format='newline_delimited', "
+        f"maximum_object_size=536870912)"
+    )
 
 
 def stage_to_parquet(con, read_clause: str, staging_path: str) -> str:
@@ -106,6 +99,17 @@ def stage_to_parquet(con, read_clause: str, staging_path: str) -> str:
     return f"read_parquet('{safe_path}')"
 
 
+def get_available_columns(con, read_clause: str) -> set[str]:
+    """Discover which top-level columns exist in the data source.
+
+    Used to handle optional fields that may not appear in all datasets
+    (e.g. organismHosts only exists in virus entries).  SQL templates
+    use NULL for columns that don't exist in the current dataset.
+    """
+    result = con.sql(f"DESCRIBE SELECT * FROM {read_clause}").fetchall()
+    return {row[0] for row in result}
+
+
 def init_duckdb(memory_limit: str, threads: int | None,
                  temp_dir: str | None = None) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
@@ -124,7 +128,23 @@ def init_duckdb(memory_limit: str, threads: int | None,
 
 # ─── SQL for each table ─────────────────────────────────────────────────
 
-ENTRIES_SQL = """
+# Optional fields that may not appear in all UniProtKB subsets.
+# (e.g. organismHosts only exists in virus/parasite entries,
+#  geneLocations is rare in some organisms.)
+# The SQL generator substitutes NULL for any that are absent.
+_OPTIONAL_ENTRY_FIELDS = {"organismHosts", "geneLocations"}
+
+
+def _build_entries_sql(available_cols: set[str]) -> str:
+    """Build the entries SQL with NULLs for any missing optional columns."""
+    organism_hosts = (
+        "e.organismHosts" if "organismHosts" in available_cols else "NULL"
+    )
+    gene_locations = (
+        "e.geneLocations" if "geneLocations" in available_cols else "NULL"
+    )
+
+    return f"""
 SELECT
     -- Identity
     e.primaryAccession                              AS acc,
@@ -213,10 +233,10 @@ SELECT
     e.proteinDescription                            AS protein_desc,
     e.genes                                         AS genes,
     e.keywords                                      AS keywords,
-    e.organismHosts                                 AS organism_hosts,
-    e.geneLocations                                 AS gene_locations
+    {organism_hosts}                                 AS organism_hosts,
+    {gene_locations}                                 AS gene_locations
 
-FROM {read_clause} e
+FROM {{read_clause}} e
 ORDER BY reviewed DESC, e.organism.taxonId, e.primaryAccession
 """
 
@@ -370,10 +390,10 @@ ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc, unnest.citation.citationTyp
 # ─── Table definitions ──────────────────────────────────────────────────
 
 TABLE_DEFS = [
-    ("entries",    ENTRIES_SQL,    ["reviewed DESC", "taxid ASC", "acc ASC"]),
-    ("features",   FEATURES_SQL,  ["from_reviewed DESC", "taxid ASC", "acc ASC", "start_pos ASC"]),
-    ("xrefs",      XREFS_SQL,     ["from_reviewed DESC", "taxid ASC", "acc ASC", "database ASC"]),
-    ("comments",   COMMENTS_SQL,  ["from_reviewed DESC", "taxid ASC", "acc ASC", "comment_type ASC"]),
+    ("entries",    None,            ["reviewed DESC", "taxid ASC", "acc ASC"]),  # SQL built dynamically
+    ("features",   FEATURES_SQL,   ["from_reviewed DESC", "taxid ASC", "acc ASC", "start_pos ASC"]),
+    ("xrefs",      XREFS_SQL,      ["from_reviewed DESC", "taxid ASC", "acc ASC", "database ASC"]),
+    ("comments",   COMMENTS_SQL,   ["from_reviewed DESC", "taxid ASC", "acc ASC", "comment_type ASC"]),
     ("references", REFERENCES_SQL, ["from_reviewed DESC", "taxid ASC", "acc ASC", "citation_type ASC"]),
 ]
 
@@ -545,11 +565,6 @@ def main():
     )
     parser.add_argument("input", help="Input JSONL(.zst) file")
     parser.add_argument(
-        "--schema", default=None,
-        help="Committed DuckDB schema JSON (from schema_bootstrap.py). "
-             "If omitted, DuckDB auto-detects.",
-    )
-    parser.add_argument(
         "--outdir", default="./lake",
         help="Output directory for Parquet tables and manifest",
     )
@@ -589,7 +604,7 @@ def main():
 
     # ── Init DuckDB ──
     con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
-    json_read_clause = build_read_clause(jsonl_path, args.schema)
+    json_read_clause = build_read_clause(jsonl_path)
 
     # ── Determine which tables to write ──
     skip_set = set()
@@ -615,6 +630,12 @@ def main():
     else:
         eprint("\n--- PARQUET STAGING (skipped — all tables already written) ---")
         read_clause = json_read_clause
+
+    # ── Discover available columns (for optional field handling) ──
+    available_cols = get_available_columns(con, read_clause)
+    missing_optional = _OPTIONAL_ENTRY_FIELDS - available_cols
+    if missing_optional:
+        eprint(f"  Optional fields not in data (will be NULL): {', '.join(sorted(missing_optional))}")
 
     # ── Write tables ──
     t_total = time.time()
@@ -647,6 +668,9 @@ def main():
                 "column_categories": meta.get("columns", {}),
             }
         else:
+            # Entries SQL is built dynamically to handle optional fields
+            if sql_template is None:
+                sql_template = _build_entries_sql(available_cols)
             sql = sql_template.format(read_clause=read_clause)
             row_count, files, arrow_schema = stream_to_parquet(
                 con, sql, table_dir, args.batch_size, label=name

@@ -11,7 +11,6 @@ DuckDB handles JSON serialisation and zstd compression natively via COPY.
 
 Usage:
     sort_jsonl.py <input.jsonl.zst> -o <sorted.jsonl.zst> \
-        [--schema schema.json] \
         [--memory-limit 16GB] \
         [--threads 4] \
         [--temp-dir /path/to/scratch]
@@ -51,11 +50,6 @@ def main():
         "-o", "--output", required=True,
         help="Output sorted JSONL(.zst) file",
     )
-    parser.add_argument(
-        "--schema", default=None,
-        help="Committed DuckDB schema JSON (from schema_bootstrap.py). "
-             "If omitted, DuckDB auto-detects.",
-    )
     parser.add_argument("--memory-limit", default="16GB", help="DuckDB memory limit")
     parser.add_argument("--threads", type=int, default=None, help="DuckDB threads")
     parser.add_argument(
@@ -76,7 +70,7 @@ def main():
     eprint()
 
     con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
-    read_clause = build_read_clause(jsonl_path, args.schema)
+    read_clause = build_read_clause(jsonl_path)
 
     sql = SORT_SQL.format(read_clause=read_clause)
     safe_output = _sql_escape(output_path)

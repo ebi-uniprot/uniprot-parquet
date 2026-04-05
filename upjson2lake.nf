@@ -15,22 +15,19 @@
 //
 // Architecture:
 //   1. Stream JSON(.gz) → single zstd-compressed JSONL
-//   2. Schema drift detection — fast sample (10K rows, ~60s)
-//      (catches new/removed/changed fields vs committed schema.json)
-//   3. Schema check — full-scan JSONL validation against schema.json
-//      (reads every row with declared types; ~30-60 min on 180GB)
-//   4. Sort JSONL by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
-//   5. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow
-//      (pre-sorted input makes DuckDB ORDER BY nearly free for entries;
+//   2. Sort JSONL by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
+//   3. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow
+//      (DuckDB infers the schema from the data via read_json_auto;
+//       pre-sorted input makes DuckDB ORDER BY nearly free for entries;
 //       child tables benefit from input locality after LATERAL unnest;
 //       features additionally sorted by start_pos for positional queries)
-//   6. Production validation: completeness, referential integrity,
+//   4. Production validation: completeness, referential integrity,
 //      sort order, round-trip spot checks, Parquet integrity
-//   7. Generate provenance manifest (only if validation passes)
+//   5. Generate provenance manifest (only if validation passes)
 //
-// Schema management: schema.json is the single source of truth (committed to repo).
-// Run `schema_bootstrap.py` once against the full dataset to generate it.
-// It is human-readable and manually editable.
+// Schema management: DuckDB infers types directly from the data via
+// read_json_auto.  The data is a JSON dump from production — whatever
+// schema it has is what we use.  Each release is a full rebuild.
 // All tables sorted by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
 // for query locality via Parquet row group statistics.
 
@@ -42,7 +39,6 @@ params.outdir         = "${projectDir}/results/uniprot_lake"
 params.release        = "2026_01"
 params.process_memory = '96 GB'   // Total memory for heavy processes (Nextflow directive)
 params.duckdb_pct     = 75        // % of process_memory allocated to DuckDB buffer pool
-params.schema         = "${projectDir}/schema.json"
 params.notify_email   = null      // Email for SLURM failure notifications (null = disabled)
 params.duckdb_temp    = null      // DuckDB spill directory (null = use $TMPDIR or /tmp)
 params.expected_count = null      // Expected entry count (from UniProt release stats, null = skip)
@@ -107,74 +103,6 @@ process STREAM_JSONL {
 }
 
 
-/* ── PROCESS: Detect schema drift before committing to full validation ── */
-// Samples 10K rows (fast — under 60s) and compares against schema.json.
-// Fails if the data has new fields, removed fields, or type changes.
-// This catches the case where UniProt adds a field that read_json(columns={...})
-// would silently drop.  Run schema_bootstrap.py to update schema.json.
-process SCHEMA_DIFF {
-    tag 'schema_diff'
-    cpus 2
-    memory '4 GB'
-    time '10m'
-
-    publishDir "${release_dir}", mode: 'copy', pattern: 'schema_diff.json'
-
-    input:
-    path jsonl
-    path duckdb_schema
-
-    output:
-    path "schema_diff.json", emit: report
-    val true,                emit: checked
-
-    script:
-    """
-    set -euo pipefail
-    echo " .-- SCHEMA_DIFF BEGUN \$(date)"
-
-    schema_diff.py ${jsonl} \
-        --committed-schema ${duckdb_schema} \
-        --sample-size 10000 \
-        --strict \
-        -o schema_diff.json
-
-    echo " '-- SCHEMA_DIFF ENDED \$(date)"
-    """
-}
-
-
-/* ── PROCESS: Pre-flight JSONL validation against schema.json ────── */
-process SCHEMA_CHECK {
-    tag 'schema_check'
-    cpus 4
-    memory params.process_memory
-    time '4h'
-    disk '500 GB'        // DuckDB spill space for full-scan validation
-
-    input:
-    path jsonl
-    path duckdb_schema
-
-    output:
-    val true, emit: validated
-
-    script:
-    """
-    set -euo pipefail
-    echo " .-- SCHEMA_CHECK BEGUN \$(date)"
-
-    schema_check.py ${jsonl} \
-        --duckdb-schema ${duckdb_schema} \
-        --memory-limit ${duckdb_memory} \
-        --threads ${task.cpus} \
-        ${params.duckdb_temp ? "--temp-dir ${params.duckdb_temp}" : ''}
-
-    echo " '-- SCHEMA_CHECK ENDED \$(date)"
-    """
-}
-
-
 /* ── PROCESS: Sort JSONL by reviewed DESC, taxid ASC, acc ASC ──────────────── */
 // Sorts the raw JSONL before the Parquet transform.  Pre-sorted input
 // makes DuckDB's ORDER BY nearly free for the entries table and improves
@@ -191,9 +119,6 @@ process SORT_JSONL {
 
     input:
     path jsonl
-    path duckdb_schema
-    val schema_ok
-    val schema_drift_ok
 
     output:
     path "sorted.jsonl.zst", emit: sorted_jsonl
@@ -205,7 +130,6 @@ process SORT_JSONL {
 
     sort_jsonl.py ${jsonl} \
         -o sorted.jsonl.zst \
-        --schema ${duckdb_schema} \
         --memory-limit ${duckdb_memory} \
         --threads ${task.cpus} \
         ${params.duckdb_temp ? "--temp-dir ${params.duckdb_temp}" : ''}
@@ -235,7 +159,6 @@ process PARQUET_TRANSFORM {
 
     input:
     path sorted_jsonl
-    path duckdb_schema
 
     output:
     path "lake", emit: lake
@@ -246,7 +169,6 @@ process PARQUET_TRANSFORM {
     echo " .-- PARQUET_TRANSFORM BEGUN \$(date)"
 
     parquet_transform.py ${sorted_jsonl} \
-        --schema ${duckdb_schema} \
         --outdir ./lake \
         --memory-limit ${duckdb_memory} \
         --threads ${task.cpus} \
@@ -309,7 +231,6 @@ process PROVENANCE {
     input:
     path lake
     path sorted_jsonl
-    path duckdb_schema
     val validation_ok
 
     output:
@@ -322,7 +243,6 @@ process PROVENANCE {
     release_manifest.py \
         --lake ${lake} \
         --input-jsonl ${sorted_jsonl} \
-        --schema ${duckdb_schema} \
         --release ${params.release} \
         -o provenance.json
     """
@@ -340,7 +260,6 @@ workflow {
     ${line("Release: ${params.release}")}
     ╚${bar}╝
     Input:      ${params.inputfile}
-    Schema:     ${params.schema}
     Output:     ${release_dir}
     DuckDB mem: ${duckdb_memory} (${params.duckdb_pct}% of ${params.process_memory})
     DuckDB tmp: ${params.duckdb_temp ?: '(default: \$TMPDIR or /tmp)'}
@@ -354,52 +273,31 @@ workflow {
         System.exit(2)
     }
 
-    // Value channel so it can be consumed by multiple processes without exhaustion
-    schema_ch = Channel.value(file(params.schema))
-
     // 1. Stream input → single zstd-compressed JSONL
     input_ch = Channel.fromPath(params.inputfile)
     STREAM_JSONL(input_ch)
 
-    // 2. Schema drift detection — fast sample (10K rows, ~60s)
-    //    Fails if the data has new/removed/changed fields vs schema.json.
-    //    Catches silent field drops before the expensive full-scan.
-    SCHEMA_DIFF(STREAM_JSONL.out.jsonl, schema_ch)
-
-    // 3. Schema check — full-scan JSONL validation against schema.json
-    //    (gate: sort + transform only run if both checks pass)
-    SCHEMA_CHECK(STREAM_JSONL.out.jsonl, schema_ch)
-
-    // 4. Sort JSONL by reviewed DESC, taxid ASC, acc ASC
+    // 2. Sort JSONL by reviewed DESC, taxid ASC, acc ASC
     //    Pre-sorting means DuckDB's ORDER BY in the transform is nearly free.
-    //    Gated on both schema checks passing.
-    SORT_JSONL(
-        STREAM_JSONL.out.jsonl,
-        schema_ch,
-        SCHEMA_CHECK.out.validated,
-        SCHEMA_DIFF.out.checked,
-    )
+    SORT_JSONL(STREAM_JSONL.out.jsonl)
 
-    // 5. Transform sorted JSONL → Parquet tables
+    // 3. Transform sorted JSONL → Parquet tables
+    //    DuckDB infers schema from the data via read_json_auto.
     //    Reads pre-sorted input; entries ORDER BY is a no-op,
     //    child tables benefit from input locality after unnest.
-    PARQUET_TRANSFORM(
-        SORT_JSONL.out.sorted_jsonl,
-        schema_ch,
-    )
+    PARQUET_TRANSFORM(SORT_JSONL.out.sorted_jsonl)
 
-    // 6. Validate the Parquet lake (uses sorted JSONL as ground truth —
+    // 4. Validate the Parquet lake (uses sorted JSONL as ground truth —
     //    same entries, same count, just reordered)
     VALIDATE(
         PARQUET_TRANSFORM.out.lake,
         SORT_JSONL.out.sorted_jsonl,
     )
 
-    // 7. Generate provenance record (only after validation passes)
+    // 5. Generate provenance record (only after validation passes)
     PROVENANCE(
         PARQUET_TRANSFORM.out.lake,
         SORT_JSONL.out.sorted_jsonl,
-        schema_ch,
         VALIDATE.out.validated,
     )
 }

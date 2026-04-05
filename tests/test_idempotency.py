@@ -12,7 +12,6 @@ import pyarrow.dataset as ds
 import pytest
 
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
-SCHEMA_JSON = os.path.join(os.path.dirname(__file__), "..", "schema.json")
 
 EXPECTED_ENTRIES = 44
 TABLE_NAMES = ["entries", "features", "xrefs", "comments", "references"]
@@ -26,7 +25,6 @@ def _run_transform(small_jsonl, outdir, extra_args=None):
 
     cmd = [
         sys.executable, transform_script, small_jsonl,
-        "--schema", SCHEMA_JSON,
         "--outdir", outdir,
         "--memory-limit", "4GB",
         "--batch-size", "50",

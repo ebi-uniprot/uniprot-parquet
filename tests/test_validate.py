@@ -11,7 +11,6 @@ import subprocess
 import pytest
 
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
-SCHEMA_JSON = os.path.join(os.path.dirname(__file__), "..", "schema.json")
 
 
 def test_validate_passes_on_good_lake(small_jsonl, parquet_lake, tmp_path):
