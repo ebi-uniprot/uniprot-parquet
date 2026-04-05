@@ -54,3 +54,4 @@ trace-*.txt
 install.sh
 logs/
 repo-context.txt
+demo/drosophila_kinases.csv

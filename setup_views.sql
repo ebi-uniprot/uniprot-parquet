@@ -102,6 +102,7 @@ CREATE OR REPLACE MACRO organism_xrefs(target_taxid, databases) AS TABLE (
 
 
 -- Functional annotations (comments) for an organism.
+-- comment_type values are plain strings: 'FUNCTION', 'SUBCELLULAR LOCATION', etc.
 -- Example: SELECT * FROM organism_comments(9606, 'FUNCTION');
 CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
     SELECT
@@ -179,7 +180,7 @@ CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
                 )
             ) AS iso
         FROM comments
-        WHERE comment_type = '"ALTERNATIVE PRODUCTS"'
+        WHERE comment_type = 'ALTERNATIVE PRODUCTS'
           AND acc = target_acc
     ) i
     JOIN entries e ON e.acc = i.acc

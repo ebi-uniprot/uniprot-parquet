@@ -328,11 +328,12 @@ SELECT
     sub.from_reviewed,
     sub.taxid,
 
-    unnest.commentType                              AS comment_type,
-    -- Extract text value from the common texts[] array (most comment types)
-    CASE WHEN unnest.texts IS NOT NULL AND len(unnest.texts) > 0
-         THEN unnest.texts[1].value
-         ELSE NULL END                              AS text_value,
+    -- Strip embedded double quotes from commentType (JSON scalar → VARCHAR)
+    -- so users can write comment_type = 'FUNCTION' instead of '"FUNCTION"'
+    trim('"' FROM unnest.commentType::VARCHAR)      AS comment_type,
+    -- Extract first text value via JSON path (texts is inferred as JSON
+    -- because comment types are polymorphic — struct[] inference fails)
+    unnest.texts->>'$[0].value'                     AS text_value,
     -- Full comment structure for complex/polymorphic types
     unnest                                          AS comment
 
@@ -346,7 +347,8 @@ FROM (
     FROM {read_clause} e
     WHERE e.comments IS NOT NULL AND len(e.comments) > 0
 ) sub, LATERAL unnest(sub.comments)
-ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc, unnest.commentType
+ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc,
+         trim('"' FROM unnest.commentType::VARCHAR)
 """
 
 

@@ -73,7 +73,7 @@ CREATE OR REPLACE MACRO organism_xrefs(target_taxid, databases) AS TABLE (
     ORDER BY x.acc, x.database
 );
 
--- Comments by type for an organism
+-- Comments by type for an organism (plain strings: 'FUNCTION', 'SUBCELLULAR LOCATION', etc.)
 CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
     SELECT c.acc, c.comment_type, c.text_value
     FROM comments c
@@ -120,7 +120,7 @@ CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
                 )
             ) AS iso
         FROM comments
-        WHERE comment_type = '"ALTERNATIVE PRODUCTS"'
+        WHERE comment_type = 'ALTERNATIVE PRODUCTS'
           AND acc = target_acc
     ) i
     JOIN entries e ON e.acc = i.acc
