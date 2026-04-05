@@ -153,3 +153,34 @@ CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
       AND list_contains(databases, x.database)
     ORDER BY e.acc, x.database
 );
+
+
+-- Unnest isoforms for a single protein.
+-- Parses the ALTERNATIVE PRODUCTS comment to extract isoform IDs,
+-- names, sequence status, and variant sequence identifiers.
+-- Useful for proteomics/mass-spec workflows that need to map
+-- peptides to specific isoforms.
+-- Example: SELECT * FROM unnest_isoforms('P04637');
+CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
+    SELECT
+        i.acc,
+        e.gene_name,
+        iso.name.value                  AS isoform_name,
+        unnest(iso.isoformIds)          AS isoform_id,
+        iso.isoformSequenceStatus       AS sequence_status,
+        iso.sequenceIds                 AS variant_sequence_ids
+    FROM (
+        SELECT
+            acc,
+            unnest(
+                from_json(
+                    element_at(comment, 'isoforms')[1]::JSON,
+                    '[{"name":{"value":"VARCHAR"},"isoformIds":["VARCHAR"],"isoformSequenceStatus":"VARCHAR","sequenceIds":["VARCHAR"]}]'
+                )
+            ) AS iso
+        FROM comments
+        WHERE comment_type = '"ALTERNATIVE PRODUCTS"'
+          AND acc = target_acc
+    ) i
+    JOIN entries e ON e.acc = i.acc
+);

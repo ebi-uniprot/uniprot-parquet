@@ -18,7 +18,7 @@ Usage (remote — EBI FTP):
     con = connect("https://ftp.ebi.ac.uk/.../2026_01/lake")
 
 That's it. The returned object is a standard duckdb.DuckDBPyConnection
-with five views (entries, features, xrefs, comments, refs) and six
+with five views (entries, features, xrefs, comments, refs) and seven
 macros ready to use.
 
 Requirements: pip install duckdb
@@ -100,6 +100,31 @@ CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
     WHERE e.taxid = target_taxid AND list_contains(databases, x.database)
     ORDER BY e.acc, x.database
 );
+
+-- Unnest isoforms for a single protein (from ALTERNATIVE PRODUCTS comments)
+CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
+    SELECT
+        i.acc,
+        e.gene_name,
+        iso.name.value                  AS isoform_name,
+        unnest(iso.isoformIds)          AS isoform_id,
+        iso.isoformSequenceStatus       AS sequence_status,
+        iso.sequenceIds                 AS variant_sequence_ids
+    FROM (
+        SELECT
+            acc,
+            unnest(
+                from_json(
+                    element_at(comment, 'isoforms')[1]::JSON,
+                    '[{"name":{"value":"VARCHAR"},"isoformIds":["VARCHAR"],"isoformSequenceStatus":"VARCHAR","sequenceIds":["VARCHAR"]}]'
+                )
+            ) AS iso
+        FROM comments
+        WHERE comment_type = '"ALTERNATIVE PRODUCTS"'
+          AND acc = target_acc
+    ) i
+    JOIN entries e ON e.acc = i.acc
+);
 """
 
 
@@ -128,8 +153,8 @@ def connect(
     duckdb.DuckDBPyConnection
         A connection with views (entries, features, xrefs, comments, refs)
         and macros (protein_card, organism_features, organism_xrefs,
-        organism_comments, entries_with_features, entries_with_xrefs)
-        ready to use.
+        organism_comments, entries_with_features, entries_with_xrefs,
+        unnest_isoforms) ready to use.
     """
     con = duckdb.connect()
 

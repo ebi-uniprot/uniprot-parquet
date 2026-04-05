@@ -37,7 +37,7 @@ con.sql("SELECT * FROM protein_card('P04637')").show()
 con.sql("SELECT * FROM organism_features(9606, 'Domain')").show()
 ```
 
-The returned object is a standard `duckdb.DuckDBPyConnection` — use it exactly as you would any DuckDB connection. Five views (`entries`, `features`, `xrefs`, `comments`, `refs`) and six macros are ready to use immediately.
+The returned object is a standard `duckdb.DuckDBPyConnection` — use it exactly as you would any DuckDB connection. Five views (`entries`, `features`, `xrefs`, `comments`, `refs`) and seven macros are ready to use immediately.
 
 For remote access, DuckDB's httpfs reads only the byte ranges it needs — a query touching 3 columns of one organism downloads a fraction of the full dataset.
 
@@ -76,6 +76,9 @@ SELECT * FROM entries_with_features(9606) WHERE type = 'Signal';
 
 -- Join entries + xrefs for an organism + specific databases
 SELECT * FROM entries_with_xrefs(9606, ['PDB', 'Ensembl']);
+
+-- Isoforms for a protein (from ALTERNATIVE PRODUCTS comments)
+SELECT * FROM unnest_isoforms('P04637');
 ```
 
 ### Direct access (no setup file)
@@ -222,7 +225,7 @@ UniProtKB.json.gz
 
 DuckDB handles the heavy lifting: JSON parsing (with automatic schema inference via `read_json_auto`), SQL transformations (flattening, unnesting), and sorting. It streams Arrow record batches to PyArrow, which writes zstd-compressed Parquet files directly. Memory stays bounded regardless of dataset size.
 
-There is no committed schema file — the data is a JSON dump from production, so whatever schema it has is what we use. DuckDB infers types directly from the data at the start of each pipeline run. Each release is a full rebuild. Optional fields that may not appear in all datasets (e.g. `organismHosts` in virus-only entries) are handled gracefully with NULL substitution.
+There is no committed schema file — the data is a JSON dump from production, so whatever schema it has is what we use. DuckDB infers types directly from the data at the start of each pipeline run with `sample_size=-1` (full-file scan) to ensure rare nested struct fields are never silently dropped. Each release is a full rebuild. Optional fields that may not appear in all datasets (e.g. `organismHosts` in virus-only entries) are handled gracefully with NULL substitution.
 
 The pipeline is **idempotent** — re-running on the same release directory overwrites the Parquet files, so row counts are always correct. Each release gets its own isolated directory. With `--skip-existing`, partially completed runs resume from where they left off.
 

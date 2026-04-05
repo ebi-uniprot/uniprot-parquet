@@ -67,11 +67,15 @@ def build_read_clause(jsonl_path: str) -> str:
     DuckDB infers column names and types from the data itself.
     This is the right approach for UniProtKB: the data is a JSON dump
     from production, so whatever schema it has is what we use.
+
+    sample_size=-1 forces DuckDB to scan the entire file for schema
+    inference, ensuring rare nested struct fields (e.g. a ligand sub-struct
+    that only appears in a handful of entries) are never silently dropped.
     """
     safe_path = _sql_escape(jsonl_path)
     return (
         f"read_json_auto('{safe_path}', format='newline_delimited', "
-        f"maximum_object_size=536870912)"
+        f"sample_size=-1, maximum_object_size=536870912)"
     )
 
 
