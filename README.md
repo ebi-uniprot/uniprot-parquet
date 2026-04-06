@@ -12,13 +12,13 @@ Each release lands in its own directory (`<outdir>/<release>/`):
 | `lake/features/features_*.parquet`     | One row per positional feature                                 |
 | `lake/xrefs/xrefs_*.parquet`           | One row per cross-reference                                    |
 | `lake/comments/comments_*.parquet`     | One row per comment annotation                                 |
-| `lake/references/references_*.parquet` | One row per literature citation                                |
+| `lake/publications/publications_*.parquet` | One row per literature citation                           |
 | `lake/manifest.json`                   | File list, schemas, row counts, sort orders, semantic metadata |
 | `sorted.jsonl.zst`                     | JSONL archive sorted by review status, taxid, then accession   |
 | `provenance.json`                      | Provenance record (checksums, git commit, row counts)          |
 | `validation_report.txt`                | 8-check production validation (see below)                      |
 
-All five tables are sorted by Swiss-Prot first (`reviewed`/`from_reviewed DESC`), then `taxid ASC`, then `acc ASC`. The boolean column is called `reviewed` on the entries table and `from_reviewed` on child tables (features, xrefs, comments, references) to clarify that it's inherited from the parent entry, not an independent review status.
+All five tables are sorted by Swiss-Prot first (`reviewed`/`from_reviewed DESC`), then `taxid ASC`, then `acc ASC`. The boolean column is called `reviewed` on the entries table and `from_reviewed` on child tables (features, xrefs, comments, publications) to clarify that it's inherited from the parent entry, not an independent review status.
 
 ## Accessing the data
 
@@ -32,12 +32,12 @@ from uniprot_lake import connect
 con = connect("/data/uniprot/2026_01/lake")                           # local
 con = connect("https://ftp.ebi.ac.uk/.../2026_01/lake")              # remote (auto-installs httpfs)
 
-con.sql("SELECT acc, gene_name, protein_name FROM entries WHERE taxid = 9606 LIMIT 5").show()
+con.sql("SELECT acc, gene_names[1] AS gene_name, protein_name FROM entries WHERE taxid = 9606 LIMIT 5").show()
 con.sql("SELECT * FROM protein_card('P04637')").show()
 con.sql("SELECT * FROM organism_features(9606, 'Domain')").show()
 ```
 
-The returned object is a standard `duckdb.DuckDBPyConnection` — use it exactly as you would any DuckDB connection. Five views (`entries`, `features`, `xrefs`, `comments`, `refs`) and seven macros are ready to use immediately.
+The returned object is a standard `duckdb.DuckDBPyConnection` — use it exactly as you would any DuckDB connection. Five views (`entries`, `features`, `xrefs`, `comments`, `publications`) and seven macros are ready to use immediately.
 
 For remote access, DuckDB's httpfs reads only the byte ranges it needs — a query touching 3 columns of one organism downloads a fraction of the full dataset.
 
@@ -258,7 +258,7 @@ The `VALIDATE` step runs 8 checks against the source JSONL as ground truth. All 
 1. **Completeness** — JSONL line count == entries rows; child table counts match `sum(entries.*_count)`
 2. **Uniqueness** — `entries.acc` has zero duplicates
 3. **Null keys** — `acc`, `reviewed`/`from_reviewed`, `taxid` never null across all tables
-4. **Referential integrity** — every `acc` in features/xrefs/comments/references exists in entries
+4. **Referential integrity** — every `acc` in features/xrefs/comments/publications exists in entries
 5. **Sort order** — all tables sorted by `(reviewed/from_reviewed DESC, taxid ASC, acc ASC)`
 6. **Round-trip spot check** — 1000 reservoir-sampled entries verified field-by-field against JSONL
 7. **Parquet file integrity** — every `.parquet` file in the lake is readable
@@ -268,12 +268,12 @@ The `VALIDATE` step runs 8 checks against the source JSONL as ground truth. All 
 
 We adopt a **denormalized-first + full nested** design. Each table has two layers:
 
-1. **Flattened convenience columns** (e.g. `gene_name`, `gene_synonyms`, `ec_numbers`, `go_ids`) — cover the 90% use case with simple SQL. These are intentionally lossy shortcuts: `gene_name` is only the first gene's primary name, `ec_numbers` are only from `recommendedName`, and `go_ids` are IDs without aspect/evidence.
+1. **Flattened convenience columns** (e.g. `gene_names`, `gene_synonyms`, `ec_numbers`, `go_ids`) — cover the 90% use case with simple SQL. These provide complete data: `gene_names` is an array of all gene primary names, `ec_numbers` include all naming blocks (recommended, alternative, submitted), and `go_ids` are IDs without aspect/evidence.
 2. **Full nested structures** (e.g. `genes`, `protein_desc`, `comment`, `feature`, `reference`) — preserve all upstream data for power users and lossless JSONL reconstruction. DuckDB's struct/list syntax makes these queryable without ETL.
 
 No UniProtKB data is discarded. Users needing isoforms, GO aspects, EC numbers from alternative names, multi-paragraph comments, or evidence codes can always query the nested columns.
 
-Parquet's columnar storage mitigates any read-amplification cost — if a query touches 5 of 40+ columns, only those 5 are read from disk. Normalized child tables (features, xrefs, comments, references) are provided for high-cardinality relationships that would make the main table unwieldy as arrays.
+Parquet's columnar storage mitigates any read-amplification cost — if a query touches 5 of 40+ columns, only those 5 are read from disk. Normalized child tables (features, xrefs, comments, publications) are provided for high-cardinality relationships that would make the main table unwieldy as arrays.
 
 All five tables are sorted by Swiss-Prot first, then `taxid ASC`, then `acc ASC`, and all include denormalized entry-level fields (`acc`, `reviewed`/`from_reviewed`, `taxid`) so most queries don't need joins.
 
@@ -281,7 +281,7 @@ All five tables are sorted by Swiss-Prot first, then `taxid ASC`, then `acc ASC`
 
 - Identity: `acc`, `id`, `reviewed`, `secondary_accs`, `entry_type`
 - Organism: `taxid`, `organism_name`, `organism_common`, `lineage`
-- Gene/protein: `gene_name`, `gene_synonyms`, `protein_name`, `alt_protein_names`, `protein_flag`, `ec_numbers`, `protein_existence`, `annotation_score`
+- Gene/protein: `gene_names`, `gene_synonyms`, `protein_name`, `alt_protein_names`, `protein_flag`, `ec_numbers`, `protein_existence`, `annotation_score`
 - Sequence: `sequence`, `seq_length`, `seq_mass`, `seq_md5`, `seq_crc64`
 - Shortcuts: `go_ids`, `xref_dbs`, `keyword_ids`, `keyword_names`
 - Versioning: `first_public`, `last_modified`, `last_seq_modified`, `entry_version`, `seq_version`
@@ -303,10 +303,10 @@ All five tables are sorted by Swiss-Prot first, then `taxid ASC`, then `acc ASC`
 **comments** — one row per comment annotation:
 
 - `acc`, `from_reviewed`, `taxid`
-- Flattened: `comment_type`, `text_value`
-- Full nested: `comment` (preserves all polymorphic comment fields)
+- Flattened: `comment_type`, `text_value` (covers 15 of 25 comment types; the other 10 store data in type-specific keys)
+- Full nested: `comment` (JSON — preserves all polymorphic comment fields). UniProtKB comments are polymorphic (FUNCTION has `texts`, SUBCELLULAR LOCATION has `subcellularLocations`, CATALYTIC ACTIVITY has `reaction`, etc.), so the column is stored as JSON rather than a typed struct. Use `comment->>'$.key'` to extract text values or `comment->'$.key'` for nested objects.
 
-**references** — one row per literature citation:
+**publications** — one row per literature citation (derived from the `references` array in UniProtKB JSON; named "publications" to match UniProt's entry page terminology).
 
 - `acc`, `from_reviewed`, `taxid`
 - Flattened: `reference_number`, `citation_type`, `citation_id`, `title`, `authors`, `authoring_group`, `publication_date`, `journal`, `volume`, `first_page`, `last_page`, `submission_database`, `citation_xrefs`, `reference_positions`, `reference_comments`, `evidences`
@@ -320,7 +320,7 @@ con = connect('/path/to/2026_01/lake')
 
 # All human kinases
 con.sql("""
-    SELECT acc, gene_name, protein_name, ec_numbers
+    SELECT acc, gene_names[1] AS gene_name, protein_name, ec_numbers
     FROM entries
     WHERE taxid = 9606
       AND list_contains(keyword_names, 'Kinase')
@@ -344,9 +344,19 @@ con.sql("SELECT * FROM organism_xrefs(9606, ['PDB'])").show()
 # Function annotations for mouse
 con.sql("SELECT * FROM organism_comments(10090, 'FUNCTION')").show()
 
+# Dive into the full JSON comment (polymorphic — varies by comment type)
+con.sql("""
+    SELECT acc, comment_type,
+           comment->>'$.texts[0].value'                         AS text,
+           comment->>'$.subcellularLocations[0].location.value' AS location,
+           comment->>'$.reaction.name'                          AS reaction
+    FROM comments
+    WHERE acc = 'P04637'
+""").show()
+
 # Entries joined with features — one row per feature, entry columns attached
 con.sql("""
-    SELECT acc, gene_name, type, start_pos, end_pos, description
+    SELECT acc, gene_names[1] AS gene_name, type, start_pos, end_pos, description
     FROM entries_with_features(9606)
     WHERE type = 'Transmembrane'
 """).show()
@@ -354,7 +364,7 @@ con.sql("""
 # Publications by a specific author
 con.sql("""
     SELECT acc, title, publication_date
-    FROM refs
+    FROM publications
     WHERE list_contains(authors, 'Levitsky A.A.')
 """).show()
 

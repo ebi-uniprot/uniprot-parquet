@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Transform JSONL(.zst) → sorted Parquet tables (entries, features, xrefs, comments, references).
+Transform JSONL(.zst) → sorted Parquet tables (entries, features, xrefs, comments, publications).
 
 Architecture:
   - The JSONL is staged to a Parquet file once (single JSON parse), then all
@@ -24,7 +24,7 @@ Output layout:
     features/features_00001.parquet, ...
     xrefs/xrefs_00001.parquet, ...
     comments/comments_00001.parquet, ...
-    references/references_00001.parquet, ...
+    publications/publications_00001.parquet, ...
     manifest.json
 
 Schema is inferred automatically from the data via DuckDB's read_json_auto.
@@ -43,6 +43,7 @@ import sys
 import argparse
 import time
 import json
+import shutil
 from datetime import datetime, timezone
 
 import duckdb
@@ -52,6 +53,52 @@ import pyarrow.parquet as pq
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
+
+
+def build_sorting_columns(sort_order, arrow_schema):
+    """Convert sort order strings to PyArrow SortingColumn objects.
+
+    Args:
+        sort_order: List of strings like ["reviewed DESC", "taxid ASC", "acc ASC"]
+        arrow_schema: PyArrow schema to map column names to indices
+
+    Returns:
+        List of pq.SortingColumn objects, or None if PyArrow < 16.0 or parse fails.
+        Falls back to None (no sorting metadata) if SortingColumn is not available.
+    """
+    if not sort_order:
+        return None
+
+    try:
+        # Check if pq.SortingColumn exists (PyArrow 16.0+)
+        if not hasattr(pq, 'SortingColumn'):
+            eprint("  WARNING: PyArrow SortingColumn not available (requires PyArrow 16.0+). Skipping sort metadata.")
+            return None
+
+        # Build a map of column name -> index
+        col_name_to_idx = {field.name: i for i, field in enumerate(arrow_schema)}
+
+        sorting_columns = []
+        for spec in sort_order:
+            parts = spec.strip().split()
+            if len(parts) != 2:
+                eprint(f"  WARNING: Invalid sort spec '{spec}' (expected 'column ASC/DESC'). Skipping.")
+                continue
+
+            col_name, direction = parts
+            if col_name not in col_name_to_idx:
+                eprint(f"  WARNING: Column '{col_name}' not found in schema. Skipping from sort order.")
+                continue
+
+            col_idx = col_name_to_idx[col_name]
+            descending = direction.upper() == "DESC"
+            sorting_columns.append(pq.SortingColumn(col_idx, descending=descending, nulls_first=False))
+
+        return sorting_columns if sorting_columns else None
+
+    except Exception as e:
+        eprint(f"  WARNING: Failed to build sorting columns: {e}. Continuing without sort metadata.")
+        return None
 
 
 # ─── DuckDB helpers ──────────────────────────────────────────────────────
@@ -74,6 +121,10 @@ def build_read_clause(jsonl_path: str) -> str:
     """
     safe_path = _sql_escape(jsonl_path)
     return (
+        # sample_size=-1: scan all records to infer schema (no sampling).
+        # maximum_object_size=512 MB: some UniProtKB JSON entries exceed
+        # DuckDB's 16 MB default (e.g. titin has >34k residues + huge
+        # annotation arrays).  512 MB covers the largest known entry.
         f"read_json_auto('{safe_path}', format='newline_delimited', "
         f"sample_size=-1, maximum_object_size=536870912)"
     )
@@ -93,6 +144,8 @@ def stage_to_parquet(con, read_clause: str, staging_path: str) -> str:
     safe_path = _sql_escape(staging_path)
     eprint(f"  Staging JSONL → Parquet: {staging_path}")
     t0 = time.time()
+    # ROW_GROUP_SIZE 100k: keeps per-group memory bounded while giving
+    # DuckDB enough rows for efficient predicate pushdown and min/max stats.
     con.sql(f"""
         COPY (SELECT * FROM {read_clause})
         TO '{safe_path}'
@@ -112,6 +165,23 @@ def get_available_columns(con, read_clause: str) -> set[str]:
     """
     result = con.sql(f"DESCRIBE SELECT * FROM {read_clause}").fetchall()
     return {row[0] for row in result}
+
+
+def get_struct_subfields(con, read_clause: str, column: str) -> set[str]:
+    """Discover sub-field names inside a top-level STRUCT column.
+
+    Used to handle optional nested fields that may not appear in all
+    datasets (e.g. proteinDescription.submittedNames only exists for
+    TrEMBL entries, not Swiss-Prot).
+    """
+    try:
+        result = con.sql(
+            f"SELECT unnest(struct_keys(t.{column})) AS k "
+            f"FROM (SELECT * FROM {read_clause} LIMIT 1) t"
+        ).fetchall()
+        return {row[0] for row in result}
+    except Exception:
+        return set()
 
 
 def init_duckdb(memory_limit: str, threads: int | None,
@@ -139,14 +209,43 @@ def init_duckdb(memory_limit: str, threads: int | None,
 _OPTIONAL_ENTRY_FIELDS = {"organismHosts", "geneLocations"}
 
 
-def _build_entries_sql(available_cols: set[str]) -> str:
-    """Build the entries SQL with NULLs for any missing optional columns."""
+def _build_entries_sql(available_cols: set[str], pd_subfields: set[str] | None = None) -> str:
+    """Build the entries SQL with NULLs for any missing optional columns.
+
+    Parameters
+    ----------
+    available_cols : set[str]
+        Top-level column names present in the data.
+    pd_subfields : set[str], optional
+        Sub-field names inside proteinDescription (e.g. submittedNames).
+        Used to conditionally include nested fields that may not exist
+        in all UniProtKB subsets.
+    """
+    if pd_subfields is None:
+        pd_subfields = set()
+
     organism_hosts = (
         "e.organismHosts" if "organismHosts" in available_cols else "NULL"
     )
     gene_locations = (
         "e.geneLocations" if "geneLocations" in available_cols else "NULL"
     )
+
+    # EC numbers: extract from recommended, alternative, and (if present) submitted names.
+    # submittedNames only exists in TrEMBL entries; Swiss-Prot-only datasets lack it.
+    ec_parts = [
+        "list_transform(COALESCE(e.proteinDescription.recommendedName.ecNumbers, []), x -> x.value)",
+        """flatten(list_transform(
+            COALESCE(e.proteinDescription.alternativeNames, []),
+            n -> list_transform(COALESCE(n.ecNumbers, []), x -> x.value)
+        ))""",
+    ]
+    if "submittedNames" in pd_subfields:
+        ec_parts.append("""flatten(list_transform(
+            COALESCE(e.proteinDescription.submittedNames, []),
+            n -> list_transform(COALESCE(n.ecNumbers, []), x -> x.value)
+        ))""")
+    ec_numbers_expr = "list_distinct(flatten([\n        " + ",\n        ".join(ec_parts) + "\n    ]))"
 
     return f"""
 SELECT
@@ -164,7 +263,10 @@ SELECT
     e.organism.lineage                              AS lineage,
 
     -- Gene & protein (flattened)
-    e.genes[1].geneName.value                       AS gene_name,
+    list_transform(
+        COALESCE(e.genes, []),
+        g -> g.geneName.value
+    )                                               AS gene_names,
     -- All gene synonyms across all genes (searchable list)
     flatten(list_transform(
         COALESCE(e.genes, []),
@@ -178,11 +280,8 @@ SELECT
     )                                               AS alt_protein_names,
     -- Precursor / Fragment flag (commonly used to filter incomplete sequences)
     e.proteinDescription.flag                       AS protein_flag,
-    -- EC numbers: extract from recommendedName.ecNumbers[]
-    list_transform(
-        COALESCE(e.proteinDescription.recommendedName.ecNumbers, []),
-        x -> x.value
-    )                                               AS ec_numbers,
+    -- EC numbers: extract from all naming blocks (recommended, alternative, submitted)
+    {ec_numbers_expr}                               AS ec_numbers,
     e.proteinExistence                              AS protein_existence,
     e.annotationScore                               AS annotation_score,
 
@@ -232,7 +331,7 @@ SELECT
     e.extraAttributes                               AS extra_attributes,
 
     -- Full nested structures (preserved for power users)
-    -- features, xrefs, comments, and references are in their own tables
+    -- features, xrefs, comments, and publications are in their own tables
     e.organism                                      AS organism,
     e.proteinDescription                            AS protein_desc,
     e.genes                                         AS genes,
@@ -331,11 +430,16 @@ SELECT
     -- Strip embedded double quotes from commentType (JSON scalar → VARCHAR)
     -- so users can write comment_type = 'FUNCTION' instead of '"FUNCTION"'
     trim('"' FROM unnest.commentType::VARCHAR)      AS comment_type,
-    -- Extract first text value via JSON path (texts is inferred as JSON
-    -- because comment types are polymorphic — struct[] inference fails)
-    unnest.texts->>'$[0].value'                     AS text_value,
-    -- Full comment structure for complex/polymorphic types
-    unnest                                          AS comment
+    -- Concatenate all text values (multi-paragraph comments have texts[1..N])
+    -- texts is JSON, so extract all values and join with double newline
+    array_to_string(
+        from_json(unnest.texts->'$[*].value', '["VARCHAR"]'),
+        chr(10) || chr(10)
+    )                                               AS text_value,
+    -- Full comment as JSON (lossless — preserves original structure).
+    -- Stored as VARCHAR in Parquet; the comments view casts to JSON
+    -- so users get ->> operators without explicit casting.
+    unnest::JSON                                    AS comment
 
 FROM (
     SELECT
@@ -400,7 +504,7 @@ TABLE_DEFS = [
     ("features",   FEATURES_SQL,   ["from_reviewed DESC", "taxid ASC", "acc ASC", "start_pos ASC"]),
     ("xrefs",      XREFS_SQL,      ["from_reviewed DESC", "taxid ASC", "acc ASC", "database ASC"]),
     ("comments",   COMMENTS_SQL,   ["from_reviewed DESC", "taxid ASC", "acc ASC", "comment_type ASC"]),
-    ("references", REFERENCES_SQL, ["from_reviewed DESC", "taxid ASC", "acc ASC", "citation_type ASC"]),
+    ("publications", REFERENCES_SQL, ["from_reviewed DESC", "taxid ASC", "acc ASC", "citation_type ASC"]),
 ]
 
 
@@ -418,7 +522,7 @@ TABLE_META = {
             "convenience": [
                 "acc", "id", "reviewed", "secondary_accs",
                 "taxid", "organism_name", "organism_common", "lineage",
-                "gene_name", "gene_synonyms", "protein_name", "alt_protein_names",
+                "gene_names", "gene_synonyms", "protein_name", "alt_protein_names",
                 "protein_flag", "ec_numbers", "protein_existence", "annotation_score",
                 "sequence", "seq_length", "seq_mass", "seq_md5", "seq_crc64",
                 "go_ids", "xref_dbs", "keyword_ids", "keyword_names",
@@ -469,11 +573,11 @@ TABLE_META = {
                 "acc", "from_reviewed", "taxid",
                 "comment_type", "text_value",
             ],
-            "nested": ["comment"],
+            "nested": ["comment"],  # JSON — use comment->>'$.key' to extract
         },
     },
-    "references": {
-        "description": "One row per literature citation or submission.",
+    "publications": {
+        "description": "One row per literature citation or submission (derived from UniProtKB entry.references).",
         "primary_key": [],
         "foreign_keys": {"acc": "entries.acc", "taxid": "entries.taxid"},
         "columns": {
@@ -493,12 +597,12 @@ TABLE_META = {
 
 # ─── Core pipeline ──────────────────────────────────────────────────────
 
-def stream_to_parquet(con, sql, table_dir, batch_size, label="table"):
+def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order=None):
     """Stream DuckDB result → Parquet files in bounded-memory batches.
 
     DuckDB executes the query lazily and yields Arrow record batches of
-    `batch_size` rows.  Each batch is written as a zstd-compressed
-    Parquet file.
+    `batch_size` rows. Multiple batches are accumulated into larger files
+    targeting ~256MB per file using ParquetWriter.
 
     The Arrow schema is determined once by DuckDB before the first batch
     is yielded — all batches share the same schema.
@@ -506,47 +610,115 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table"):
     Memory model: only one Arrow batch is held at a time (plus whatever
     DuckDB needs for the ORDER BY spill).
 
-    Returns (total_rows, file_list).
+    Atomicity: Files are written to a temporary .tmp/ directory and moved
+    to the final location after all batches are successfully written.
+
+    Args:
+        con: DuckDB connection
+        sql: SQL query to execute
+        table_dir: Output directory for Parquet files
+        batch_size: Rows per Arrow batch
+        label: Table name (for logging)
+        sort_order: List of sort order strings (e.g. ["reviewed DESC", "taxid ASC"])
+                   to embed in Parquet footer metadata (PyArrow 16.0+).
+
+    Returns (total_rows, file_list, arrow_schema).
     """
+    TARGET_FILE_BYTES = 256 * 1024 * 1024  # ~256 MB per file
+
     eprint(f"  Querying DuckDB for {label}...")
     t0 = time.time()
 
     result = con.sql(sql)
     reader = result.to_arrow_reader(batch_size=batch_size)
 
+    # Create main output directory and temporary directory
     os.makedirs(table_dir, exist_ok=True)
+    tmp_dir = os.path.join(table_dir, ".tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
 
     total_rows = 0
     file_num = 0
     parquet_files = []
     arrow_schema = None
+    writer = None
+    current_file_num = 0
+    current_file_path = None
+    sorting_columns = None
 
-    for record_batch in reader:
-        arrow_tbl = pa.Table.from_batches([record_batch])
-        n = arrow_tbl.num_rows
-        if n == 0:
-            continue
+    try:
+        for record_batch in reader:
+            arrow_tbl = pa.Table.from_batches([record_batch])
+            n = arrow_tbl.num_rows
+            if n == 0:
+                continue
 
-        if arrow_schema is None:
-            arrow_schema = arrow_tbl.schema
+            if arrow_schema is None:
+                arrow_schema = arrow_tbl.schema
+                # Build sorting columns once schema is available
+                if sort_order:
+                    sorting_columns = build_sorting_columns(sort_order, arrow_schema)
 
-        file_num += 1
-        total_rows += n
+            total_rows += n
 
-        filename = f"{label}_{file_num:05d}.parquet"
-        parquet_path = os.path.join(table_dir, filename)
-        t1 = time.time()
-        pq.write_table(arrow_tbl, parquet_path, compression="zstd",
-                       row_group_size=100_000)
-        parquet_files.append(filename)
-        eprint(
-            f"    batch {file_num}: {n:,} rows "
-            f"(total {total_rows:,}, "
-            f"wrote in {time.time()-t1:.1f}s)"
-        )
+            # Initialize writer for first batch or if we haven't started yet
+            if writer is None:
+                current_file_num += 1
+                filename = f"{label}_{current_file_num:05d}.parquet"
+                current_file_path = os.path.join(tmp_dir, filename)
+                writer_kwargs = {
+                    "compression": "zstd",
+                }
+                if sorting_columns:
+                    writer_kwargs["sorting_columns"] = sorting_columns
+                writer = pq.ParquetWriter(
+                    current_file_path,
+                    arrow_schema,
+                    **writer_kwargs
+                )
+
+            # Write batch to current file (row_group_size controls Parquet row group boundaries)
+            writer.write_table(arrow_tbl, row_group_size=100_000)
+
+            # Check current file size and close if it exceeds target
+            current_size = os.path.getsize(current_file_path)
+            if current_size >= TARGET_FILE_BYTES:
+                writer.close()
+                parquet_files.append(os.path.basename(current_file_path))
+                writer = None
+
+            elapsed = time.time() - t0
+            rate = total_rows / elapsed if elapsed > 0 else 0
+            eprint(
+                f"    batch {current_file_num}: {n:,} rows "
+                f"(total {total_rows:,}, "
+                f"{elapsed:.0f}s elapsed, "
+                f"{rate:,.0f} rows/s)"
+            )
+
+        # Close final writer if it's still open
+        if writer is not None:
+            writer.close()
+            parquet_files.append(os.path.basename(current_file_path))
+
+        # Move all files from .tmp/ to final location atomically
+        for filename in parquet_files:
+            tmp_path = os.path.join(tmp_dir, filename)
+            final_path = os.path.join(table_dir, filename)
+            shutil.move(tmp_path, final_path)
+
+        # Clean up empty .tmp/ directory
+        if os.path.isdir(tmp_dir) and not os.listdir(tmp_dir):
+            os.rmdir(tmp_dir)
+
+    except Exception:
+        # On error, close writer and leave .tmp/ for cleanup by caller
+        if writer is not None:
+            writer.close()
+        raise
 
     elapsed = time.time() - t0
-    eprint(f"  {label}: {total_rows:,} rows in {file_num} files ({elapsed:.1f}s)")
+    eprint(f"  {label}: {total_rows:,} rows in {len(parquet_files)} files ({elapsed:.1f}s)")
     return total_rows, parquet_files, arrow_schema
 
 
@@ -567,7 +739,7 @@ def _schema_to_dict(arrow_schema):
 def main():
     parser = argparse.ArgumentParser(
         description="Transform UniProtKB JSONL → sorted Parquet tables "
-                    "(entries, features, xrefs, comments, references)"
+                    "(entries, features, xrefs, comments, publications)"
     )
     parser.add_argument("input", help="Input JSONL(.zst) file")
     parser.add_argument(
@@ -597,6 +769,9 @@ def main():
     args = parser.parse_args()
 
     jsonl_path = os.path.abspath(args.input)
+    if not os.path.exists(jsonl_path):
+        eprint(f"ERROR: Input file not found: {jsonl_path}")
+        sys.exit(1)
     outdir = os.path.abspath(args.outdir)
     os.makedirs(outdir, exist_ok=True)
 
@@ -644,6 +819,11 @@ def main():
         if missing_optional:
             eprint(f"  Optional fields not in data (will be NULL): {', '.join(sorted(missing_optional))}")
 
+        # Discover proteinDescription sub-fields (submittedNames is absent in Swiss-Prot-only datasets)
+        pd_subfields = get_struct_subfields(con, read_clause, "proteinDescription") if "proteinDescription" in available_cols else set()
+        if "submittedNames" not in pd_subfields:
+            eprint("  Note: proteinDescription.submittedNames absent (normal for Swiss-Prot-only data)")
+
         # ── Write tables ──
         t_total = time.time()
         manifest_tables = {}
@@ -677,10 +857,10 @@ def main():
             else:
                 # Entries SQL is built dynamically to handle optional fields
                 if sql_template is None:
-                    sql_template = _build_entries_sql(available_cols)
+                    sql_template = _build_entries_sql(available_cols, pd_subfields)
                 sql = sql_template.format(read_clause=read_clause)
                 row_count, files, arrow_schema = stream_to_parquet(
-                    con, sql, table_dir, args.batch_size, label=name
+                    con, sql, table_dir, args.batch_size, label=name, sort_order=sort_order
                 )
                 manifest_tables[name] = {
                     "description": meta.get("description", ""),

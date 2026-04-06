@@ -51,8 +51,8 @@ def comments_ds(lake_dir):
 
 
 @pytest.fixture(scope="session")
-def references_ds(lake_dir):
-    return open_table(lake_dir, "references")
+def publications_ds(lake_dir):
+    return open_table(lake_dir, "publications")
 
 
 # ─── Row counts ──────────────────────────────────────────────────────
@@ -98,17 +98,17 @@ class TestRowCounts:
                 comment_sum += s
         assert comment_sum == comments_ds.count_rows()
 
-    def test_references_count_positive(self, references_ds):
-        assert references_ds.count_rows() > 0, "Expected references rows"
+    def test_publications_count_positive(self, publications_ds):
+        assert publications_ds.count_rows() > 0, "Expected publications rows"
 
-    def test_references_count_consistency(self, entries_ds, references_ds):
-        """sum(entries.reference_count) should equal references row count."""
+    def test_publications_count_consistency(self, entries_ds, publications_ds):
+        """sum(entries.reference_count) should equal publications row count."""
         ref_sum = 0
         for batch in entries_ds.to_batches(columns=["reference_count"]):
             s = pc.sum(batch.column("reference_count")).as_py()
             if s is not None:
                 ref_sum += s
-        assert ref_sum == references_ds.count_rows()
+        assert ref_sum == publications_ds.count_rows()
 
 
 # ─── Manifest ──────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ class TestSchema:
     def test_entries_required_columns(self, entries_ds):
         names = set(entries_ds.schema.names)
         required = {
-            "acc", "id", "reviewed", "taxid", "organism_name", "gene_name",
+            "acc", "id", "reviewed", "taxid", "organism_name", "gene_names",
             "gene_synonyms", "protein_name", "alt_protein_names",
             "sequence", "seq_length", "go_ids", "xref_dbs",
             "feature_count", "xref_count", "comment_count", "reference_count",
@@ -179,8 +179,8 @@ class TestSchema:
         missing = required - names
         assert not missing, f"Missing columns: {missing}"
 
-    def test_references_required_columns(self, references_ds):
-        names = set(references_ds.schema.names)
+    def test_publications_required_columns(self, publications_ds):
+        names = set(publications_ds.schema.names)
         required = {
             "acc", "from_reviewed", "taxid", "citation_type", "citation_id",
             "title", "authors", "publication_date",
@@ -230,12 +230,12 @@ class TestDataIntegrity:
         arrow = comments_ds.to_table(columns=["comment_type"])
         assert arrow.column("comment_type").null_count == 0
 
-    def test_references_have_citation_type(self, references_ds):
-        arrow = references_ds.to_table(columns=["citation_type"])
+    def test_publications_have_citation_type(self, publications_ds):
+        arrow = publications_ds.to_table(columns=["citation_type"])
         assert arrow.column("citation_type").null_count == 0
 
-    def test_references_have_acc(self, references_ds):
-        arrow = references_ds.to_table(columns=["acc"])
+    def test_publications_have_acc(self, publications_ds):
+        arrow = publications_ds.to_table(columns=["acc"])
         assert arrow.column("acc").null_count == 0
 
     def test_sample_accession_present(self, entries_ds):
@@ -259,14 +259,14 @@ class TestDataIntegrity:
         arrow = features_ds.to_table(columns=["feature"])
         assert arrow.column("feature").null_count == 0
 
-    def test_references_have_reference_number(self, references_ds):
+    def test_publications_have_reference_number(self, publications_ds):
         """reference_number preserves the ordinal position from the original JSON."""
-        arrow = references_ds.to_table(columns=["reference_number"])
+        arrow = publications_ds.to_table(columns=["reference_number"])
         assert arrow.column("reference_number").null_count == 0
 
-    def test_references_have_reference_struct(self, references_ds):
+    def test_publications_have_reference_struct(self, publications_ds):
         """The reference column preserves the full original nested structure."""
-        arrow = references_ds.to_table(columns=["reference"])
+        arrow = publications_ds.to_table(columns=["reference"])
         assert arrow.column("reference").null_count == 0
 
     def test_comments_have_comment_struct(self, comments_ds):
@@ -317,10 +317,10 @@ class TestSortOrder:
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
         assert keys == sorted(keys), "Comments not sorted by (from_reviewed DESC, taxid ASC, acc ASC)"
 
-    def test_references_sorted_by_from_reviewed_desc_taxid_asc_acc_asc(self, references_ds):
-        arrow = references_ds.to_table(columns=["from_reviewed", "taxid", "acc"])
+    def test_publications_sorted_by_from_reviewed_desc_taxid_asc_acc_asc(self, publications_ds):
+        arrow = publications_ds.to_table(columns=["from_reviewed", "taxid", "acc"])
         reviewed = arrow.column("from_reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
         accs = arrow.column("acc").to_pylist()
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
-        assert keys == sorted(keys), "References not sorted by (from_reviewed DESC, taxid ASC, acc ASC)"
+        assert keys == sorted(keys), "Publications not sorted by (from_reviewed DESC, taxid ASC, acc ASC)"

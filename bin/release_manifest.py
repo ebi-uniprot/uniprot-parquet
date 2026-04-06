@@ -109,7 +109,7 @@ def main():
             lake_manifest = json.load(f)
 
         tables_info = {}
-        for table_name in ["entries", "features", "xrefs", "comments", "references"]:
+        for table_name in ["entries", "features", "xrefs", "comments", "publications"]:
             table_data = lake_manifest.get("tables", {}).get(table_name, {})
             info = {
                 "row_count": table_data.get("row_count", 0),

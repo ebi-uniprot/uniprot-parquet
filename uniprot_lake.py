@@ -18,8 +18,8 @@ Usage (remote — EBI FTP):
     con = connect("https://ftp.ebi.ac.uk/.../2026_01/lake")
 
 That's it. The returned object is a standard duckdb.DuckDBPyConnection
-with five views (entries, features, xrefs, comments, refs) and seven
-macros ready to use.
+with five views (entries, features, xrefs, comments, publications)
+and seven macros ready to use.
 
 Requirements: pip install duckdb
 """
@@ -42,13 +42,15 @@ _SETUP_SQL = """\
 CREATE OR REPLACE VIEW entries    AS SELECT * FROM read_parquet('{BASE}/entries/*.parquet');
 CREATE OR REPLACE VIEW features   AS SELECT * FROM read_parquet('{BASE}/features/*.parquet');
 CREATE OR REPLACE VIEW xrefs      AS SELECT * FROM read_parquet('{BASE}/xrefs/*.parquet');
-CREATE OR REPLACE VIEW comments   AS SELECT * FROM read_parquet('{BASE}/comments/*.parquet');
-CREATE OR REPLACE VIEW refs       AS SELECT * FROM read_parquet('{BASE}/references/*.parquet');
+CREATE OR REPLACE VIEW comments   AS SELECT * REPLACE (comment::JSON AS comment) FROM read_parquet('{BASE}/comments/*.parquet');
+-- Named "publications" to match UniProt's entry page terminology.
+-- ("references" is also a reserved word in SQL.)
+CREATE OR REPLACE VIEW publications AS SELECT * FROM read_parquet('{BASE}/publications/*.parquet');
 
 -- Annotation card for a single protein
 CREATE OR REPLACE MACRO protein_card(target_acc) AS TABLE (
     SELECT
-        e.acc, e.gene_name, e.protein_name, e.organism_name, e.taxid,
+        e.acc, e.gene_names[1] AS gene_name, e.protein_name, e.organism_name, e.taxid,
         e.reviewed, e.seq_length, e.protein_existence, e.annotation_score,
         e.go_ids, e.keyword_names, e.ec_numbers,
         e.feature_count, e.xref_count, e.comment_count, e.reference_count
@@ -83,7 +85,7 @@ CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
 
 -- Entries joined with features for an organism (filter first, join second)
 CREATE OR REPLACE MACRO entries_with_features(target_taxid) AS TABLE (
-    SELECT e.acc, e.gene_name, e.protein_name, e.reviewed,
+    SELECT e.acc, e.gene_names[1] AS gene_name, e.protein_name, e.reviewed,
            f.type, f.start_pos, f.end_pos, f.description, f.feature_id
     FROM entries e
     JOIN features f ON f.acc = e.acc AND f.taxid = e.taxid
@@ -93,7 +95,7 @@ CREATE OR REPLACE MACRO entries_with_features(target_taxid) AS TABLE (
 
 -- Entries joined with xrefs for an organism + specific databases
 CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
-    SELECT e.acc, e.gene_name, e.protein_name, e.reviewed,
+    SELECT e.acc, e.gene_names[1] AS gene_name, e.protein_name, e.reviewed,
            x.database, x.id, x.properties
     FROM entries e
     JOIN xrefs x ON x.acc = e.acc AND x.taxid = e.taxid
@@ -105,7 +107,7 @@ CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
 CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
     SELECT
         i.acc,
-        e.gene_name,
+        e.gene_names[1] AS gene_name,
         iso.name.value                  AS isoform_name,
         unnest(iso.isoformIds)          AS isoform_id,
         iso.isoformSequenceStatus       AS sequence_status,
@@ -115,7 +117,7 @@ CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
             acc,
             unnest(
                 from_json(
-                    element_at(comment, 'isoforms')[1]::JSON,
+                    comment->'$.isoforms',
                     '[{"name":{"value":"VARCHAR"},"isoformIds":["VARCHAR"],"isoformSequenceStatus":"VARCHAR","sequenceIds":["VARCHAR"]}]'
                 )
             ) AS iso
@@ -126,6 +128,37 @@ CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
     JOIN entries e ON e.acc = i.acc
 );
 """
+
+
+def _split_sql(sql: str) -> list[str]:
+    """Split SQL text on semicolons, respecting single-quoted strings.
+
+    Naive str.split(';') would break on semicolons inside string
+    literals (e.g. JSON schemas in from_json() calls).  This tracks
+    quote state so those inner semicolons are preserved.
+    """
+    statements = []
+    current: list[str] = []
+    in_quote = False
+    for char in sql:
+        if char == "'" and not in_quote:
+            in_quote = True
+            current.append(char)
+        elif char == "'" and in_quote:
+            in_quote = False
+            current.append(char)
+        elif char == ";" and not in_quote:
+            stmt = "".join(current).strip()
+            if stmt:
+                statements.append(stmt)
+            current = []
+        else:
+            current.append(char)
+    # Catch any trailing statement without a final semicolon
+    stmt = "".join(current).strip()
+    if stmt:
+        statements.append(stmt)
+    return statements
 
 
 def connect(
@@ -151,7 +184,7 @@ def connect(
     Returns
     -------
     duckdb.DuckDBPyConnection
-        A connection with views (entries, features, xrefs, comments, refs)
+        A connection with views (entries, features, xrefs, comments, publications)
         and macros (protein_card, organism_features, organism_xrefs,
         organism_comments, entries_with_features, entries_with_xrefs,
         unnest_isoforms) ready to use.
@@ -172,12 +205,12 @@ def connect(
     elif base.startswith("s3://"):
         con.sql("INSTALL httpfs; LOAD httpfs;")
 
-    # Create views and macros
+    # Create views and macros.
+    # Split on semicolons that aren't inside single-quoted strings,
+    # so JSON schemas like '[{"name":{"value":"VARCHAR"}}]' stay intact.
     sql = _SETUP_SQL.replace("{BASE}", base)
-    for statement in sql.split(";"):
-        statement = statement.strip()
-        if statement:
-            con.sql(statement)
+    for statement in _split_sql(sql):
+        con.sql(statement)
 
     return con
 
@@ -199,8 +232,18 @@ def manifest(lake_path: str) -> dict:
         The parsed manifest with keys like "tables", "release", etc.
     """
     manifest_path = os.path.join(lake_path, "manifest.json")
-    with open(manifest_path) as f:
-        return json.load(f)
+    try:
+        with open(manifest_path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"manifest.json not found at {manifest_path}. "
+            f"Is '{lake_path}' a valid lake directory?"
+        ) from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"manifest.json at {manifest_path} is not valid JSON: {exc}"
+        ) from None
 
 
 def tables(lake_path: str) -> dict[str, int]:

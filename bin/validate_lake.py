@@ -16,7 +16,7 @@ Checks (in order):
      - sum(entries.feature_count) == features row count
      - sum(entries.xref_count) == xrefs row count
      - sum(entries.comment_count) == comments row count
-     - sum(entries.reference_count) == references row count
+     - sum(entries.reference_count) == publications row count
 
   2. UNIQUENESS
      - entries.acc has zero duplicates
@@ -29,7 +29,7 @@ Checks (in order):
      - Every acc in features exists in entries
      - Every acc in xrefs exists in entries
      - Every acc in comments exists in entries
-     - Every acc in references exists in entries
+     - Every acc in publications exists in entries
 
   5. SORT ORDER
      - All tables sorted by (reviewed DESC, taxid ASC, acc ASC)
@@ -57,11 +57,16 @@ Checks (in order):
   12. SCHEMA TYPE PROTECTION
       - Critical columns have expected Arrow types (not silently cast)
 
+  13. SCHEMA EVOLUTION GUARD
+      - Inferred Parquet schema matches committed baseline
+      - Detects renamed/dropped/new fields from upstream JSON changes
+
 Usage:
     validate_lake.py \
         --lake /path/to/lake \
         --jsonl /path/to/uniprot.jsonl.zst \
         [--spot-check-n 1000] \
+        [--schema-baseline /path/to/schema_baseline.json] \
         [-o validation_report.txt]
 
 Exit codes:
@@ -242,7 +247,7 @@ def check_completeness(report, lake_dir, jsonl_count):
         ("features", "feature_count"),
         ("xrefs", "xref_count"),
         ("comments", "comment_count"),
-        ("references", "reference_count"),
+        ("publications", "reference_count"),
     ]:
         child_ds = open_table(lake_dir, child_name)
         child_count = count_rows(child_ds)
@@ -291,7 +296,7 @@ def check_null_keys(report, lake_dir):
         ("features",   ["acc", "from_reviewed", "taxid", "type"]),
         ("xrefs",      ["acc", "from_reviewed", "taxid", "database", "id"]),
         ("comments",   ["acc", "from_reviewed", "taxid", "comment_type"]),
-        ("references", ["acc", "from_reviewed", "taxid", "citation_type", "reference_number"]),
+        ("publications", ["acc", "from_reviewed", "taxid", "citation_type", "reference_number"]),
     ]
 
     # Identity columns that must never be empty strings
@@ -300,7 +305,7 @@ def check_null_keys(report, lake_dir):
         ("features",   ["acc"]),
         ("xrefs",      ["acc", "id"]),
         ("comments",   ["acc"]),
-        ("references", ["acc"]),
+        ("publications", ["acc"]),
     ]
 
     for table_name, columns in key_checks:
@@ -344,7 +349,7 @@ def check_referential_integrity(report, lake_dir, entries_accs):
     eprint("\n--- 4. REFERENTIAL INTEGRITY ---")
     eprint(f"  Using entry acc set: {len(entries_accs):,} accessions")
 
-    for child_name in ["features", "xrefs", "comments", "references"]:
+    for child_name in ["features", "xrefs", "comments", "publications"]:
         child_ds = open_table(lake_dir, child_name)
         orphans = set()
 
@@ -373,7 +378,7 @@ def check_sort_order(report, lake_dir):
         ("features",   "from_reviewed"),
         ("xrefs",      "from_reviewed"),
         ("comments",   "from_reviewed"),
-        ("references", "from_reviewed"),
+        ("publications", "from_reviewed"),
     ]
 
     for table_name, rev_col in sort_check_tables:
@@ -576,7 +581,7 @@ def check_parquet_integrity(report, lake_dir):
     total_files = 0
     corrupt_files = []
 
-    for table_name in ["entries", "features", "xrefs", "comments", "references"]:
+    for table_name in ["entries", "features", "xrefs", "comments", "publications"]:
         table_dir = os.path.join(lake_dir, table_name)
         if not os.path.isdir(table_dir):
             continue
@@ -616,7 +621,7 @@ def check_manifest(report, lake_dir):
     report.check("manifest.json exists", True)
 
     # Check each table's files match what's on disk
-    for table_name in ["entries", "features", "xrefs", "comments", "references"]:
+    for table_name in ["entries", "features", "xrefs", "comments", "publications"]:
         table_info = manifest.get("tables", {}).get(table_name, {})
         manifest_files = set(table_info.get("files", []))
         table_dir = os.path.join(lake_dir, table_name)
@@ -649,7 +654,7 @@ def check_denormalized_sync(report, lake_dir):
         for i, acc in enumerate(accs):
             entry_lookup[acc] = (revs[i], taxids[i])
 
-    for child_name in ["features", "xrefs", "comments", "references"]:
+    for child_name in ["features", "xrefs", "comments", "publications"]:
         child_ds = open_table(lake_dir, child_name)
         taxid_mismatches = 0
         reviewed_mismatches = 0
@@ -838,6 +843,81 @@ def check_schema_types(report, lake_dir):
             )
 
 
+def check_schema_evolution(report, lake_dir, baseline_path):
+    """
+    Detect upstream UniProtKB JSON schema changes by comparing inferred Parquet
+    schema against a committed baseline.  Reports missing columns (ERROR) and
+    new columns (WARNING) to alert on schema drift.
+    """
+    report.checks.append("\n--- 13. SCHEMA EVOLUTION GUARD ---")
+    eprint("\n--- 13. SCHEMA EVOLUTION GUARD ---")
+
+    if not os.path.exists(baseline_path):
+        report.check(
+            "schema baseline file exists",
+            False,
+            f"baseline not found at {baseline_path}"
+        )
+        return
+
+    # Load baseline schema
+    try:
+        with open(baseline_path) as f:
+            baseline = json.load(f)
+    except Exception as e:
+        report.check(
+            "schema baseline file is valid JSON",
+            False,
+            f"error reading {baseline_path}: {e}"
+        )
+        return
+
+    report.check("schema baseline file exists", True)
+
+    # Compare each table's columns
+    for table_name in ["entries", "features", "xrefs", "comments", "publications"]:
+        if table_name not in baseline:
+            eprint(f"  warning: {table_name} not in baseline, skipping")
+            continue
+
+        baseline_cols = set(baseline[table_name])
+        dataset = open_table(lake_dir, table_name)
+        schema = dataset.schema
+        actual_cols = {field.name for field in schema}
+
+        missing_cols = baseline_cols - actual_cols
+        new_cols = actual_cols - baseline_cols
+
+        # Missing columns are ERRORS (upstream field dropped or renamed)
+        if missing_cols:
+            report.checks.append(
+                f"  [{report.failures}] MISSING in {table_name}: "
+                f"{sorted(missing_cols)}"
+            )
+            report.failures += 1
+            missing_detail = ", ".join(sorted(missing_cols)[:5])
+            report.check(
+                f"{table_name}: no missing columns",
+                False,
+                f"{len(missing_cols)} expected but not found: {missing_detail}"
+            )
+        else:
+            report.check(
+                f"{table_name}: no missing columns",
+                True
+            )
+
+        # New columns are WARNINGS (upstream added new field)
+        if new_cols:
+            report.checks.append(
+                f"  [WARN] NEW in {table_name}: {sorted(new_cols)}"
+            )
+            new_detail = ", ".join(sorted(new_cols)[:5])
+            report.checks.append(
+                f"  [{len(new_cols)} new column(s): {new_detail}]"
+            )
+
+
 # ─── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -855,6 +935,10 @@ def main():
     parser.add_argument(
         "--spot-check-n", type=int, default=1000,
         help="Number of entries to spot-check against JSONL (default: 1000)",
+    )
+    parser.add_argument(
+        "--schema-baseline", default=None,
+        help="Path to schema baseline JSON (enables schema evolution check)",
     )
     parser.add_argument("-o", "--output", default="validation_report.txt")
     args = parser.parse_args()
@@ -885,6 +969,8 @@ def main():
     check_sequence_integrity(report, args.lake)
     check_feature_coordinates(report, args.lake)
     check_schema_types(report, args.lake)
+    if args.schema_baseline:
+        check_schema_evolution(report, args.lake, args.schema_baseline)
 
     # ── Write report ──
     elapsed = time.time() - t_start

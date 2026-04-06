@@ -22,6 +22,7 @@ demo/dag-*.html
 demo/report-*.html
 demo/timeline-*.html
 demo/trace-*.txt
+demo/drosophila_kinases.csv
 
 # Python
 __pycache__/
@@ -54,4 +55,3 @@ trace-*.txt
 install.sh
 logs/
 repo-context.txt
-demo/drosophila_kinases.csv

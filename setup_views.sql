@@ -1,7 +1,7 @@
 -- UniProtKB Parquet Data Lake — DuckDB Setup Views
 --
 -- Creates virtual views over the five lake tables so downstream queries
--- can use plain table names (entries, features, xrefs, comments, refs)
+-- can use plain table names (entries, features, xrefs, comments, publications)
 -- without repeating read_parquet() globs.
 --
 -- Usage (local lake):
@@ -33,8 +33,10 @@
 CREATE OR REPLACE VIEW entries    AS SELECT * FROM read_parquet('${BASE}/entries/*.parquet');
 CREATE OR REPLACE VIEW features   AS SELECT * FROM read_parquet('${BASE}/features/*.parquet');
 CREATE OR REPLACE VIEW xrefs      AS SELECT * FROM read_parquet('${BASE}/xrefs/*.parquet');
-CREATE OR REPLACE VIEW comments   AS SELECT * FROM read_parquet('${BASE}/comments/*.parquet');
-CREATE OR REPLACE VIEW refs       AS SELECT * FROM read_parquet('${BASE}/references/*.parquet');
+CREATE OR REPLACE VIEW comments   AS SELECT * REPLACE (comment::JSON AS comment) FROM read_parquet('${BASE}/comments/*.parquet');
+-- Named "publications" to match UniProt's entry page terminology.
+-- ("references" is also a reserved word in SQL.)
+CREATE OR REPLACE VIEW publications AS SELECT * FROM read_parquet('${BASE}/publications/*.parquet');
 
 
 -- ── Macros for common query patterns ───────────────────────────────────
@@ -48,7 +50,7 @@ CREATE OR REPLACE VIEW refs       AS SELECT * FROM read_parquet('${BASE}/referen
 CREATE OR REPLACE MACRO protein_card(target_acc) AS TABLE (
     SELECT
         e.acc,
-        e.gene_name,
+        e.gene_names[1] AS gene_name,
         e.protein_name,
         e.organism_name,
         e.taxid,
@@ -122,7 +124,7 @@ CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
 CREATE OR REPLACE MACRO entries_with_features(target_taxid) AS TABLE (
     SELECT
         e.acc,
-        e.gene_name,
+        e.gene_names[1] AS gene_name,
         e.protein_name,
         e.reviewed,
         f.type,
@@ -142,7 +144,7 @@ CREATE OR REPLACE MACRO entries_with_features(target_taxid) AS TABLE (
 CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
     SELECT
         e.acc,
-        e.gene_name,
+        e.gene_names[1] AS gene_name,
         e.protein_name,
         e.reviewed,
         x.database,
@@ -165,7 +167,7 @@ CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
 CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
     SELECT
         i.acc,
-        e.gene_name,
+        e.gene_names[1] AS gene_name,
         iso.name.value                  AS isoform_name,
         unnest(iso.isoformIds)          AS isoform_id,
         iso.isoformSequenceStatus       AS sequence_status,
@@ -175,7 +177,7 @@ CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
             acc,
             unnest(
                 from_json(
-                    element_at(comment, 'isoforms')[1]::JSON,
+                    comment->'$.isoforms',
                     '[{"name":{"value":"VARCHAR"},"isoformIds":["VARCHAR"],"isoformSequenceStatus":"VARCHAR","sequenceIds":["VARCHAR"]}]'
                 )
             ) AS iso

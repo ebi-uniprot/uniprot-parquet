@@ -8,7 +8,7 @@
 //   lake/features/features_*.parquet  (one row per feature)
 //   lake/xrefs/xrefs_*.parquet        (one row per cross-reference)
 //   lake/comments/comments_*.parquet  (one row per comment annotation)
-//   lake/references/refs_*.parquet    (one row per citation)
+//   lake/publications/publications_*.parquet  (one row per citation)
 //   lake/manifest.json                (file list, schemas, row counts, sort orders)
 //   validation_report.txt             (12-check production validation)
 //   provenance.json                   (checksums, git commit, row counts)
@@ -34,7 +34,7 @@
 nextflow.enable.dsl = 2
 
 /* ── PARAMS ────────────────────────────────────────────────────────── */
-params.inputfile      = "${projectDir}/entries_test.json"
+params.inputfile      = "${projectDir}/tests/fixtures/small.json.gz"
 params.outdir         = "${projectDir}/results/uniprot_lake"
 params.release        = "2026_01"
 params.process_memory = '96 GB'   // Total memory for heavy processes (Nextflow directive)
@@ -51,7 +51,7 @@ def release_dir = "${params.outdir}/${params.release}"
 import nextflow.util.MemoryUnit
 def proc_bytes    = MemoryUnit.of(params.process_memory).toBytes()
 def duckdb_bytes  = (long)(proc_bytes * params.duckdb_pct / 100)
-def duckdb_memory = "${(int)(duckdb_bytes / (1024*1024*1024))}GB"
+def duckdb_memory = "${Math.round(duckdb_bytes / (1024*1024*1024))}GB"
 
 // Scripts live in bin/ which Nextflow adds to $PATH automatically.
 // This allows the pipeline to run from remote URLs (e.g. GitHub).
@@ -144,7 +144,7 @@ process SORT_JSONL {
 // five table queries read from the staged Parquet — roughly 2× faster than
 // re-parsing JSON for each table.  DuckDB's ORDER BY on entries is nearly
 // a no-op since the input is already in (reviewed DESC, taxid ASC, acc ASC) order.
-// Child tables (features, xrefs, comments, references) still need their own sort
+// Child tables (features, xrefs, comments, publications) still need their own sort
 // after LATERAL unnest, but benefit from the input locality.
 process PARQUET_TRANSFORM {
     tag 'transform'
@@ -152,8 +152,6 @@ process PARQUET_TRANSFORM {
     memory params.process_memory
     time '48h'
     disk '2 TB'          // DuckDB ORDER BY spill + Parquet output
-    errorStrategy 'retry'
-    maxRetries 1
 
     publishDir "${release_dir}", mode: 'copy', pattern: 'lake'
 
@@ -184,15 +182,24 @@ process PARQUET_TRANSFORM {
 /* ── PROCESS: Production validation of the Parquet data lake ─────── */
 // Validates completeness, uniqueness, referential integrity, sort order,
 // round-trip spot checks against the source JSONL, Parquet file integrity,
-// and manifest consistency.  Exits 1 on ANY failure.
-// Uses the sorted JSONL as ground truth (same entries, same count).
+// manifest consistency, and optionally schema evolution against a baseline.
+// Exits 1 on ANY failure.  Uses the sorted JSONL as ground truth (same entries, same count).
+//
+// SCHEMA EVOLUTION GUARD:
+//   To enable schema evolution detection, pass --schema-baseline /path/to/schema_baseline.json
+//   The baseline is a JSON file mapping table names to lists of expected column names:
+//     { "entries": [...], "features": [...], "xrefs": [...], "comments": [...], "publications": [...] }
+//   This catches upstream UniProtKB JSON schema changes (renamed/dropped/new fields).
+//   Example of staging with Nextflow:
+//     params.schema_baseline = "${projectDir}/schema_baseline.json"
+//   Then uncomment the --schema-baseline flag below to enable the check.
 process VALIDATE {
     tag 'validate'
     cpus 2
     memory params.process_memory
     time '4h'
 
-    publishDir "${release_dir}", mode: 'move'
+    publishDir "${release_dir}", mode: 'copy'
 
     input:
     path lake
@@ -203,6 +210,9 @@ process VALIDATE {
     val true,                     emit: validated
 
     script:
+    // Uncomment to enable schema evolution check:
+    // def schema_baseline_flag = params.schema_baseline ? "--schema-baseline ${params.schema_baseline}" : ''
+    def schema_baseline_flag = ''
     """
     set -euo pipefail
     echo " .-- VALIDATE BEGUN \$(date)"
@@ -211,6 +221,7 @@ process VALIDATE {
         --lake ${lake} \
         --jsonl ${sorted_jsonl} \
         --spot-check-n 1000 \
+        ${schema_baseline_flag} \
         -o validation_report.txt
 
     echo " '-- VALIDATE ENDED \$(date)"
@@ -226,7 +237,7 @@ process PROVENANCE {
     cpus 1
     memory '1 GB'
 
-    publishDir "${release_dir}", mode: 'move'
+    publishDir "${release_dir}", mode: 'copy'
 
     input:
     path lake
@@ -269,8 +280,7 @@ workflow {
 
     // Validate inputs
     if (!file(params.inputfile).exists()) {
-        log.error "Input file not found: ${params.inputfile}"
-        System.exit(2)
+        error "Input file not found: ${params.inputfile}"
     }
 
     // 1. Stream input → single zstd-compressed JSONL

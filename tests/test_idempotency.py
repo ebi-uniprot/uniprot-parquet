@@ -14,7 +14,7 @@ import pytest
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 
 EXPECTED_ENTRIES = 44
-TABLE_NAMES = ["entries", "features", "xrefs", "comments", "references"]
+TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications"]
 
 
 def _run_transform(small_jsonl, outdir, extra_args=None):
