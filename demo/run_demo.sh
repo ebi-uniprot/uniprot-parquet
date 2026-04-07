@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # ─── UniProtKB Parquet Data Lake Demo ───────────────────────────
 #
-# Downloads reviewed Drosophila melanogaster entries (~3,800 proteins)
+# Downloads a diverse multi-organism dataset (~5k proteins, reviewed + unreviewed)
 # from UniProtKB and builds a complete Parquet data lake from scratch.
+#
+# The query fetches short proteins (70–75 aa) from five model organisms:
+#   Human, Mouse, Fruit fly, Arabidopsis, and Yeast.
+# This gives a mix of Swiss-Prot and TrEMBL entries across multiple
+# kingdoms (mammals, insects, plants, fungi) — enough to exercise every
+# code path while staying small enough for a quick local demo.
 #
 # Output (all inside demo/):
 #   input.json.gz           Downloaded UniProtKB JSON (kept for re-runs)
 #   lake/2026_01/           Parquet data lake + sorted JSONL + provenance
 #
 # Usage:
-#   cd demo && ./run_demo.sh            # default: Drosophila reviewed
+#   cd demo && ./run_demo.sh            # default
 #   cd demo && ./run_demo.sh --clean    # wipe lake/ and rebuild
 #
 # For the Jupyter notebook (demo.ipynb):
@@ -22,7 +28,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # ─── Configuration ────────────────────────────────────────────────
-QUERY="(organism_id:7227)+AND+(reviewed:true)"   # D. melanogaster Swiss-Prot
+# 5 model organisms: Human (9606), Mouse (10090), Fruit fly (7227),
+#                     Arabidopsis (3702), S. cerevisiae (559292)
+# Length 70–75 aa keeps the download fast while giving ~5k diverse entries.
+QUERY="(organism_id:9606+OR+organism_id:10090+OR+organism_id:7227+OR+organism_id:3702+OR+organism_id:559292)+AND+(length:%5B70+TO+75%5D)"
 RELEASE="2026_01"
 INPUT="input.json.gz"
 LAKE_DIR="lake"
@@ -51,7 +60,7 @@ else
     echo "Downloading from UniProtKB REST API..."
     echo "  Query: $QUERY"
     echo "  URL:   $URL"
-    curl --progress-bar -o "$INPUT" "$URL"
+    curl --globoff --progress-bar -o "$INPUT" "$URL"
     echo "  Saved: $INPUT ($(du -h "$INPUT" | cut -f1) compressed)"
 fi
 

@@ -13,7 +13,7 @@ import pytest
 
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 
-EXPECTED_ENTRIES = 44
+EXPECTED_ENTRIES = 50
 TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications"]
 
 

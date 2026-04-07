@@ -14,10 +14,12 @@ import pytest
 
 
 # ─── Expected values from small.json.gz ──────────────────────────────
-EXPECTED_ENTRIES = 44
-EXPECTED_FEATURES = 1451
-EXPECTED_REVIEWED = 44
-EXPECTED_UNREVIEWED = 0
+# The fixture contains a mix of Swiss-Prot (reviewed) and TrEMBL (unreviewed)
+# entries to exercise both code paths in the pipeline.
+EXPECTED_ENTRIES = 50
+EXPECTED_FEATURES = 1325
+EXPECTED_REVIEWED = 30
+EXPECTED_UNREVIEWED = 20
 
 
 def open_table(lake_dir, table_name):
@@ -239,10 +241,12 @@ class TestDataIntegrity:
         assert arrow.column("acc").null_count == 0
 
     def test_sample_accession_present(self, entries_ds):
-        """Check that a known accession from small.json.gz is in the table."""
+        """Check that known accessions from small.json.gz are in the table."""
         arrow = entries_ds.to_table(columns=["acc"])
         accs = set(arrow.column("acc").to_pylist())
-        assert "A0A1L5YRA2" in accs
+        # One reviewed and one unreviewed accession from the fixture
+        assert "P02538" in accs, "Expected reviewed accession P02538"
+        assert "A0A096MIX7" in accs, "Expected unreviewed accession A0A096MIX7"
 
     def test_entry_type_not_null(self, entries_ds):
         """entry_type preserves the original entryType string for lossless round-trip."""
@@ -276,10 +280,9 @@ class TestDataIntegrity:
 
 
 # ─── Sort order: reviewed DESC, taxid ASC, acc ASC ───────────────
-# Note: small.json.gz contains only reviewed (Swiss-Prot) entries, so
-# the reviewed DESC ordering is trivially satisfied.  The production
-# validator (validate_lake.py) tests the full three-column sort on
-# datasets with both reviewed and unreviewed entries.
+# small.json.gz contains both reviewed (Swiss-Prot) and unreviewed
+# (TrEMBL) entries, so these tests exercise the full three-column
+# sort including the reviewed DESC boundary.
 
 
 class TestSortOrder:

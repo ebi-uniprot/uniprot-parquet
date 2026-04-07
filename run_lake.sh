@@ -46,7 +46,7 @@ case "$MODE" in
         PROFILE="local"
         ;;
     subset)
-        INPUTFILE="~/uniprot100k.json.gz"
+        INPUTFILE="${HOME}/uniprot100k.json.gz"
         OUTDIR="$(pwd)/datalake"
         MEMORY="16GB"
         RELEASE="subset"

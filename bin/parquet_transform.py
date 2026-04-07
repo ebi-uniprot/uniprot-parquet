@@ -156,36 +156,53 @@ def stage_to_parquet(con, read_clause: str, staging_path: str) -> str:
     return f"read_parquet('{safe_path}')"
 
 
-def get_available_columns(con, read_clause: str) -> set[str]:
-    """Discover which top-level columns exist in the data source.
+def discover_schema_paths(staging_path: str) -> set[str]:
+    """Walk the staged Parquet schema and return all valid dotted field paths.
 
-    Used to handle optional fields that may not appear in all datasets
-    (e.g. organismHosts only exists in virus entries).  SQL templates
-    use NULL for columns that don't exist in the current dataset.
+    This is the single source of truth for what fields exist in the dataset.
+    SQL builders use ``path in schema_paths`` to decide whether to reference
+    a nested field or emit NULL.
+
+    The schema comes from PyArrow (which reads the Parquet footer), so it
+    reflects the union schema that DuckDB inferred during staging with
+    sample_size=-1.  This means every field that appears in *any* row is
+    present — the schema is the superset of all rows.
+
+    Examples of paths returned::
+
+        "primaryAccession"
+        "organism.taxonId"
+        "proteinDescription.recommendedName.ecNumbers"
+        "features.ligand.note"
+
+    For LIST<STRUCT> columns (e.g. ``features``), the element struct's
+    fields are listed directly under the list column name — just as DuckDB
+    exposes them after ``LATERAL unnest()``.
     """
-    result = con.sql(f"DESCRIBE SELECT * FROM {read_clause}").fetchall()
-    return {row[0] for row in result}
+    schema = pq.read_schema(staging_path)
 
+    paths: set[str] = set()
 
-def get_struct_subfields(con, read_clause: str, column: str) -> set[str]:
-    """Discover sub-field names inside a top-level STRUCT column.
+    def _walk(field_or_type, prefix: str) -> None:
+        if isinstance(field_or_type, pa.Schema):
+            for field in field_or_type:
+                _walk(field, prefix)
+            return
+        if isinstance(field_or_type, pa.Field):
+            path = f"{prefix}.{field_or_type.name}" if prefix else field_or_type.name
+            paths.add(path)
+            _walk(field_or_type.type, path)
+            return
+        t = field_or_type
+        if isinstance(t, pa.StructType):
+            for i in range(t.num_fields):
+                _walk(t.field(i), prefix)
+        elif isinstance(t, (pa.ListType, pa.LargeListType)):
+            # List element fields are accessible after unnest — keep same prefix.
+            _walk(t.value_type, prefix)
 
-    Used to handle optional nested fields that may not appear in all
-    datasets (e.g. proteinDescription.submittedNames only exists for
-    TrEMBL entries, not Swiss-Prot).
-
-    LIMIT 1 is correct here because this reads from the staged Parquet,
-    which has a uniform struct schema (DuckDB infers it with sample_size=-1
-    during staging, so the schema is the union of all rows).
-    """
-    try:
-        result = con.sql(
-            f"SELECT unnest(struct_keys(t.{column})) AS k "
-            f"FROM (SELECT * FROM {read_clause} LIMIT 1) t"
-        ).fetchall()
-        return {row[0] for row in result}
-    except Exception:
-        return set()
+    _walk(schema, "")
+    return paths
 
 
 def init_duckdb(memory_limit: str, threads: int | None,
@@ -213,49 +230,50 @@ def init_duckdb(memory_limit: str, threads: int | None,
 _OPTIONAL_ENTRY_FIELDS = {"organismHosts", "geneLocations"}
 
 
-def _build_entries_sql(available_cols: set[str], pd_subfields: set[str] | None = None) -> str:
-    """Build the entries SQL with NULLs for any missing optional columns.
+def _build_entries_sql(schema_paths: set[str]) -> str:
+    """Build the entries SQL with NULLs for any fields absent from the schema.
 
-    Parameters
-    ----------
-    available_cols : set[str]
-        Top-level column names present in the data.
-    pd_subfields : set[str], optional
-        Sub-field names inside proteinDescription (e.g. submittedNames).
-        Used to conditionally include nested fields that may not exist
-        in all UniProtKB subsets.
+    ``schema_paths`` is the set of all valid dotted paths discovered from the
+    staged Parquet (see :func:`discover_schema_paths`).  Any path not in the
+    set gets ``NULL`` in the SQL — no BinderException, no matter how exotic
+    the dataset.
     """
-    if pd_subfields is None:
-        pd_subfields = set()
 
-    organism_hosts = (
-        "e.organismHosts" if "organismHosts" in available_cols else "NULL"
-    )
-    gene_locations = (
-        "e.geneLocations" if "geneLocations" in available_cols else "NULL"
-    )
+    def has(path: str) -> bool:
+        return path in schema_paths
+
+    organism_hosts = "e.organismHosts" if has("organismHosts") else "NULL"
+    gene_locations = "e.geneLocations" if has("geneLocations") else "NULL"
 
     # EC numbers: extract from recommended, alternative, and (if present) submitted names.
-    # submittedNames only exists in TrEMBL entries; Swiss-Prot-only datasets lack it.
-    ec_parts = [
-        "list_transform(COALESCE(e.proteinDescription.recommendedName.ecNumbers, []), x -> x.value)",
-        """flatten(list_transform(
+    # Each naming block's struct schema may or may not include ecNumbers depending on the
+    # dataset.  Only include the extraction expression when the field actually exists.
+    ec_parts = []
+    if has("proteinDescription.recommendedName.ecNumbers"):
+        ec_parts.append(
+            "list_transform(COALESCE(e.proteinDescription.recommendedName.ecNumbers, []), x -> x.value)"
+        )
+    if has("proteinDescription.alternativeNames.ecNumbers"):
+        ec_parts.append("""flatten(list_transform(
             COALESCE(e.proteinDescription.alternativeNames, []),
             n -> list_transform(COALESCE(n.ecNumbers, []), x -> x.value)
-        ))""",
-    ]
-    if "submittedNames" in pd_subfields:
+        ))""")
+    if has("proteinDescription.submittedNames.ecNumbers"):
         ec_parts.append("""flatten(list_transform(
             COALESCE(e.proteinDescription.submittedNames, []),
             n -> list_transform(COALESCE(n.ecNumbers, []), x -> x.value)
         ))""")
-    ec_numbers_expr = "list_distinct(flatten([\n        " + ",\n        ".join(ec_parts) + "\n    ]))"
+
+    if ec_parts:
+        ec_numbers_expr = "list_distinct(flatten([\n        " + ",\n        ".join(ec_parts) + "\n    ]))"
+    else:
+        ec_numbers_expr = "CAST([] AS VARCHAR[])"
 
     # protein_name: COALESCE across recommendedName → submittedNames[1] → alternativeNames[1].
     # Swiss-Prot entries have recommendedName; TrEMBL entries typically only have submittedNames.
     # Without this fallback, protein_name is NULL for >99% of the lake (TrEMBL dominates).
     protein_name_parts = ["e.proteinDescription.recommendedName.fullName.value"]
-    if "submittedNames" in pd_subfields:
+    if has("proteinDescription.submittedNames"):
         protein_name_parts.append("e.proteinDescription.submittedNames[1].fullName.value")
     protein_name_parts.append("(list_extract(COALESCE(e.proteinDescription.alternativeNames, []), 1)).fullName.value")
     protein_name_expr = "COALESCE(" + ", ".join(protein_name_parts) + ")"
@@ -357,7 +375,36 @@ ORDER BY reviewed DESC, e.organism.taxonId, e.primaryAccession
 """
 
 
-FEATURES_SQL = """
+def _build_features_sql(schema_paths: set[str]) -> str:
+    """Build features SQL with NULLs for any fields absent from the schema.
+
+    Feature structs may lack ligand, alternativeSequence, evidences, or
+    featureId depending on the dataset.  ``schema_paths`` is checked for
+    every nested reference so the SQL never touches a missing struct key.
+    """
+
+    def has(path: str) -> bool:
+        return path in schema_paths
+
+    feature_id = "unnest.featureId" if has("features.featureId") else "NULL"
+
+    if has("features.evidences"):
+        evidence_codes = """list_transform(
+        COALESCE(unnest.evidences, []),
+        x -> x.evidenceCode
+    )"""
+    else:
+        evidence_codes = "CAST([] AS VARCHAR[])"
+
+    original_seq = "unnest.alternativeSequence.originalSequence" if has("features.alternativeSequence.originalSequence") else "NULL"
+    alt_seqs = "unnest.alternativeSequence.alternativeSequences" if has("features.alternativeSequence.alternativeSequences") else "NULL"
+
+    ligand_name = "unnest.ligand.name" if has("features.ligand.name") else "NULL"
+    ligand_id = "unnest.ligand.id" if has("features.ligand.id") else "NULL"
+    ligand_label = "unnest.ligand.label" if has("features.ligand.label") else "NULL"
+    ligand_note = "unnest.ligand.note" if has("features.ligand.note") else "NULL"
+
+    return f"""
 SELECT
     sub.acc,
     sub.from_reviewed,
@@ -372,20 +419,17 @@ SELECT
     unnest.location.start.modifier                  AS start_modifier,
     unnest.location.end.modifier                    AS end_modifier,
     unnest.description                              AS description,
-    unnest.featureId                                AS feature_id,
+    {feature_id}                                    AS feature_id,
 
-    list_transform(
-        COALESCE(unnest.evidences, []),
-        x -> x.evidenceCode
-    )                                               AS evidence_codes,
+    {evidence_codes}                                AS evidence_codes,
 
-    unnest.alternativeSequence.originalSequence      AS original_sequence,
-    unnest.alternativeSequence.alternativeSequences  AS alternative_sequences,
+    {original_seq}                                  AS original_sequence,
+    {alt_seqs}                                      AS alternative_sequences,
 
-    unnest.ligand.name                              AS ligand_name,
-    unnest.ligand.id                                AS ligand_id,
-    unnest.ligand.label                             AS ligand_label,
-    unnest.ligand.note                              AS ligand_note,
+    {ligand_name}                                   AS ligand_name,
+    {ligand_id}                                     AS ligand_id,
+    {ligand_label}                                  AS ligand_label,
+    {ligand_note}                                   AS ligand_note,
 
     -- Full original nested struct (lossless round-trip)
     unnest                                          AS feature
@@ -399,7 +443,7 @@ FROM (
         e.organism.scientificName                    AS organism_name,
         CAST(e.sequence.length AS INTEGER)           AS seq_length,
         e.features
-    FROM {read_clause} e
+    FROM {{read_clause}} e
     WHERE e.features IS NOT NULL AND len(e.features) > 0
 ) sub, LATERAL unnest(sub.features)
 ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc, unnest.location.start.value
@@ -513,10 +557,10 @@ ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc, unnest.citation.citationTyp
 # ─── Table definitions ──────────────────────────────────────────────────
 
 TABLE_DEFS = [
-    ("entries",    None,            ["reviewed DESC", "taxid ASC", "acc ASC"]),  # SQL built dynamically
-    ("features",   FEATURES_SQL,   ["from_reviewed DESC", "taxid ASC", "acc ASC", "start_pos ASC"]),
-    ("xrefs",      XREFS_SQL,      ["from_reviewed DESC", "taxid ASC", "acc ASC", "database ASC"]),
-    ("comments",   COMMENTS_SQL,   ["from_reviewed DESC", "taxid ASC", "acc ASC", "comment_type ASC"]),
+    ("entries",      None,            ["reviewed DESC", "taxid ASC", "acc ASC"]),       # SQL built dynamically
+    ("features",     None,            ["from_reviewed DESC", "taxid ASC", "acc ASC", "start_pos ASC"]),  # SQL built dynamically
+    ("xrefs",        XREFS_SQL,      ["from_reviewed DESC", "taxid ASC", "acc ASC", "database ASC"]),
+    ("comments",     COMMENTS_SQL,   ["from_reviewed DESC", "taxid ASC", "acc ASC", "comment_type ASC"]),
     ("publications", REFERENCES_SQL, ["from_reviewed DESC", "taxid ASC", "acc ASC", "citation_type ASC"]),
 ]
 
@@ -826,16 +870,26 @@ def main():
             eprint("\n--- PARQUET STAGING (skipped — all tables already written) ---")
             read_clause = json_read_clause
 
-        # ── Discover available columns (for optional field handling) ──
-        available_cols = get_available_columns(con, read_clause)
-        missing_optional = _OPTIONAL_ENTRY_FIELDS - available_cols
+        # ── Discover schema (single source of truth for all SQL generation) ──
+        # Only needed when we have tables to write (staging must have occurred).
+        if tables_to_write:
+            schema_paths = discover_schema_paths(staging_path)
+            eprint(f"  Schema: {len(schema_paths)} field paths discovered")
+        else:
+            schema_paths = set()
+
+        # Log notable absent fields for diagnostics
+        missing_optional = _OPTIONAL_ENTRY_FIELDS - {p for p in schema_paths if "." not in p}
         if missing_optional:
             eprint(f"  Optional fields not in data (will be NULL): {', '.join(sorted(missing_optional))}")
-
-        # Discover proteinDescription sub-fields (submittedNames is absent in Swiss-Prot-only datasets)
-        pd_subfields = get_struct_subfields(con, read_clause, "proteinDescription") if "proteinDescription" in available_cols else set()
-        if "submittedNames" not in pd_subfields:
+        if "proteinDescription.submittedNames" not in schema_paths:
             eprint("  Note: proteinDescription.submittedNames absent (normal for Swiss-Prot-only data)")
+        ec_sources = [s for s in ["recommendedName", "alternativeNames", "submittedNames"]
+                      if f"proteinDescription.{s}.ecNumbers" in schema_paths]
+        if ec_sources:
+            eprint(f"  EC numbers found in: {', '.join(ec_sources)}")
+        else:
+            eprint("  Note: no ecNumbers in any naming block (ec_numbers column will be empty)")
 
         # ── Write tables ──
         t_total = time.time()
@@ -868,9 +922,13 @@ def main():
                     "column_categories": meta.get("columns", {}),
                 }
             else:
-                # Entries SQL is built dynamically to handle optional fields
-                if sql_template is None:
-                    sql_template = _build_entries_sql(available_cols, pd_subfields)
+                # Entries and features SQL are built dynamically to handle optional fields.
+                # schema_paths is the single source of truth — no field is referenced
+                # without first checking that it exists in the staged Parquet schema.
+                if sql_template is None and name == "entries":
+                    sql_template = _build_entries_sql(schema_paths)
+                elif sql_template is None and name == "features":
+                    sql_template = _build_features_sql(schema_paths)
                 sql = sql_template.format(read_clause=read_clause)
                 row_count, files, arrow_schema = stream_to_parquet(
                     con, sql, table_dir, args.batch_size, label=name, sort_order=sort_order

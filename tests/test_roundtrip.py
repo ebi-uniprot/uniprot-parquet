@@ -467,7 +467,9 @@ class TestConvenienceColumns:
                 for g in (orig.get("genes") or [])
                 if g.get("geneName", {}).get("value")
             ]
-            lake_genes = lake.get("gene_names") or []
+            # The SQL list_transform produces NULL for genes without geneName;
+            # filter those out for comparison.
+            lake_genes = [g for g in (lake.get("gene_names") or []) if g is not None]
             assert set(orig_genes) == set(lake_genes), (
                 f"{acc}: gene_names mismatch: {orig_genes} vs {lake_genes}"
             )
