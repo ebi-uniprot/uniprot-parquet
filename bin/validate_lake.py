@@ -110,24 +110,23 @@ def count_rows(dataset):
 # ─── JSONL ground truth helpers ────────────────────────────────────────
 
 def count_jsonl_lines(jsonl_path: str) -> int:
-    """Count lines in a JSONL(.zst) file without loading into memory."""
+    """Count lines in a JSONL(.zst) file without loading into memory.
+
+    Counts newline characters in the stream.  A trailing newline (the
+    normal case) does not produce an extra count because the empty
+    string after it is never counted as a line.
+    """
     count = 0
     if jsonl_path.endswith(".zst"):
         import zstandard as zstd
         dctx = zstd.ZstdDecompressor()
         with open(jsonl_path, "rb") as f:
             with dctx.stream_reader(f) as reader:
-                buf = b""
                 while True:
                     chunk = reader.read(16 * 1024 * 1024)  # 16 MB chunks
                     if not chunk:
-                        if buf:
-                            count += 1  # last line without trailing newline
                         break
-                    buf += chunk
-                    lines = buf.split(b"\n")
-                    count += len(lines) - 1
-                    buf = lines[-1]
+                    count += chunk.count(b"\n")
     else:
         with open(jsonl_path, "rb") as f:
             for _ in f:
@@ -344,28 +343,44 @@ def check_null_keys(report, lake_dir):
 
 
 def check_referential_integrity(report, lake_dir, entries_accs):
-    """Verify every acc in child tables exists in entries."""
+    """Verify every acc in child tables exists in entries.
+
+    Uses DuckDB anti-joins instead of Python iteration for scalability
+    (the xrefs table can exceed 16B rows at production scale).
+    """
     report.checks.append("\n--- 4. REFERENTIAL INTEGRITY ---")
     eprint("\n--- 4. REFERENTIAL INTEGRITY ---")
     eprint(f"  Using entry acc set: {len(entries_accs):,} accessions")
 
+    import duckdb
+    entries_path = os.path.join(lake_dir, "entries", "*.parquet")
+
     for child_name in ["features", "xrefs", "comments", "publications"]:
-        child_ds = open_table(lake_dir, child_name)
-        orphans = set()
-
-        for batch in child_ds.to_batches(columns=["acc"]):
-            for acc in batch.column("acc").to_pylist():
-                if acc not in entries_accs:
-                    orphans.add(acc)
-
-        report.check(
-            f"all {child_name}.acc exist in entries",
-            len(orphans) == 0,
-            f"{len(orphans):,} orphan accessions" if orphans else ""
-        )
-        if orphans:
-            examples = sorted(orphans)[:5]
-            report.checks.append(f"    orphan examples: {examples}")
+        child_path = os.path.join(lake_dir, child_name, "*.parquet")
+        t0 = time.time()
+        try:
+            result = duckdb.sql(f"""
+                SELECT DISTINCT c.acc
+                FROM read_parquet('{child_path}') c
+                LEFT JOIN read_parquet('{entries_path}') e ON c.acc = e.acc
+                WHERE e.acc IS NULL
+                LIMIT 100
+            """).fetchall()
+            orphans = [row[0] for row in result]
+            elapsed = time.time() - t0
+            report.check(
+                f"all {child_name}.acc exist in entries",
+                len(orphans) == 0,
+                f"{len(orphans):,}+ orphan accessions ({elapsed:.1f}s)" if orphans else f"({elapsed:.1f}s)"
+            )
+            if orphans:
+                report.checks.append(f"    orphan examples: {orphans[:5]}")
+        except Exception as e:
+            report.check(
+                f"all {child_name}.acc exist in entries",
+                False,
+                f"DuckDB error: {e}"
+            )
 
 
 def check_sort_order(report, lake_dir):
@@ -640,59 +655,48 @@ def check_manifest(report, lake_dir):
 
 
 def check_denormalized_sync(report, lake_dir):
-    """Verify that denormalized parent columns in child tables match entries."""
+    """Verify that denormalized parent columns in child tables match entries.
+
+    Uses DuckDB joins instead of Python dicts for scalability (entries alone
+    is ~250M rows; materializing a Python dict would need ~25 GB heap).
+    """
     report.checks.append("\n--- 9. DENORMALIZED COLUMN SYNC ---")
     eprint("\n--- 9. DENORMALIZED COLUMN SYNC ---")
 
-    # Build lookup: acc → (reviewed, taxid) from entries
-    entries_ds = open_table(lake_dir, "entries")
-    entry_lookup = {}
-    for batch in entries_ds.to_batches(columns=["acc", "reviewed", "taxid"]):
-        accs = batch.column("acc").to_pylist()
-        revs = batch.column("reviewed").to_pylist()
-        taxids = batch.column("taxid").to_pylist()
-        for i, acc in enumerate(accs):
-            entry_lookup[acc] = (revs[i], taxids[i])
+    import duckdb
+    entries_path = os.path.join(lake_dir, "entries", "*.parquet")
 
     for child_name in ["features", "xrefs", "comments", "publications"]:
-        child_ds = open_table(lake_dir, child_name)
-        taxid_mismatches = 0
-        reviewed_mismatches = 0
-        mismatch_examples = []
+        child_path = os.path.join(lake_dir, child_name, "*.parquet")
+        t0 = time.time()
+        try:
+            result = duckdb.sql(f"""
+                SELECT
+                    count(*) FILTER (WHERE c.taxid != e.taxid) AS taxid_mismatches,
+                    count(*) FILTER (WHERE c.from_reviewed != e.reviewed) AS reviewed_mismatches
+                FROM read_parquet('{child_path}') c
+                JOIN read_parquet('{entries_path}') e ON c.acc = e.acc
+            """).fetchone()
+            taxid_mismatches = result[0]
+            reviewed_mismatches = result[1]
+            elapsed = time.time() - t0
 
-        for batch in child_ds.to_batches(
-            columns=["acc", "from_reviewed", "taxid"]
-        ):
-            accs = batch.column("acc").to_pylist()
-            revs = batch.column("from_reviewed").to_pylist()
-            taxids = batch.column("taxid").to_pylist()
-            for i, acc in enumerate(accs):
-                parent = entry_lookup.get(acc)
-                if parent is None:
-                    continue  # orphan — caught by referential integrity check
-                if taxids[i] != parent[1]:
-                    taxid_mismatches += 1
-                    if len(mismatch_examples) < 3:
-                        mismatch_examples.append(
-                            f"{acc}: child taxid={taxids[i]}, "
-                            f"parent taxid={parent[1]}"
-                        )
-                if revs[i] != parent[0]:
-                    reviewed_mismatches += 1
-
-        report.check(
-            f"{child_name}.taxid matches entries.taxid",
-            taxid_mismatches == 0,
-            f"{taxid_mismatches:,} mismatches" if taxid_mismatches else ""
-        )
-        report.check(
-            f"{child_name}.from_reviewed matches entries.reviewed",
-            reviewed_mismatches == 0,
-            f"{reviewed_mismatches:,} mismatches" if reviewed_mismatches else ""
-        )
-        if mismatch_examples:
-            for ex in mismatch_examples:
-                report.checks.append(f"    {ex}")
+            report.check(
+                f"{child_name}.taxid matches entries.taxid",
+                taxid_mismatches == 0,
+                f"{taxid_mismatches:,} mismatches ({elapsed:.1f}s)" if taxid_mismatches else f"({elapsed:.1f}s)"
+            )
+            report.check(
+                f"{child_name}.from_reviewed matches entries.reviewed",
+                reviewed_mismatches == 0,
+                f"{reviewed_mismatches:,} mismatches" if reviewed_mismatches else ""
+            )
+        except Exception as e:
+            report.check(
+                f"{child_name} denormalized sync",
+                False,
+                f"DuckDB error: {e}"
+            )
 
 
 def check_sequence_integrity(report, lake_dir):

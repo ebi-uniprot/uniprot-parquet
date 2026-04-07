@@ -173,6 +173,10 @@ def get_struct_subfields(con, read_clause: str, column: str) -> set[str]:
     Used to handle optional nested fields that may not appear in all
     datasets (e.g. proteinDescription.submittedNames only exists for
     TrEMBL entries, not Swiss-Prot).
+
+    LIMIT 1 is correct here because this reads from the staged Parquet,
+    which has a uniform struct schema (DuckDB infers it with sample_size=-1
+    during staging, so the schema is the union of all rows).
     """
     try:
         result = con.sql(
@@ -247,6 +251,15 @@ def _build_entries_sql(available_cols: set[str], pd_subfields: set[str] | None =
         ))""")
     ec_numbers_expr = "list_distinct(flatten([\n        " + ",\n        ".join(ec_parts) + "\n    ]))"
 
+    # protein_name: COALESCE across recommendedName → submittedNames[1] → alternativeNames[1].
+    # Swiss-Prot entries have recommendedName; TrEMBL entries typically only have submittedNames.
+    # Without this fallback, protein_name is NULL for >99% of the lake (TrEMBL dominates).
+    protein_name_parts = ["e.proteinDescription.recommendedName.fullName.value"]
+    if "submittedNames" in pd_subfields:
+        protein_name_parts.append("e.proteinDescription.submittedNames[1].fullName.value")
+    protein_name_parts.append("(list_extract(COALESCE(e.proteinDescription.alternativeNames, []), 1)).fullName.value")
+    protein_name_expr = "COALESCE(" + ", ".join(protein_name_parts) + ")"
+
     return f"""
 SELECT
     -- Identity
@@ -272,7 +285,7 @@ SELECT
         COALESCE(e.genes, []),
         g -> list_transform(COALESCE(g.synonyms, []), s -> s.value)
     ))                                              AS gene_synonyms,
-    e.proteinDescription.recommendedName.fullName.value AS protein_name,
+    {protein_name_expr}                                AS protein_name,
     -- Alternative protein names (searchable list)
     list_transform(
         COALESCE(e.proteinDescription.alternativeNames, []),

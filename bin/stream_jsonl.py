@@ -81,7 +81,9 @@ def main():
                 print(f"  stream_jsonl: SKIPPED entry {acc}: {e}",
                       file=sys.stderr)
     except BrokenPipeError:
-        pass
+        print(f"  stream_jsonl: FATAL — BrokenPipeError after {count:,} entries "
+              f"(downstream consumer died)", file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         pass
     except Exception as e:

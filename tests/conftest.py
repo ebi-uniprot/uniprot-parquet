@@ -1,4 +1,8 @@
-"""Shared fixtures for UniProtKB Parquet data lake tests."""
+"""Shared fixtures for UniProtKB Parquet data lake tests.
+
+Run locally with: pytest tests/ -v
+No CI/CD pipeline yet — tests are run manually before committing.
+"""
 
 import os
 import sys

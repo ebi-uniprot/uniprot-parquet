@@ -16,7 +16,7 @@ Each release lands in its own directory (`<outdir>/<release>/`):
 | `lake/manifest.json`                   | File list, schemas, row counts, sort orders, semantic metadata |
 | `sorted.jsonl.zst`                     | JSONL archive sorted by review status, taxid, then accession   |
 | `provenance.json`                      | Provenance record (checksums, git commit, row counts)          |
-| `validation_report.txt`                | 8-check production validation (see below)                      |
+| `validation_report.txt`                | 12-check production validation (see below)                     |
 
 All five tables are sorted by Swiss-Prot first (`reviewed`/`from_reviewed DESC`), then `taxid ASC`, then `acc ASC`. The boolean column is called `reviewed` on the entries table and `from_reviewed` on child tables (features, xrefs, comments, publications) to clarify that it's inherited from the parent entry, not an independent review status.
 
@@ -81,20 +81,38 @@ SELECT * FROM entries_with_xrefs(9606, ['PDB', 'Ensembl']);
 SELECT * FROM unnest_isoforms('P04637');
 ```
 
-### Direct access (no setup file)
+### Direct access (no setup file needed)
 
-You can also query the Parquet files directly without any setup:
+The lake is plain Parquet files in directories — any engine that reads Parquet works out of the box, no DuckDB or `uniprot_lake.py` required:
 
 ```python
-# DuckDB
-con.sql("SELECT * FROM read_parquet('lake/entries/*.parquet') WHERE taxid = 9606")
-
 # Polars
-pl.scan_parquet("lake/entries/*.parquet").filter(pl.col("taxid") == 9606)
+import polars as pl
+df = pl.scan_parquet("lake/entries/*.parquet").filter(pl.col("taxid") == 9606).collect()
 
-# pandas via PyArrow
-pd.read_parquet("lake/entries/", filters=[("taxid", "==", 9606)])
+# pandas / PyArrow
+import pandas as pd
+df = pd.read_parquet("lake/entries/", filters=[("taxid", "==", 9606)])
+
+# DuckDB (standalone, no setup_views.sql)
+import duckdb
+duckdb.sql("SELECT * FROM read_parquet('lake/entries/*.parquet') WHERE taxid = 9606")
 ```
+
+```r
+# R (arrow)
+library(arrow)
+ds <- open_dataset("lake/entries/")
+ds |> filter(taxid == 9606) |> select(acc, protein_name, seq_length) |> collect()
+```
+
+```python
+# PySpark
+df = spark.read.parquet("lake/entries/")
+df.filter(df.taxid == 9606).show()
+```
+
+All tables are sorted by `(reviewed DESC, taxid ASC, acc ASC)` with Parquet row-group min/max statistics, so predicate pushdown works automatically — engines skip irrelevant row groups without any configuration.
 
 ### Metadata
 
@@ -175,7 +193,7 @@ nextflow run upjson2lake.nf -profile prod \
 
 | Parameter          | Default                | Description                                                                                |
 | ------------------ | ---------------------- | ------------------------------------------------------------------------------------------ |
-| `--inputfile`      | `entries_test.json`    | Input UniProtKB JSON(.gz) file                                                             |
+| `--inputfile`      | `tests/fixtures/small.json.gz` | Input UniProtKB JSON(.gz) file                                                      |
 | `--outdir`         | `results/uniprot_lake` | Output base directory                                                                      |
 | `--release`        | `2026_01`              | Release label (output goes to `<outdir>/<release>/`)                                       |
 | `--process_memory` | `96 GB`                | Memory for heavy processes (DuckDB gets 75% of this)                                       |
@@ -213,9 +231,9 @@ UniProtKB.json.gz
 +--------+-----------+   (JSONL staged to Parquet once, then 5 fast reads)
          |
          v
-+----------+   8 checks: completeness, uniqueness, null keys,
++----------+   12 checks: completeness, uniqueness, null keys,
 | VALIDATE |   referential integrity, sort order, round-trip,
-+----+-----+   Parquet integrity, manifest consistency
++----+-----+   Parquet integrity, manifest, denorm sync, seq, coords, types
      |
      v
 +------------+   Checksums, git commit, row counts
@@ -253,22 +271,26 @@ Before running the full ~250M-entry UniProtKB dataset:
 
 ## Production validation
 
-The `VALIDATE` step runs 8 checks against the source JSONL as ground truth. All checks use bounded-memory streaming. Any single failure exits 1 and blocks the provenance manifest:
+The `VALIDATE` step runs 12 checks against the source JSONL as ground truth. All checks use bounded-memory streaming or DuckDB joins (no Python dicts for billion-row tables). Any single failure exits 1 and blocks the provenance manifest:
 
 1. **Completeness** — JSONL line count == entries rows; child table counts match `sum(entries.*_count)`
 2. **Uniqueness** — `entries.acc` has zero duplicates
-3. **Null keys** — `acc`, `reviewed`/`from_reviewed`, `taxid` never null across all tables
-4. **Referential integrity** — every `acc` in features/xrefs/comments/publications exists in entries
+3. **Null keys and empty strings** — `acc`, `reviewed`/`from_reviewed`, `taxid` never null; identity columns never empty
+4. **Referential integrity** — every `acc` in child tables exists in entries (DuckDB anti-join)
 5. **Sort order** — all tables sorted by `(reviewed/from_reviewed DESC, taxid ASC, acc ASC)`
 6. **Round-trip spot check** — 1000 reservoir-sampled entries verified field-by-field against JSONL
 7. **Parquet file integrity** — every `.parquet` file in the lake is readable
 8. **Manifest consistency** — `manifest.json` file list matches actual files on disk
+9. **Denormalized column sync** — `taxid` and `from_reviewed` in child tables match entries (DuckDB join)
+10. **Sequence integrity** — `len(sequence) == seq_length` for every entry; no zero-length sequences
+11. **Feature coordinate boundaries** — `start_pos <= end_pos` where both are non-null
+12. **Schema type protection** — critical columns have expected Arrow types (not silently cast by inference)
 
 ## Schema design
 
 We adopt a **denormalized-first + full nested** design. Each table has two layers:
 
-1. **Flattened convenience columns** (e.g. `gene_names`, `gene_synonyms`, `ec_numbers`, `go_ids`) — cover the 90% use case with simple SQL. These provide complete data: `gene_names` is an array of all gene primary names, `ec_numbers` include all naming blocks (recommended, alternative, submitted), and `go_ids` are IDs without aspect/evidence.
+1. **Flattened convenience columns** (e.g. `gene_names`, `gene_synonyms`, `ec_numbers`, `go_ids`) — cover the 90% use case with simple SQL. These provide complete data: `gene_names` is an array of all gene primary names, `protein_name` falls back from `recommendedName` to `submittedNames[1]` to `alternativeNames[1]` (so TrEMBL entries always have a name), `ec_numbers` include all naming blocks (recommended, alternative, submitted), and `go_ids` are IDs without aspect/evidence (full GO annotations with aspect and evidence codes are in the `xrefs` table where `database = 'GO'`).
 2. **Full nested structures** (e.g. `genes`, `protein_desc`, `comment`, `feature`, `reference`) — preserve all upstream data for power users and lossless JSONL reconstruction. DuckDB's struct/list syntax makes these queryable without ETL.
 
 No UniProtKB data is discarded. Users needing isoforms, GO aspects, EC numbers from alternative names, multi-paragraph comments, or evidence codes can always query the nested columns.
@@ -281,7 +303,7 @@ All five tables are sorted by Swiss-Prot first, then `taxid ASC`, then `acc ASC`
 
 - Identity: `acc`, `id`, `reviewed`, `secondary_accs`, `entry_type`
 - Organism: `taxid`, `organism_name`, `organism_common`, `lineage`
-- Gene/protein: `gene_names`, `gene_synonyms`, `protein_name`, `alt_protein_names`, `protein_flag`, `ec_numbers`, `protein_existence`, `annotation_score`
+- Gene/protein: `gene_names`, `gene_synonyms`, `protein_name` (falls back to submittedName for TrEMBL entries), `alt_protein_names`, `protein_flag`, `ec_numbers`, `protein_existence`, `annotation_score`
 - Sequence: `sequence`, `seq_length`, `seq_mass`, `seq_md5`, `seq_crc64`
 - Shortcuts: `go_ids`, `xref_dbs`, `keyword_ids`, `keyword_names`
 - Versioning: `first_public`, `last_modified`, `last_seq_modified`, `entry_version`, `seq_version`

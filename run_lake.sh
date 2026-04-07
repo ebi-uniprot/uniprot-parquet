@@ -7,6 +7,14 @@
 #   ./run_lake.sh full --expected-count 248799253 --input /path/to/UniProtKB.json.gz
 #   ./run_lake.sh full --expected-count 248799253 --outdir /scratch/results
 
+# Prerequisites:
+#   Activate your conda/mamba environment before running this script.
+#   On SLURM, the active environment carries to compute nodes automatically.
+#   No container or Nextflow conda directive is used — this is intentional:
+#   it avoids conda resolution overhead on every run and version-pinning
+#   differences between Nextflow's conda integration and your local env.
+#   Add a Dockerfile/Singularity definition when moving to scheduled production.
+
 set -euo pipefail
 
 MODE="${1:-small}"
