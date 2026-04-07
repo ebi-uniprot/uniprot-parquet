@@ -46,12 +46,9 @@ params.expected_count = null      // Expected entry count (from UniProt release 
 // Final output directory: <outdir>/<release>/
 def release_dir = "${params.outdir}/${params.release}"
 
-// Compute DuckDB memory limit as a fraction of process memory, leaving headroom
-// for the Python interpreter, PyArrow heap, and JSON parsing overhead.
-import nextflow.util.MemoryUnit
-def proc_bytes    = MemoryUnit.of(params.process_memory).toBytes()
-def duckdb_bytes  = (long)(proc_bytes * params.duckdb_pct / 100)
-def duckdb_memory = "${Math.round(duckdb_bytes / (1024*1024*1024))}GB"
+// DuckDB memory is computed inside each process script block (not here) so that
+// it reacts to task.memory on retry — when Nextflow doubles the allocation after
+// an OOM, DuckDB's buffer pool scales up with it.
 
 // Scripts live in bin/ which Nextflow adds to $PATH automatically.
 // This allows the pipeline to run from remote URLs (e.g. GitHub).
@@ -128,9 +125,11 @@ process SORT_JSONL {
     set -euo pipefail
     echo " .-- SORT_JSONL BEGUN \$(date)"
 
+    DUCKDB_MEM="\$(python3 -c "print(str(int(${task.memory.toBytes()} * ${params.duckdb_pct} / 100 / 1073741824)) + 'GB')")"
+
     sort_jsonl.py ${jsonl} \
         -o sorted.jsonl.zst \
-        --memory-limit ${duckdb_memory} \
+        --memory-limit \${DUCKDB_MEM} \
         --threads ${task.cpus} \
         ${params.duckdb_temp ? "--temp-dir ${params.duckdb_temp}" : ''}
 
@@ -146,6 +145,14 @@ process SORT_JSONL {
 // a no-op since the input is already in (reviewed DESC, taxid ASC, acc ASC) order.
 // Child tables (features, xrefs, comments, publications) still need their own sort
 // after LATERAL unnest, but benefit from the input locality.
+//
+// NOTE on --skip-existing and retries:
+//   --skip-existing is useful for manual re-runs (e.g. fix root cause, then
+//   `nextflow run ... -resume`).  It does NOT help with automatic retries
+//   because Nextflow provisions a fresh work directory per attempt — partial
+//   outputs from a failed attempt are not visible to the retry.  This is a
+//   known limitation; splitting into per-table processes would fix it but
+//   adds significant complexity for a rare failure mode.
 process PARQUET_TRANSFORM {
     tag 'transform'
     cpus 4
@@ -166,9 +173,11 @@ process PARQUET_TRANSFORM {
     set -euo pipefail
     echo " .-- PARQUET_TRANSFORM BEGUN \$(date)"
 
+    DUCKDB_MEM="\$(python3 -c "print(str(int(${task.memory.toBytes()} * ${params.duckdb_pct} / 100 / 1073741824)) + 'GB')")"
+
     parquet_transform.py ${sorted_jsonl} \
         --outdir ./lake \
-        --memory-limit ${duckdb_memory} \
+        --memory-limit \${DUCKDB_MEM} \
         --threads ${task.cpus} \
         --release ${params.release} \
         --skip-existing \
@@ -185,14 +194,17 @@ process PARQUET_TRANSFORM {
 // manifest consistency, and optionally schema evolution against a baseline.
 // Exits 1 on ANY failure.  Uses the sorted JSONL as ground truth (same entries, same count).
 //
-// SCHEMA EVOLUTION GUARD:
-//   To enable schema evolution detection, pass --schema-baseline /path/to/schema_baseline.json
-//   The baseline is a JSON file mapping table names to lists of expected column names:
-//     { "entries": [...], "features": [...], "xrefs": [...], "comments": [...], "publications": [...] }
-//   This catches upstream UniProtKB JSON schema changes (renamed/dropped/new fields).
-//   Example of staging with Nextflow:
-//     params.schema_baseline = "${projectDir}/schema_baseline.json"
-//   Then uncomment the --schema-baseline flag below to enable the check.
+// SCHEMA EVOLUTION GUARD (intentionally disabled):
+//   A schema_baseline.json exists in the repo and validate_lake.py supports
+//   --schema-baseline, but the check is deliberately not wired in.
+//   Reason: if UniProt changes their JSON schema, it's already in production —
+//   failing the pipeline doesn't help; we need to adapt our SQL templates.
+//   Renamed fields break the SQL directly (DuckDB BinderError), dropped fields
+//   are handled by the optional-fields mechanism (NULLed out), and new fields
+//   are picked up automatically by read_json_auto.  The one case it could
+//   catch (silent type changes) isn't detected by the baseline anyway, since
+//   it only compares column names, not types.
+//   For cross-release change tracking, compare manifest.json files instead.
 process VALIDATE {
     tag 'validate'
     cpus 2
@@ -210,8 +222,7 @@ process VALIDATE {
     val true,                     emit: validated
 
     script:
-    // Uncomment to enable schema evolution check:
-    // def schema_baseline_flag = params.schema_baseline ? "--schema-baseline ${params.schema_baseline}" : ''
+    // Schema evolution check deliberately disabled — see comment above VALIDATE process.
     def schema_baseline_flag = ''
     """
     set -euo pipefail
@@ -272,7 +283,7 @@ workflow {
     ╚${bar}╝
     Input:      ${params.inputfile}
     Output:     ${release_dir}
-    DuckDB mem: ${duckdb_memory} (${params.duckdb_pct}% of ${params.process_memory})
+    DuckDB mem: ${params.duckdb_pct}% of task.memory (scales on retry)
     DuckDB tmp: ${params.duckdb_temp ?: '(default: \$TMPDIR or /tmp)'}
     Expected:   ${params.expected_count ?: '(not set — post-hoc verification only)'}
     ${'─' * (W + 2)}
