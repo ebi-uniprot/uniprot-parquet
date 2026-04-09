@@ -259,30 +259,30 @@ def check_completeness(report, lake_dir, jsonl_count):
 
 
 def check_uniqueness(report, lake_dir):
-    """Verify entries.acc has no duplicates.  Returns the acc set."""
+    """Verify entries.acc has no duplicates.  Returns (total, unique_count).
+
+    Uses DuckDB aggregation instead of materializing 250M accessions into a
+    Python set (~2.5 GB heap), which would pressure the GC and starve
+    downstream DuckDB queries of memory.
+    """
     report.checks.append("\n--- 2. UNIQUENESS ---")
     eprint("\n--- 2. UNIQUENESS ---")
 
-    entries_ds = open_table(lake_dir, "entries")
-    seen = set()
-    total = 0
-    dupes = 0
-
-    for batch in entries_ds.to_batches(columns=["acc"]):
-        accs = batch.column("acc").to_pylist()
-        total += len(accs)
-        for acc in accs:
-            if acc in seen:
-                dupes += 1
-            else:
-                seen.add(acc)
+    import duckdb
+    entries_path = os.path.join(lake_dir, "entries", "*.parquet")
+    row = duckdb.sql(f"""
+        SELECT count(*) AS total, count(DISTINCT acc) AS unique_count
+        FROM read_parquet('{entries_path}')
+    """).fetchone()
+    total, unique_count = row
+    dupes = total - unique_count
 
     report.check(
         "entries.acc is unique (no duplicates)",
         dupes == 0,
-        f"total={total:,}, unique={len(seen):,}, dupes={dupes:,}"
+        f"total={total:,}, unique={unique_count:,}, dupes={dupes:,}"
     )
-    return seen
+    return total, unique_count
 
 
 def check_null_keys(report, lake_dir):
@@ -342,7 +342,7 @@ def check_null_keys(report, lake_dir):
             )
 
 
-def check_referential_integrity(report, lake_dir, entries_accs):
+def check_referential_integrity(report, lake_dir, entry_count):
     """Verify every acc in child tables exists in entries.
 
     Uses DuckDB anti-joins instead of Python iteration for scalability
@@ -350,7 +350,7 @@ def check_referential_integrity(report, lake_dir, entries_accs):
     """
     report.checks.append("\n--- 4. REFERENTIAL INTEGRITY ---")
     eprint("\n--- 4. REFERENTIAL INTEGRITY ---")
-    eprint(f"  Using entry acc set: {len(entries_accs):,} accessions")
+    eprint(f"  Entries: {entry_count:,} unique accessions")
 
     import duckdb
     entries_path = os.path.join(lake_dir, "entries", "*.parquet")
@@ -527,29 +527,30 @@ def check_round_trip(report, lake_dir, jsonl_path, n):
             "reference_count": reference_count,
         }
 
-    # Read matching entries from lake
-    entries_ds = open_table(lake_dir, "entries")
-    fields = ["acc", "taxid", "seq_length", "feature_count",
-              "xref_count", "comment_count", "reference_count"]
+    # Read matching entries from lake via DuckDB (avoids scanning all 250M rows in Python)
+    import duckdb
+    entries_path = os.path.join(lake_dir, "entries", "*.parquet")
+    acc_list = list(jsonl_lookup.keys())
     lake_lookup = {}
-    for batch in entries_ds.to_batches(columns=fields):
-        accs = batch.column("acc").to_pylist()
-        taxids = batch.column("taxid").to_pylist()
-        seq_lens = batch.column("seq_length").to_pylist()
-        fc = batch.column("feature_count").to_pylist()
-        xc = batch.column("xref_count").to_pylist()
-        cc = batch.column("comment_count").to_pylist()
-        rc = batch.column("reference_count").to_pylist()
-        for i, acc in enumerate(accs):
-            if acc in jsonl_lookup:
-                lake_lookup[acc] = {
-                    "taxid": taxids[i],
-                    "seq_length": seq_lens[i],
-                    "feature_count": fc[i],
-                    "xref_count": xc[i],
-                    "comment_count": cc[i],
-                    "reference_count": rc[i],
-                }
+    try:
+        rows = duckdb.sql(f"""
+            SELECT acc, taxid, seq_length, feature_count,
+                   xref_count, comment_count, reference_count
+            FROM read_parquet('{entries_path}')
+            WHERE acc IN ({','.join("'" + a.replace("'", "''") + "'" for a in acc_list)})
+        """).fetchall()
+        for row in rows:
+            lake_lookup[row[0]] = {
+                "taxid": row[1],
+                "seq_length": row[2],
+                "feature_count": row[3],
+                "xref_count": row[4],
+                "comment_count": row[5],
+                "reference_count": row[6],
+            }
+    except Exception as e:
+        report.check("round-trip lake lookup", False, f"DuckDB error: {e}")
+        return
 
     missing = set(jsonl_lookup.keys()) - set(lake_lookup.keys())
     report.check(
@@ -894,11 +895,6 @@ def check_schema_evolution(report, lake_dir, baseline_path):
 
         # Missing columns are ERRORS (upstream field dropped or renamed)
         if missing_cols:
-            report.checks.append(
-                f"  [{report.failures}] MISSING in {table_name}: "
-                f"{sorted(missing_cols)}"
-            )
-            report.failures += 1
             missing_detail = ", ".join(sorted(missing_cols)[:5])
             report.check(
                 f"{table_name}: no missing columns",
@@ -962,9 +958,9 @@ def main():
 
     # ── Run all checks ──
     check_completeness(report, args.lake, jsonl_count)
-    entry_accs = check_uniqueness(report, args.lake)
+    entry_total, entry_unique = check_uniqueness(report, args.lake)
     check_null_keys(report, args.lake)
-    check_referential_integrity(report, args.lake, entry_accs)
+    check_referential_integrity(report, args.lake, entry_unique)
     check_sort_order(report, args.lake)
     check_round_trip(report, args.lake, args.jsonl, args.spot_check_n)
     check_parquet_integrity(report, args.lake)

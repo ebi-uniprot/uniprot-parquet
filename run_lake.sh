@@ -92,6 +92,13 @@ printf "║  %-$(( W - 2 ))s║\n" "Profile:   $PROFILE"
 printf "╚%s╝\n" "$BAR"
 echo ""
 
+# Pre-flight: verify input file exists before submitting to SLURM
+if [[ ! -f "$INPUTFILE" ]]; then
+    echo "ERROR: Input file not found: $INPUTFILE" >&2
+    echo "  (resolved from working directory: $(pwd))" >&2
+    exit 1
+fi
+
 # Ensure report directory exists (Nextflow won't create it)
 mkdir -p "$OUTDIR/reports"
 

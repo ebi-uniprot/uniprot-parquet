@@ -3,21 +3,19 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
-  - openjdk=17          # Required for Nextflow
-  - nextflow            # Pipeline orchestration
-  - python>=3.11
-  - pigz                # Parallel gzip decompression
-  - zstd                # Zstandard compression for intermediate JSONL
-  - pyarrow             # Arrow columnar format + Parquet read/write
-  - pip
-  - pip:
-      - duckdb                          # JSON/Parquet engine (Python bindings + C library)
-      - orjson                          # Fast JSON serialisation for sorted JSONL
-      - ijson                           # Streaming JSON parser
-      - zstandard                       # Zstd bindings for test fixtures
-      - pytest                          # Test runner
-      # ── Demo notebook (demo/demo_datalake.ipynb) ──
-      - notebook                         # Jupyter notebook server
-      - polars                           # DataFrame library
-      - pandas                           # DataFrame library
-      - matplotlib                       # Plotting
+  - openjdk=17                        # Required for Nextflow
+  - nextflow>=25.10                   # Pipeline orchestration
+  - python>=3.14
+  - pigz                              # Parallel gzip decompression
+  - zstd                              # Zstandard compression for intermediate JSONL
+  - pyarrow>=23.0,<24                 # Arrow columnar format + Parquet read/write
+  - duckdb>=1.5,<2                    # JSON/Parquet engine (Python bindings + C library)
+  - orjson>=3.11,<4                   # Fast JSON serialisation for sorted JSONL
+  - ijson>=3.5,<4                     # Streaming JSON parser
+  - zstandard>=0.25,<1                 # Zstd Python bindings for test fixtures
+  - pytest>=9.0,<10                   # Test runner
+  # ── Demo notebook (demo/demo.ipynb) ──
+  - notebook>=7.5,<8                  # Jupyter notebook server
+  - polars>=1.39,<2                   # DataFrame library
+  - pandas>=2.3,<3                    # DataFrame library
+  - matplotlib>=3.10,<4               # Plotting

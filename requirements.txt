@@ -1,6 +1,0 @@
-duckdb>=1.1,<2
-pyarrow>=14.0,<18
-orjson>=3.9,<4
-ijson>=3.2,<4
-zstandard>=0.20,<1
-pytest>=7.0,<9

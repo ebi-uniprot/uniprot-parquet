@@ -19,8 +19,8 @@
 //   3. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow
 //      (DuckDB infers the schema from the data via read_json_auto;
 //       pre-sorted input makes DuckDB ORDER BY nearly free for entries;
-//       child tables benefit from input locality after LATERAL unnest;
-//       features additionally sorted by start_pos for positional queries)
+//       child tables inherit (reviewed, taxid, acc) order from LATERAL unnest
+//       with no additional sort — avoids ~1.2 TB spill at production scale)
 //   4. Production validation: completeness, referential integrity,
 //      sort order, round-trip spot checks, Parquet integrity
 //   5. Generate provenance manifest (only if validation passes)

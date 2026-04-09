@@ -23,6 +23,7 @@ demo/report-*.html
 demo/timeline-*.html
 demo/trace-*.txt
 demo/drosophila_kinases.csv
+demo/lake_kinases.csv
 
 # Python
 __pycache__/

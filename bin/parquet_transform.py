@@ -446,11 +446,25 @@ FROM (
     FROM {{read_clause}} e
     WHERE e.features IS NOT NULL AND len(e.features) > 0
 ) sub, LATERAL unnest(sub.features)
-ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc, unnest.location.start.value
+ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
 """
 
 
-XREFS_SQL = """
+def _build_xrefs_sql(schema_paths: set[str]) -> str:
+    """Build xrefs SQL with NULLs for any fields absent from the schema.
+
+    Cross-reference structs may lack ``isoformId`` or ``evidences`` depending
+    on the dataset.  ``schema_paths`` is checked before referencing them.
+    """
+
+    def has(path: str) -> bool:
+        return path in schema_paths
+
+    isoform_id = "unnest.isoformId" if has("uniProtKBCrossReferences.isoformId") else "NULL"
+    xref_evidences = "unnest.evidences" if has("uniProtKBCrossReferences.evidences") else "NULL"
+    properties = "unnest.properties" if has("uniProtKBCrossReferences.properties") else "NULL"
+
+    return f"""
 SELECT
     sub.acc,
     sub.from_reviewed,
@@ -459,9 +473,9 @@ SELECT
     -- Flattened convenience columns (fast querying)
     unnest.database                                 AS database,
     unnest.id                                       AS id,
-    unnest.properties                               AS properties,
-    unnest.isoformId                                AS isoform_id,
-    unnest.evidences                                AS evidences
+    {properties}                                    AS properties,
+    {isoform_id}                                    AS isoform_id,
+    {xref_evidences}                                AS evidences
 
 FROM (
     SELECT
@@ -470,15 +484,36 @@ FROM (
              THEN true ELSE false END                AS from_reviewed,
         e.organism.taxonId                           AS taxid,
         e.uniProtKBCrossReferences
-    FROM {read_clause} e
+    FROM {{read_clause}} e
     WHERE e.uniProtKBCrossReferences IS NOT NULL
       AND len(e.uniProtKBCrossReferences) > 0
 ) sub, LATERAL unnest(sub.uniProtKBCrossReferences)
-ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc, unnest.database
+ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
 """
 
 
-COMMENTS_SQL = """
+def _build_comments_sql(schema_paths: set[str]) -> str:
+    """Build comments SQL with NULLs for any fields absent from the schema.
+
+    The ``texts`` field only appears on text-based comment types (FUNCTION,
+    SUBUNIT, etc.) — not on structured types like COFACTOR, INTERACTION, or
+    CATALYTIC_ACTIVITY.  DuckDB's union schema *should* include it if any
+    comment in the dataset has it, but on a subset that only contains
+    structured comment types, ``texts`` could be absent entirely.
+    """
+
+    def has(path: str) -> bool:
+        return path in schema_paths
+
+    if has("comments.texts"):
+        text_value_expr = """array_to_string(
+        from_json(unnest.texts->'$[*].value', '["VARCHAR"]'),
+        chr(10) || chr(10)
+    )"""
+    else:
+        text_value_expr = "NULL"
+
+    return f"""
 SELECT
     sub.acc,
     sub.from_reviewed,
@@ -489,10 +524,7 @@ SELECT
     trim('"' FROM unnest.commentType::VARCHAR)      AS comment_type,
     -- Concatenate all text values (multi-paragraph comments have texts[1..N])
     -- texts is JSON, so extract all values and join with double newline
-    array_to_string(
-        from_json(unnest.texts->'$[*].value', '["VARCHAR"]'),
-        chr(10) || chr(10)
-    )                                               AS text_value,
+    {text_value_expr}                               AS text_value,
     -- Full comment as JSON (lossless — preserves original structure).
     -- Stored as VARCHAR in Parquet; the comments view casts to JSON
     -- so users get ->> operators without explicit casting.
@@ -505,15 +537,40 @@ FROM (
              THEN true ELSE false END                AS from_reviewed,
         e.organism.taxonId                           AS taxid,
         e.comments
-    FROM {read_clause} e
+    FROM {{read_clause}} e
     WHERE e.comments IS NOT NULL AND len(e.comments) > 0
 ) sub, LATERAL unnest(sub.comments)
-ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc,
-         trim('"' FROM unnest.commentType::VARCHAR)
+ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
 """
 
 
-REFERENCES_SQL = """
+def _build_publications_sql(schema_paths: set[str]) -> str:
+    """Build publications SQL with NULLs for any fields absent from the schema.
+
+    Citation structs vary by type: journal articles have ``journal``, ``volume``,
+    ``firstPage``, ``lastPage``; submissions have ``submissionDatabase``; some
+    have ``authoringGroup`` instead of ``authors``.  On a subset that only
+    contains one citation type, many of these fields could be absent.
+    """
+
+    def has(path: str) -> bool:
+        return path in schema_paths
+
+    # Citation fields — all potentially absent depending on citation types in the dataset
+    title = "unnest.citation.title" if has("references.citation.title") else "NULL"
+    authors = "unnest.citation.authors" if has("references.citation.authors") else "NULL"
+    authoring_group = "unnest.citation.authoringGroup" if has("references.citation.authoringGroup") else "NULL"
+    journal = "unnest.citation.journal" if has("references.citation.journal") else "NULL"
+    volume = "unnest.citation.volume" if has("references.citation.volume") else "NULL"
+    first_page = "unnest.citation.firstPage" if has("references.citation.firstPage") else "NULL"
+    last_page = "unnest.citation.lastPage" if has("references.citation.lastPage") else "NULL"
+    submission_db = "unnest.citation.submissionDatabase" if has("references.citation.submissionDatabase") else "NULL"
+    citation_xrefs = "unnest.citation.citationCrossReferences" if has("references.citation.citationCrossReferences") else "NULL"
+    ref_positions = "unnest.referencePositions" if has("references.referencePositions") else "NULL"
+    ref_comments = "unnest.referenceComments" if has("references.referenceComments") else "NULL"
+    ref_evidences = "unnest.evidences" if has("references.evidences") else "NULL"
+
+    return f"""
 SELECT
     sub.acc,
     sub.from_reviewed,
@@ -523,19 +580,19 @@ SELECT
     CAST(unnest.referenceNumber AS INTEGER)          AS reference_number,
     unnest.citation.citationType                    AS citation_type,
     unnest.citation.id                              AS citation_id,
-    unnest.citation.title                           AS title,
-    unnest.citation.authors                         AS authors,
-    unnest.citation.authoringGroup                  AS authoring_group,
+    {title}                                         AS title,
+    {authors}                                       AS authors,
+    {authoring_group}                               AS authoring_group,
     unnest.citation.publicationDate                 AS publication_date,
-    unnest.citation.journal                         AS journal,
-    unnest.citation.volume                          AS volume,
-    unnest.citation.firstPage                       AS first_page,
-    unnest.citation.lastPage                        AS last_page,
-    unnest.citation.submissionDatabase              AS submission_database,
-    unnest.citation.citationCrossReferences         AS citation_xrefs,
-    unnest.referencePositions                       AS reference_positions,
-    unnest.referenceComments                        AS reference_comments,
-    unnest.evidences                                AS evidences,
+    {journal}                                       AS journal,
+    {volume}                                        AS volume,
+    {first_page}                                    AS first_page,
+    {last_page}                                     AS last_page,
+    {submission_db}                                  AS submission_database,
+    {citation_xrefs}                                AS citation_xrefs,
+    {ref_positions}                                  AS reference_positions,
+    {ref_comments}                                   AS reference_comments,
+    {ref_evidences}                                  AS evidences,
 
     -- Full original nested struct (lossless round-trip)
     unnest                                          AS reference
@@ -547,21 +604,28 @@ FROM (
              THEN true ELSE false END                AS from_reviewed,
         e.organism.taxonId                           AS taxid,
         e."references"
-    FROM {read_clause} e
+    FROM {{read_clause}} e
     WHERE e."references" IS NOT NULL AND len(e."references") > 0
 ) sub, LATERAL unnest(sub."references")
-ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc, unnest.citation.citationType
+ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
 """
 
 
 # ─── Table definitions ──────────────────────────────────────────────────
 
 TABLE_DEFS = [
-    ("entries",      None,            ["reviewed DESC", "taxid ASC", "acc ASC"]),       # SQL built dynamically
-    ("features",     None,            ["from_reviewed DESC", "taxid ASC", "acc ASC", "start_pos ASC"]),  # SQL built dynamically
-    ("xrefs",        XREFS_SQL,      ["from_reviewed DESC", "taxid ASC", "acc ASC", "database ASC"]),
-    ("comments",     COMMENTS_SQL,   ["from_reviewed DESC", "taxid ASC", "acc ASC", "comment_type ASC"]),
-    ("publications", REFERENCES_SQL, ["from_reviewed DESC", "taxid ASC", "acc ASC", "citation_type ASC"]),
+    ("entries",      None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
+    # Child tables inherit (from_reviewed DESC, taxid ASC, acc ASC) from the
+    # pre-sorted JSONL input — DuckDB's ORDER BY on these three columns is
+    # essentially free (data arrives already in order after LATERAL unnest).
+    # Within-protein sort keys (start_pos, database, comment_type, citation_type)
+    # are deliberately omitted to avoid ~1.2 TB of sort spill at production
+    # scale (~3B xref + ~1.3B feature + ~1B publication + ~400M comment rows).
+    # Users who need within-protein ordering can add it at query time.
+    ("features",     None, ["from_reviewed DESC", "taxid ASC", "acc ASC"]),
+    ("xrefs",        None, ["from_reviewed DESC", "taxid ASC", "acc ASC"]),
+    ("comments",     None, ["from_reviewed DESC", "taxid ASC", "acc ASC"]),
+    ("publications", None, ["from_reviewed DESC", "taxid ASC", "acc ASC"]),
 ]
 
 
@@ -595,7 +659,7 @@ TABLE_META = {
         },
     },
     "features": {
-        "description": "One row per positional annotation (domain, signal, transmembrane, etc). Sorted by start_pos within each protein.",
+        "description": "One row per positional annotation (domain, signal, transmembrane, etc). Sorted by (from_reviewed DESC, taxid ASC, acc ASC) for locality; use ORDER BY start_pos for position-sorted queries within a protein.",
         "primary_key": [],
         "foreign_keys": {"acc": "entries.acc", "taxid": "entries.taxid"},
         "columns": {
@@ -922,13 +986,18 @@ def main():
                     "column_categories": meta.get("columns", {}),
                 }
             else:
-                # Entries and features SQL are built dynamically to handle optional fields.
+                # All table SQL is built dynamically to handle optional fields.
                 # schema_paths is the single source of truth — no field is referenced
                 # without first checking that it exists in the staged Parquet schema.
-                if sql_template is None and name == "entries":
-                    sql_template = _build_entries_sql(schema_paths)
-                elif sql_template is None and name == "features":
-                    sql_template = _build_features_sql(schema_paths)
+                _SQL_BUILDERS = {
+                    "entries":      _build_entries_sql,
+                    "features":     _build_features_sql,
+                    "xrefs":        _build_xrefs_sql,
+                    "comments":     _build_comments_sql,
+                    "publications": _build_publications_sql,
+                }
+                if sql_template is None:
+                    sql_template = _SQL_BUILDERS[name](schema_paths)
                 sql = sql_template.format(read_clause=read_clause)
                 row_count, files, arrow_schema = stream_to_parquet(
                     con, sql, table_dir, args.batch_size, label=name, sort_order=sort_order

@@ -295,14 +295,18 @@ class TestSortOrder:
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
         assert keys == sorted(keys), "Entries not sorted by (reviewed DESC, taxid ASC, acc ASC)"
 
-    def test_features_sorted_by_from_reviewed_desc_taxid_asc_acc_asc_start_pos(self, features_ds):
-        arrow = features_ds.to_table(columns=["from_reviewed", "taxid", "acc", "start_pos"])
+    def test_features_sorted_by_from_reviewed_desc_taxid_asc_acc_asc(self, features_ds):
+        """Features sorted by (from_reviewed DESC, taxid ASC, acc ASC).
+
+        Within-protein start_pos sort is deliberately omitted to avoid
+        ~1.2 TB of sort spill at production scale.
+        """
+        arrow = features_ds.to_table(columns=["from_reviewed", "taxid", "acc"])
         reviewed = arrow.column("from_reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
         accs = arrow.column("acc").to_pylist()
-        start_pos = [p if p is not None else float('inf') for p in arrow.column("start_pos").to_pylist()]
-        keys = [(not r, t, a, s) for r, t, a, s in zip(reviewed, taxids, accs, start_pos)]
-        assert keys == sorted(keys), "Features not sorted by (from_reviewed DESC, taxid ASC, acc ASC, start_pos ASC)"
+        keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
+        assert keys == sorted(keys), "Features not sorted by (from_reviewed DESC, taxid ASC, acc ASC)"
 
     def test_xrefs_sorted_by_from_reviewed_desc_taxid_asc_acc_asc(self, xrefs_ds):
         arrow = xrefs_ds.to_table(columns=["from_reviewed", "taxid", "acc"])
