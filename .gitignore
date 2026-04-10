@@ -9,6 +9,10 @@ datalake/
 *.jsonl
 *.jsonl.zst
 
+# Test fixtures (fetched on demand, not committed)
+tests/fixtures/diverse.json.gz
+tests/fixtures/diverse_stress.json.gz
+
 # Test results
 test_results/
 

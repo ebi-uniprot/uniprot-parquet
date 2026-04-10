@@ -1,9 +1,14 @@
-"""Tests for the Parquet transform pipeline against small.json.gz.
+"""Tests for the Parquet transform pipeline.
 
 These tests run the full pipeline once (via the parquet_lake session fixture)
 and verify row counts, column schemas, data integrity, and sort order.
+
+The fixture is a diverse ~5K-entry dataset fetched from UniProtKB REST API
+(viruses, fragments, multi-gene, isoforms, rare comment types, etc.).
+Expected values are derived from the fixture at test time, not hardcoded.
 """
 
+import gzip
 import json
 import os
 
@@ -12,19 +17,47 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import pytest
 
-
-# ─── Expected values from small.json.gz ──────────────────────────────
-# The fixture contains a mix of Swiss-Prot (reviewed) and TrEMBL (unreviewed)
-# entries to exercise both code paths in the pipeline.
-EXPECTED_ENTRIES = 50
-EXPECTED_FEATURES = 1325
-EXPECTED_REVIEWED = 30
-EXPECTED_UNREVIEWED = 20
+from conftest import DIVERSE_JSON_GZ
 
 
 def open_table(lake_dir, table_name):
     """Open a Parquet dataset from the lake directory."""
     return ds.dataset(os.path.join(lake_dir, table_name), format="parquet")
+
+
+# ─── Derive expected values from the fixture JSON ──────────────────
+# Computed once per session so tests don't depend on a specific fixture file.
+
+@pytest.fixture(scope="session")
+def expected(fixture_json_gz):
+    """Compute expected row counts and accessions from the source JSON."""
+    with gzip.open(fixture_json_gz, "rt") as f:
+        data = json.load(f)
+    entries = data["results"]
+
+    reviewed = [e for e in entries if e.get("entryType", "").startswith("UniProtKB reviewed")]
+    unreviewed = [e for e in entries if not e.get("entryType", "").startswith("UniProtKB reviewed")]
+
+    total_features = sum(len(e.get("features", [])) for e in entries)
+    total_xrefs = sum(len(e.get("uniProtKBCrossReferences", [])) for e in entries)
+    total_comments = sum(len(e.get("comments", [])) for e in entries)
+    total_refs = sum(len(e.get("references", [])) for e in entries)
+
+    # Pick one reviewed and one unreviewed accession for spot-check
+    reviewed_acc = reviewed[0]["primaryAccession"] if reviewed else None
+    unreviewed_acc = unreviewed[0]["primaryAccession"] if unreviewed else None
+
+    return {
+        "entries": len(entries),
+        "reviewed": len(reviewed),
+        "unreviewed": len(unreviewed),
+        "features": total_features,
+        "xrefs": total_xrefs,
+        "comments": total_comments,
+        "publications": total_refs,
+        "reviewed_acc": reviewed_acc,
+        "unreviewed_acc": unreviewed_acc,
+    }
 
 
 @pytest.fixture(scope="session")
@@ -61,11 +94,11 @@ def publications_ds(lake_dir):
 
 
 class TestRowCounts:
-    def test_entries_count(self, entries_ds):
-        assert entries_ds.count_rows() == EXPECTED_ENTRIES
+    def test_entries_count(self, entries_ds, expected):
+        assert entries_ds.count_rows() == expected["entries"]
 
-    def test_features_count(self, features_ds):
-        assert features_ds.count_rows() == EXPECTED_FEATURES
+    def test_features_count(self, features_ds, expected):
+        assert features_ds.count_rows() == expected["features"]
 
     def test_feature_count_consistency(self, entries_ds, features_ds):
         """sum(entries.feature_count) should equal features row count."""
@@ -125,11 +158,11 @@ class TestManifest:
             manifest = json.load(f)
         assert manifest["release"] == "test_2026"
 
-    def test_manifest_row_counts(self, lake_dir):
+    def test_manifest_row_counts(self, lake_dir, expected):
         with open(os.path.join(lake_dir, "manifest.json")) as f:
             manifest = json.load(f)
-        assert manifest["tables"]["entries"]["row_count"] == EXPECTED_ENTRIES
-        assert manifest["tables"]["features"]["row_count"] == EXPECTED_FEATURES
+        assert manifest["tables"]["entries"]["row_count"] == expected["entries"]
+        assert manifest["tables"]["features"]["row_count"] == expected["features"]
 
     def test_manifest_files_match_disk(self, lake_dir):
         with open(os.path.join(lake_dir, "manifest.json")) as f:
@@ -137,8 +170,8 @@ class TestManifest:
         for table_name, info in manifest["tables"].items():
             table_dir = os.path.join(lake_dir, table_name)
             actual = sorted(f for f in os.listdir(table_dir) if f.endswith(".parquet"))
-            expected = sorted(info["files"])
-            assert actual == expected, f"{table_name}: disk {actual} != manifest {expected}"
+            expected_files = sorted(info["files"])
+            assert actual == expected_files, f"{table_name}: disk {actual} != manifest {expected_files}"
 
 
 # ─── Schema checks ──────────────────────────────────────────────────
@@ -196,13 +229,13 @@ class TestSchema:
 
 
 class TestDataIntegrity:
-    def test_reviewed_split(self, entries_ds):
+    def test_reviewed_split(self, entries_ds, expected):
         arrow = entries_ds.to_table(columns=["reviewed"])
         reviewed = pc.sum(pc.cast(arrow.column("reviewed"), "int64")).as_py()
         total = arrow.num_rows
 
-        assert reviewed == EXPECTED_REVIEWED
-        assert total - reviewed == EXPECTED_UNREVIEWED
+        assert reviewed == expected["reviewed"]
+        assert total - reviewed == expected["unreviewed"]
 
     def test_accessions_not_null(self, entries_ds):
         arrow = entries_ds.to_table(columns=["acc"])
@@ -240,13 +273,14 @@ class TestDataIntegrity:
         arrow = publications_ds.to_table(columns=["acc"])
         assert arrow.column("acc").null_count == 0
 
-    def test_sample_accession_present(self, entries_ds):
-        """Check that known accessions from small.json.gz are in the table."""
+    def test_sample_accession_present(self, entries_ds, expected):
+        """Check that at least one reviewed and one unreviewed accession are present."""
         arrow = entries_ds.to_table(columns=["acc"])
         accs = set(arrow.column("acc").to_pylist())
-        # One reviewed and one unreviewed accession from the fixture
-        assert "P02538" in accs, "Expected reviewed accession P02538"
-        assert "A0A096MIX7" in accs, "Expected unreviewed accession A0A096MIX7"
+        if expected["reviewed_acc"]:
+            assert expected["reviewed_acc"] in accs, f"Expected reviewed accession {expected['reviewed_acc']}"
+        if expected["unreviewed_acc"]:
+            assert expected["unreviewed_acc"] in accs, f"Expected unreviewed accession {expected['unreviewed_acc']}"
 
     def test_entry_type_not_null(self, entries_ds):
         """entry_type preserves the original entryType string for lossless round-trip."""
@@ -280,9 +314,8 @@ class TestDataIntegrity:
 
 
 # ─── Sort order: reviewed DESC, taxid ASC, acc ASC ───────────────
-# small.json.gz contains both reviewed (Swiss-Prot) and unreviewed
-# (TrEMBL) entries, so these tests exercise the full three-column
-# sort including the reviewed DESC boundary.
+# The fixture contains both reviewed (Swiss-Prot) and unreviewed
+# (TrEMBL) entries to exercise the full three-column sort.
 
 
 class TestSortOrder:

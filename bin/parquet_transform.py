@@ -258,9 +258,15 @@ def _build_entries_sql(schema_paths: set[str]) -> str:
             COALESCE(e.proteinDescription.alternativeNames, []),
             n -> list_transform(COALESCE(n.ecNumbers, []), x -> x.value)
         ))""")
-    if has("proteinDescription.submittedNames.ecNumbers"):
-        ec_parts.append("""flatten(list_transform(
-            COALESCE(e.proteinDescription.submittedNames, []),
+    # UniProtKB API renamed submittedNames → submissionNames; handle both.
+    _submitted_field = (
+        "submissionNames" if has("proteinDescription.submissionNames.ecNumbers")
+        else "submittedNames" if has("proteinDescription.submittedNames.ecNumbers")
+        else None
+    )
+    if _submitted_field:
+        ec_parts.append(f"""flatten(list_transform(
+            COALESCE(e.proteinDescription.{_submitted_field}, []),
             n -> list_transform(COALESCE(n.ecNumbers, []), x -> x.value)
         ))""")
 
@@ -269,12 +275,18 @@ def _build_entries_sql(schema_paths: set[str]) -> str:
     else:
         ec_numbers_expr = "CAST([] AS VARCHAR[])"
 
-    # protein_name: COALESCE across recommendedName → submittedNames[1] → alternativeNames[1].
-    # Swiss-Prot entries have recommendedName; TrEMBL entries typically only have submittedNames.
+    # protein_name: COALESCE across recommendedName → submissionNames/submittedNames[1] → alternativeNames[1].
+    # Swiss-Prot entries have recommendedName; TrEMBL entries typically only have submissionNames.
     # Without this fallback, protein_name is NULL for >99% of the lake (TrEMBL dominates).
+    # UniProtKB API renamed submittedNames → submissionNames; handle both.
     protein_name_parts = ["e.proteinDescription.recommendedName.fullName.value"]
-    if has("proteinDescription.submittedNames"):
-        protein_name_parts.append("e.proteinDescription.submittedNames[1].fullName.value")
+    _submitted_name_field = (
+        "submissionNames" if has("proteinDescription.submissionNames")
+        else "submittedNames" if has("proteinDescription.submittedNames")
+        else None
+    )
+    if _submitted_name_field:
+        protein_name_parts.append(f"e.proteinDescription.{_submitted_name_field}[1].fullName.value")
     protein_name_parts.append("(list_extract(COALESCE(e.proteinDescription.alternativeNames, []), 1)).fullName.value")
     protein_name_expr = "COALESCE(" + ", ".join(protein_name_parts) + ")"
 
@@ -939,6 +951,9 @@ def main():
         if tables_to_write:
             schema_paths = discover_schema_paths(staging_path)
             eprint(f"  Schema: {len(schema_paths)} field paths discovered")
+            if not schema_paths:
+                eprint("FATAL: staging produced an empty schema — no field paths found")
+                sys.exit(1)
         else:
             schema_paths = set()
 
@@ -946,9 +961,10 @@ def main():
         missing_optional = _OPTIONAL_ENTRY_FIELDS - {p for p in schema_paths if "." not in p}
         if missing_optional:
             eprint(f"  Optional fields not in data (will be NULL): {', '.join(sorted(missing_optional))}")
-        if "proteinDescription.submittedNames" not in schema_paths:
-            eprint("  Note: proteinDescription.submittedNames absent (normal for Swiss-Prot-only data)")
-        ec_sources = [s for s in ["recommendedName", "alternativeNames", "submittedNames"]
+        if ("proteinDescription.submittedNames" not in schema_paths
+                and "proteinDescription.submissionNames" not in schema_paths):
+            eprint("  Note: proteinDescription.submittedNames/submissionNames absent (normal for Swiss-Prot-only data)")
+        ec_sources = [s for s in ["recommendedName", "alternativeNames", "submittedNames", "submissionNames"]
                       if f"proteinDescription.{s}.ecNumbers" in schema_paths]
         if ec_sources:
             eprint(f"  EC numbers found in: {', '.join(ec_sources)}")

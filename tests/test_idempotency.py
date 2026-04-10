@@ -4,17 +4,25 @@ This verifies idempotency: a second run overwrites the previous Parquet files,
 so row counts remain correct (no duplication).
 """
 
+import gzip
+import json
 import os
-import sys
 import subprocess
+import sys
 
 import pyarrow.dataset as ds
 import pytest
 
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 
-EXPECTED_ENTRIES = 50
 TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications"]
+
+
+def _expected_entries(fixture_path):
+    """Derive expected entry count from the fixture."""
+    with gzip.open(fixture_path, "rt") as f:
+        data = json.load(f)
+    return len(data["results"])
 
 
 def _run_transform(small_jsonl, outdir, extra_args=None):
@@ -27,7 +35,7 @@ def _run_transform(small_jsonl, outdir, extra_args=None):
         sys.executable, transform_script, small_jsonl,
         "--outdir", outdir,
         "--memory-limit", "4GB",
-        "--batch-size", "50",
+        "--batch-size", "500",
         "--release", "idempotency_test",
     ]
     if extra_args:
@@ -48,7 +56,7 @@ def _get_row_counts(outdir):
     return counts
 
 
-def test_idempotency(small_jsonl, tmp_path_factory):
+def test_idempotency(small_jsonl, fixture_json_gz, tmp_path_factory):
     """Running the pipeline twice on the same output should not duplicate data."""
     lake_dir = tmp_path_factory.mktemp("idempotency")
     outdir = str(lake_dir / "output")
@@ -73,7 +81,7 @@ def test_idempotency(small_jsonl, tmp_path_factory):
         )
 
     # Sanity: entries count should match expected
-    assert counts2["entries"] == EXPECTED_ENTRIES
+    assert counts2["entries"] == _expected_entries(fixture_json_gz)
 
 
 def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):

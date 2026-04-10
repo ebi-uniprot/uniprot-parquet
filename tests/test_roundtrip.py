@@ -20,10 +20,9 @@ import pytest
 # ─── Helpers ────────────────────────────────────────────────────────────
 
 
-def load_original_entries():
-    """Load the original JSON entries from small.json.gz, keyed by accession."""
-    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "small.json.gz")
-    with gzip.open(fixture, "rt") as f:
+def load_original_entries(fixture_path):
+    """Load the original JSON entries from the fixture, keyed by accession."""
+    with gzip.open(fixture_path, "rt") as f:
         data = json.load(f)
     return {e["primaryAccession"]: e for e in data["results"]}
 
@@ -69,9 +68,9 @@ def open_table(lake_dir, name):
 
 
 @pytest.fixture(scope="module")
-def originals():
+def originals(fixture_json_gz):
     """Original JSON entries keyed by accession."""
-    return load_original_entries()
+    return load_original_entries(fixture_json_gz)
 
 
 @pytest.fixture(scope="module")

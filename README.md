@@ -284,7 +284,7 @@ Override defaults with flags:
 #### Direct Nextflow invocation
 
 ```bash
-# Local test (uses committed small.json.gz, 44 entries)
+# Local test (uses committed small.json.gz, 52 entries incl. annotation champions)
 nextflow run upjson2lake.nf -profile local \
     --inputfile tests/fixtures/small.json.gz \
     --release test_2026
@@ -361,7 +361,7 @@ The pipeline is **idempotent** — re-running on the same release directory over
 
 ### Production notes (SLURM)
 
-**OOM recovery**: `PARQUET_TRANSFORM` retries once on OOM (exit 137/140) with doubled memory, capped at 256 GB. Non-OOM failures are terminal. The `--skip-existing` flag means retries skip already-written tables.
+**OOM recovery**: `SORT_JSONL` and `PARQUET_TRANSFORM` retry once on OOM (exit 137/140) or pre-kill SIGTERM (exit 143) with doubled memory, capped at 256 GB. Non-OOM failures are terminal. The `--skip-existing` flag means `PARQUET_TRANSFORM` retries skip already-written tables.
 
 **DuckDB spill directory**: Point `--duckdb_temp` at a large scratch filesystem (1–2 TB free). Node-local NVMe is ideal; shared Lustre/GPFS works but is slower.
 
@@ -401,10 +401,22 @@ The `VALIDATE` step runs 12 checks against the source JSONL as ground truth. All
 ### Testing
 
 ```bash
+# Default suite (~4K diverse entries, auto-fetched on first run)
 python -m pytest tests/ -v
+
+# Stress suite (~15K entries from 30+ targeted queries)
+python tests/fetch_fixtures.py --scale stress   # one-time fetch, ~60 MB
+python -m pytest tests/ -v --stress
 ```
 
-81 tests covering row counts, column schemas, data integrity, sort order, manifest consistency, idempotency, `--skip-existing` resume, and the production validator across all five tables. Tests use `tests/fixtures/small.json.gz` (44 reviewed entries).
+The default fixture is fetched automatically on first `pytest` run if not already present. It pulls ~4,000 entries from UniProtKB via targeted REST API queries (viruses, fragments, isoforms, bacteria, fungi, multiple TrEMBL organisms, etc.) and always includes the top 100 most heavily annotated Swiss-Prot and TrEMBL entries, discovered by sampling candidate pools from well-studied organisms and ranking by total annotation count (features + xrefs + comments + references). The Swiss-Prot champion is P0DTD1 (SARS-CoV-2 replicase, ~6,300 annotations); the TrEMBL champion is typically a titin ortholog (~570 annotations). These stress-test every child table at maximum annotation volume.
+
+The `--stress` flag swaps in a ~15K-entry dataset assembled from 30+ queries spanning archaea, toxins, allergens, pharmaceuticals, long/short sequences, and TrEMBL from 10+ organisms. Both suites run the same 81 tests — row counts, column schemas, data integrity, sort order, manifest consistency, idempotency, `--skip-existing` resume, full roundtrip equivalence, and the production validator across all five tables. To re-fetch fixtures (e.g. after a UniProtKB release), pass `--force`:
+
+```bash
+python tests/fetch_fixtures.py --force                # re-fetch default
+python tests/fetch_fixtures.py --scale stress --force  # re-fetch stress
+```
 
 ### Tech stack
 
