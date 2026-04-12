@@ -55,9 +55,10 @@ report-*.html
 timeline-*.html
 trace-*.txt
 
-# Benchmark results (generated, not committed)
+# Benchmark results and generated lakes (not committed)
 benchmarks/results/*.json
 benchmarks/results/*.txt
+benchmarks/variant_lake/
 
 # Build artifacts
 dist/
