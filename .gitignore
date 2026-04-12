@@ -55,6 +55,10 @@ report-*.html
 timeline-*.html
 trace-*.txt
 
+# Benchmark results (generated, not committed)
+benchmarks/results/*.json
+benchmarks/results/*.txt
+
 # Build artifacts
 dist/
 *.egg-info/
