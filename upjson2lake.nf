@@ -10,6 +10,7 @@
 //   lake/comments/comments_*.parquet  (one row per comment annotation)
 //   lake/publications/publications_*.parquet  (one row per citation)
 //   lake/manifest.json                (file list, schemas, row counts, sort orders)
+//   lake/datapackage.json             (Frictionless Data Package — FAIR metadata)
 //   validation_report.txt             (12-check production validation)
 //   provenance.json                   (checksums, git commit, row counts)
 //

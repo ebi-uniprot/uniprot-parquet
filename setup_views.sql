@@ -30,7 +30,7 @@
 -- Parquet predicate pushdown and column pruning work through views —
 -- DuckDB pushes filters down to the row-group level automatically.
 
-CREATE OR REPLACE VIEW entries    AS SELECT * FROM read_parquet('${BASE}/entries/*.parquet');
+CREATE OR REPLACE VIEW entries    AS SELECT *, gene_names[1] AS gene_name FROM read_parquet('${BASE}/entries/*.parquet');
 CREATE OR REPLACE VIEW features   AS SELECT * FROM read_parquet('${BASE}/features/*.parquet');
 CREATE OR REPLACE VIEW xrefs      AS SELECT * FROM read_parquet('${BASE}/xrefs/*.parquet');
 CREATE OR REPLACE VIEW comments   AS SELECT * REPLACE (comment::JSON AS comment) FROM read_parquet('${BASE}/comments/*.parquet');

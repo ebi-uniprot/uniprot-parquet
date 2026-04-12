@@ -308,6 +308,34 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
 
     info = tbls[table]
     cats = info.get("column_categories", {})
+
+    # Enrich with semantic descriptions from datapackage.json if available
+    dp = _load_datapackage(lake_path)
+    desc_map = {}
+    type_map = {}
+    if dp:
+        for resource in dp.get("resources", []):
+            if resource["name"] == table:
+                for field in resource["schema"]["fields"]:
+                    desc_map[field["name"]] = field.get("description", "")
+                    type_map[field["name"]] = field.get("arrowType", "")
+                break
+
+    columns = []
+    for col in info.get("columns", []):
+        col_name = col["name"]
+        entry = {
+            "name": col_name,
+            "type": col.get("type", type_map.get(col_name, "")),
+            "nullable": col.get("nullable", True),
+            "description": desc_map.get(col_name, ""),
+        }
+        if col_name in cats.get("convenience", []):
+            entry["category"] = "convenience"
+        elif col_name in cats.get("nested", []):
+            entry["category"] = "nested"
+        columns.append(entry)
+
     return {
         "description": info.get("description", ""),
         "row_count": info.get("row_count", 0),
@@ -317,4 +345,47 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
         "convenience_columns": cats.get("convenience", []),
         "nested_columns": cats.get("nested", []),
         "all_columns": [c["name"] for c in info.get("columns", [])],
+        "columns": columns,
     }
+
+
+def _load_datapackage(lake_path: str) -> dict | None:
+    """Load datapackage.json if it exists, else return None."""
+    dp_path = os.path.join(lake_path, "datapackage.json")
+    try:
+        with open(dp_path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def datapackage(lake_path: str) -> dict:
+    """Read the lake's datapackage.json (Frictionless Data Package descriptor).
+
+    This is the machine-readable schema documentation for the lake,
+    following the Frictionless Data Package spec. It contains Arrow types,
+    nullability constraints, semantic descriptions, primary/foreign keys,
+    sort orders, and licensing for every column in every table.
+
+    Parameters
+    ----------
+    lake_path : str
+        Path to the lake directory (local only for now).
+
+    Returns
+    -------
+    dict
+        The parsed Frictionless Data Package descriptor.
+
+    Raises
+    ------
+    FileNotFoundError
+        If datapackage.json is not found in the lake directory.
+    """
+    dp = _load_datapackage(lake_path)
+    if dp is None:
+        raise FileNotFoundError(
+            f"datapackage.json not found at {lake_path}. "
+            f"Rebuild the lake with the latest parquet_transform.py to generate it."
+        )
+    return dp

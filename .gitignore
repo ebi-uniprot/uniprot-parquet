@@ -4,7 +4,6 @@
 work/
 
 # Pipeline outputs
-datalake/
 *.parquet
 *.jsonl
 *.jsonl.zst
@@ -56,7 +55,12 @@ report-*.html
 timeline-*.html
 trace-*.txt
 
+# Build artifacts
+dist/
+*.egg-info/
+
 # Misc
 install.sh
 logs/
 repo-context.txt
+schema_baseline.json

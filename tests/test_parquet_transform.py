@@ -174,6 +174,90 @@ class TestManifest:
             assert actual == expected_files, f"{table_name}: disk {actual} != manifest {expected_files}"
 
 
+# ─── Data Package (Frictionless) ──────────────────────────────────────
+
+
+EXPECTED_TABLES = ["entries", "features", "xrefs", "comments", "publications"]
+
+
+class TestDataPackage:
+    def test_datapackage_exists(self, lake_dir):
+        assert os.path.exists(os.path.join(lake_dir, "datapackage.json"))
+
+    def test_datapackage_valid_structure(self, lake_dir):
+        with open(os.path.join(lake_dir, "datapackage.json")) as f:
+            dp = json.load(f)
+        assert dp["name"] == "uniprot-parquet-lake"
+        assert "resources" in dp
+        assert len(dp["resources"]) == len(EXPECTED_TABLES)
+
+    def test_datapackage_all_tables_present(self, lake_dir):
+        with open(os.path.join(lake_dir, "datapackage.json")) as f:
+            dp = json.load(f)
+        names = {r["name"] for r in dp["resources"]}
+        assert names == set(EXPECTED_TABLES)
+
+    def test_datapackage_fields_have_descriptions(self, lake_dir):
+        with open(os.path.join(lake_dir, "datapackage.json")) as f:
+            dp = json.load(f)
+        for resource in dp["resources"]:
+            for field in resource["schema"]["fields"]:
+                assert field.get("description"), (
+                    f"{resource['name']}.{field['name']} is missing a description"
+                )
+
+    def test_datapackage_fields_have_arrow_types(self, lake_dir):
+        with open(os.path.join(lake_dir, "datapackage.json")) as f:
+            dp = json.load(f)
+        for resource in dp["resources"]:
+            for field in resource["schema"]["fields"]:
+                assert "arrowType" in field, (
+                    f"{resource['name']}.{field['name']} is missing arrowType"
+                )
+                assert "nullable" in field, (
+                    f"{resource['name']}.{field['name']} is missing nullable"
+                )
+
+    def test_datapackage_foreign_keys(self, lake_dir):
+        with open(os.path.join(lake_dir, "datapackage.json")) as f:
+            dp = json.load(f)
+        resource_map = {r["name"]: r for r in dp["resources"]}
+        # Child tables should have foreign keys to entries
+        for child in ["features", "xrefs", "comments", "publications"]:
+            fks = resource_map[child]["schema"]["foreignKeys"]
+            fk_fields = {fk["fields"][0] for fk in fks}
+            assert "acc" in fk_fields, f"{child} missing acc foreign key"
+            assert "taxid" in fk_fields, f"{child} missing taxid foreign key"
+
+    def test_datapackage_matches_manifest(self, lake_dir):
+        with open(os.path.join(lake_dir, "manifest.json")) as f:
+            manifest = json.load(f)
+        with open(os.path.join(lake_dir, "datapackage.json")) as f:
+            dp = json.load(f)
+        for resource in dp["resources"]:
+            name = resource["name"]
+            m_table = manifest["tables"][name]
+            # Field count must match
+            assert len(resource["schema"]["fields"]) == len(m_table["columns"]), (
+                f"{name}: datapackage has {len(resource['schema']['fields'])} fields "
+                f"but manifest has {len(m_table['columns'])} columns"
+            )
+            # Row count must match
+            assert resource["rowCount"] == m_table["row_count"]
+
+    def test_datapackage_frictionless_spec(self, lake_dir):
+        """Validate the descriptor against the official Frictionless Data Package spec."""
+        from frictionless import Package
+
+        with open(os.path.join(lake_dir, "datapackage.json")) as f:
+            descriptor = json.load(f)
+        report = Package.validate_descriptor(descriptor)
+        assert report.valid, (
+            f"datapackage.json failed Frictionless validation: "
+            f"{report.stats['errors']} errors, {report.stats['warnings']} warnings"
+        )
+
+
 # ─── Schema checks ──────────────────────────────────────────────────
 
 

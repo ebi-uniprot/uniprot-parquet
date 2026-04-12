@@ -26,6 +26,7 @@ Output layout:
     comments/comments_00001.parquet, ...
     publications/publications_00001.parquet, ...
     manifest.json
+    datapackage.json
 
 Schema is inferred automatically from the data via DuckDB's read_json_auto.
 
@@ -49,6 +50,7 @@ from datetime import datetime, timezone
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+from frictionless import Package
 
 
 def eprint(*args, **kwargs):
@@ -130,12 +132,25 @@ def build_read_clause(jsonl_path: str) -> str:
     )
 
 
-def stage_to_parquet(con, read_clause: str, staging_path: str) -> str:
+def _human_size(nbytes: int | float) -> str:
+    """Return a human-readable size string (e.g. '2.4 MB', '158.3 GB')."""
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if abs(nbytes) < 1024 or unit == "TB":
+            if unit == "bytes":
+                n = int(nbytes)
+                return f"{n} byte" if n == 1 else f"{n} bytes"
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024
+    return f"{nbytes:.1f} TB"  # pragma: no cover
+
+
+def stage_to_parquet(con, read_clause: str, staging_path: str) -> tuple[str, int]:
     """Convert JSONL to a Parquet staging file for faster repeated reads.
 
     Parses the JSON once and writes a zstd-compressed Parquet file.
-    Returns a read_parquet() clause that can replace the original
-    read_json() clause in all SQL templates.
+    Returns a (read_parquet_clause, staged_bytes) tuple — the clause
+    replaces the original read_json() in all SQL templates, and
+    staged_bytes is the on-disk size for compression ratio reporting.
 
     At production scale (~250M entries, 160GB compressed JSON), this
     trades one JSON parse (~2-4h) for five fast Parquet reads instead
@@ -151,9 +166,9 @@ def stage_to_parquet(con, read_clause: str, staging_path: str) -> str:
         TO '{safe_path}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)
     """)
-    size_gb = os.path.getsize(staging_path) / (1024**3)
-    eprint(f"  Staged in {time.time()-t0:.1f}s ({size_gb:.1f} GB)")
-    return f"read_parquet('{safe_path}')"
+    staged_bytes = os.path.getsize(staging_path)
+    eprint(f"  Staged in {time.time()-t0:.1f}s ({_human_size(staged_bytes)})")
+    return f"read_parquet('{safe_path}')", staged_bytes
 
 
 def discover_schema_paths(staging_path: str) -> set[str]:
@@ -208,7 +223,7 @@ def discover_schema_paths(staging_path: str) -> set[str]:
 def init_duckdb(memory_limit: str, threads: int | None,
                  temp_dir: str | None = None) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
-    con.sql(f"SET memory_limit='{memory_limit}'")
+    con.sql(f"SET memory_limit='{_sql_escape(memory_limit)}'")
     if threads:
         con.sql(f"SET threads={threads}")
     # Priority: explicit --temp-dir > $TMPDIR (SLURM local scratch) > /tmp
@@ -771,7 +786,6 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
     os.makedirs(tmp_dir, exist_ok=True)
 
     total_rows = 0
-    file_num = 0
     parquet_files = []
     arrow_schema = None
     writer = None
@@ -867,6 +881,279 @@ def _schema_to_dict(arrow_schema):
     return columns
 
 
+# ─── Column semantic descriptions ───────────────────────────────────────
+# Maps (table, column) → human-readable description for datapackage.json.
+# Arrow types and nullability come from the actual Parquet schema; these
+# descriptions encode the *meaning* that Parquet metadata cannot capture.
+
+COLUMN_DESCRIPTIONS = {
+    # ── entries ──
+    ("entries", "acc"):                "UniProtKB primary accession (e.g. P05067). Stable identifier; unique per entry.",
+    ("entries", "id"):                 "UniProtKB mnemonic entry name (e.g. A4_HUMAN). May change between releases.",
+    ("entries", "reviewed"):           "True for Swiss-Prot (manually reviewed); false for TrEMBL (automated annotation).",
+    ("entries", "secondary_accs"):     "List of secondary (merged/demerged) accessions that resolve to this entry.",
+    ("entries", "taxid"):              "NCBI taxonomy ID of the source organism (e.g. 9606 for Homo sapiens).",
+    ("entries", "organism_name"):      "Scientific name of the source organism.",
+    ("entries", "organism_common"):    "Common name of the source organism (e.g. 'Human'). May be null.",
+    ("entries", "lineage"):            "Full taxonomic lineage as a list of taxon names, root to species.",
+    ("entries", "gene_names"):         "List of primary gene names across all genes associated with this entry.",
+    ("entries", "gene_synonyms"):      "Flattened list of gene name synonyms across all genes.",
+    ("entries", "protein_name"):       "Recommended (Swiss-Prot) or submitted (TrEMBL) full protein name.",
+    ("entries", "alt_protein_names"):  "List of alternative full protein names from proteinDescription.alternativeNames.",
+    ("entries", "protein_flag"):       "Protein description flag: 'Precursor', 'Fragment', 'Precursor; Fragment', or null.",
+    ("entries", "ec_numbers"):         "Distinct EC (Enzyme Commission) numbers extracted from all naming blocks.",
+    ("entries", "protein_existence"):  "Protein existence evidence level (e.g. 'Evidence at protein level').",
+    ("entries", "annotation_score"):   "UniProt annotation score (1-5). Higher = more richly annotated.",
+    ("entries", "sequence"):           "Full amino acid sequence (one-letter IUPAC codes).",
+    ("entries", "seq_length"):         "Sequence length in amino acids.",
+    ("entries", "seq_mass"):           "Molecular weight of the unprocessed precursor in Daltons.",
+    ("entries", "seq_md5"):            "MD5 hash of the sequence (lowercase hex). Useful for deduplication.",
+    ("entries", "seq_crc64"):          "CRC64 checksum of the sequence. Used by UniProt for integrity checks.",
+    ("entries", "go_ids"):             "Distinct Gene Ontology term IDs (e.g. GO:0005634) from cross-references.",
+    ("entries", "xref_dbs"):           "Distinct database names referenced in cross-references (e.g. PDB, Ensembl).",
+    ("entries", "keyword_ids"):        "UniProt keyword IDs (e.g. KW-0181).",
+    ("entries", "keyword_names"):      "UniProt keyword names (e.g. 'Complete proteome').",
+    ("entries", "first_public"):       "Date the entry was first made public in UniProtKB.",
+    ("entries", "last_modified"):      "Date of the last annotation update.",
+    ("entries", "last_seq_modified"):  "Date of the last sequence update.",
+    ("entries", "entry_version"):      "Entry version number (incremented on any change).",
+    ("entries", "seq_version"):        "Sequence version number (incremented only on sequence changes).",
+    ("entries", "feature_count"):      "Number of positional features (domains, sites, variants, etc.).",
+    ("entries", "xref_count"):         "Number of cross-references to external databases.",
+    ("entries", "comment_count"):      "Number of comment annotations (function, disease, etc.).",
+    ("entries", "reference_count"):    "Number of literature/submission references.",
+    ("entries", "uniparc_id"):         "UniParc identifier (UPI) linking to the sequence archive.",
+    ("entries", "entry_type"):         "Raw entryType string (e.g. 'UniProtKB reviewed (Swiss-Prot)'). Lossless.",
+    ("entries", "extra_attributes"):   "Nested struct with countByCommentType, countByFeatureType, uniParcId.",
+    ("entries", "organism"):           "Full nested organism struct from the original JSON (lossless).",
+    ("entries", "protein_desc"):       "Full nested proteinDescription struct (lossless).",
+    ("entries", "genes"):              "Full nested genes array (lossless). Contains all gene naming blocks.",
+    ("entries", "keywords"):           "Full nested keywords array (lossless).",
+    ("entries", "organism_hosts"):     "Full nested organismHosts array (for viruses — host organisms). May be null.",
+    ("entries", "gene_locations"):     "Full nested geneLocations array (mitochondrial, plastid, etc.). May be null.",
+
+    # ── features ──
+    ("features", "acc"):               "Parent entry's primary accession. Foreign key → entries.acc.",
+    ("features", "from_reviewed"):     "True if the parent entry is Swiss-Prot (reviewed).",
+    ("features", "taxid"):             "NCBI taxonomy ID of the parent entry. Foreign key → entries.taxid.",
+    ("features", "organism_name"):     "Scientific name of the parent entry's organism (denormalized for convenience).",
+    ("features", "seq_length"):        "Sequence length of the parent entry (denormalized for coverage calculations).",
+    ("features", "type"):              "Feature type (e.g. 'Domain', 'Signal peptide', 'Natural variant').",
+    ("features", "start_pos"):         "Start position in the sequence (1-based, inclusive). Cast to integer.",
+    ("features", "end_pos"):           "End position in the sequence (1-based, inclusive). Cast to integer.",
+    ("features", "start_modifier"):    "Position modifier: 'EXACT', 'OUTSIDE', 'UNSURE', or null.",
+    ("features", "end_modifier"):      "Position modifier: 'EXACT', 'OUTSIDE', 'UNSURE', or null.",
+    ("features", "description"):       "Free-text description of the feature annotation.",
+    ("features", "feature_id"):        "UniProt feature identifier (e.g. PRO_0000001234). May be null.",
+    ("features", "evidence_codes"):    "List of evidence codes (e.g. ECO:0000269) supporting this feature.",
+    ("features", "original_sequence"): "Original amino acids before the variant/mutation. Null for non-variant features.",
+    ("features", "alternative_sequences"): "List of alternative amino acid sequences for variant features.",
+    ("features", "ligand_name"):       "Name of the bound ligand (for Binding site features). May be null.",
+    ("features", "ligand_id"):         "ChEBI or other identifier for the ligand. May be null.",
+    ("features", "ligand_label"):      "Label distinguishing multiple ligands in the same entry. May be null.",
+    ("features", "ligand_note"):       "Additional note about the ligand binding. May be null.",
+    ("features", "feature"):           "Full nested feature struct from the original JSON (lossless).",
+
+    # ── xrefs ──
+    ("xrefs", "acc"):                  "Parent entry's primary accession. Foreign key → entries.acc.",
+    ("xrefs", "from_reviewed"):        "True if the parent entry is Swiss-Prot (reviewed).",
+    ("xrefs", "taxid"):               "NCBI taxonomy ID of the parent entry. Foreign key → entries.taxid.",
+    ("xrefs", "database"):            "External database name (e.g. 'PDB', 'Ensembl', 'GO', 'InterPro').",
+    ("xrefs", "id"):                  "Identifier in the external database (e.g. '1ABC' for PDB).",
+    ("xrefs", "properties"):          "Database-specific key-value properties as a nested struct/list.",
+    ("xrefs", "isoform_id"):          "Isoform accession if this xref is specific to an isoform. May be null.",
+    ("xrefs", "evidences"):           "Evidence records supporting this cross-reference. May be null.",
+
+    # ── comments ──
+    ("comments", "acc"):               "Parent entry's primary accession. Foreign key → entries.acc.",
+    ("comments", "from_reviewed"):     "True if the parent entry is Swiss-Prot (reviewed).",
+    ("comments", "taxid"):            "NCBI taxonomy ID of the parent entry. Foreign key → entries.taxid.",
+    ("comments", "comment_type"):     "Comment type (e.g. 'FUNCTION', 'DISEASE', 'SUBCELLULAR LOCATION').",
+    ("comments", "text_value"):       "Concatenated free-text values (paragraphs joined by double newline). Null for structured-only comments.",
+    ("comments", "comment"):          "Full comment as JSON string (lossless). Use comment->>'$.key' to extract fields.",
+
+    # ── publications ──
+    ("publications", "acc"):           "Parent entry's primary accession. Foreign key → entries.acc.",
+    ("publications", "from_reviewed"): "True if the parent entry is Swiss-Prot (reviewed).",
+    ("publications", "taxid"):        "NCBI taxonomy ID of the parent entry. Foreign key → entries.taxid.",
+    ("publications", "reference_number"): "Position of this reference in the entry's reference list (1-based).",
+    ("publications", "citation_type"): "Citation type: 'journal article', 'submission', 'book', 'patent', etc.",
+    ("publications", "citation_id"):  "Citation identifier (PubMed ID, DOI, or other). May be null for submissions.",
+    ("publications", "title"):        "Publication title. May be null for submissions without titles.",
+    ("publications", "authors"):      "List of author names. May be null.",
+    ("publications", "authoring_group"): "Authoring group/consortium name. May be null.",
+    ("publications", "publication_date"): "Publication or submission date (string, as provided by UniProt).",
+    ("publications", "journal"):      "Journal name. Null for non-journal citations.",
+    ("publications", "volume"):       "Journal volume. Null for non-journal citations.",
+    ("publications", "first_page"):   "First page number. Null for non-journal citations.",
+    ("publications", "last_page"):    "Last page number. Null for non-journal citations.",
+    ("publications", "submission_database"): "Database name for submissions (e.g. 'EMBL/GenBank/DDBJ'). Null otherwise.",
+    ("publications", "citation_xrefs"): "Cross-references within the citation (PubMed, DOI, etc.).",
+    ("publications", "reference_positions"): "List of reference position strings (e.g. 'NUCLEOTIDE SEQUENCE').",
+    ("publications", "reference_comments"): "List of reference comment structs (scope, source, etc.).",
+    ("publications", "evidences"):    "Evidence records for this reference. May be null.",
+    ("publications", "reference"):    "Full nested reference struct from the original JSON (lossless).",
+}
+
+
+# ─── Arrow → Frictionless type mapping ──────────────────────────────────
+
+def _arrow_type_to_frictionless(arrow_type_str: str) -> dict:
+    """Map an Arrow type string to a Frictionless Data Package field type + format.
+
+    Returns a dict with 'type' and optionally 'format' and 'arrayItem'.
+    Frictionless spec doesn't natively support nested structs or arrays,
+    so we use 'array' and 'object' as type with richer_type for the Arrow detail.
+    """
+    s = arrow_type_str.strip()
+
+    # Simple scalar types
+    if s in ("bool", "boolean"):
+        return {"type": "boolean"}
+    if s in ("int32", "int64", "uint32", "uint64", "int16", "uint16", "int8", "uint8"):
+        return {"type": "integer"}
+    if s in ("float", "double", "float16", "float32", "float64"):
+        return {"type": "number"}
+    if s in ("string", "utf8", "large_string", "large_utf8"):
+        return {"type": "string"}
+    if s == "date32[day]":
+        return {"type": "date"}
+    if s.startswith("timestamp"):
+        return {"type": "datetime"}
+    if s == "json":
+        return {"type": "object", "format": "json"}
+
+    # List types
+    if s.startswith("list<"):
+        return {"type": "array"}
+
+    # Struct/nested types
+    if s.startswith("struct<") or s.startswith("map<"):
+        return {"type": "object"}
+
+    # Fallback
+    return {"type": "string", "format": "default"}
+
+
+def _build_datapackage(manifest: dict, release: str) -> dict:
+    """Build a Frictionless Data Package descriptor from a manifest.
+
+    The descriptor follows https://specs.frictionlessdata.io/data-package/
+    and https://specs.frictionlessdata.io/tabular-data-resource/ with
+    extensions for Arrow type detail, nullability, and sort order.
+
+    This makes the lake self-describing and machine-readable per FAIR
+    principles (Findable, Accessible, Interoperable, Reusable).
+    """
+    resources = []
+
+    for table_name, table_info in manifest["tables"].items():
+        meta = TABLE_META.get(table_name, {})
+
+        # Build field descriptors from the actual Parquet schema
+        fields = []
+        for col in table_info.get("columns", []):
+            col_name = col["name"]
+            frictionless = _arrow_type_to_frictionless(col["type"])
+
+            field = {
+                "name": col_name,
+                "type": frictionless["type"],
+                "description": COLUMN_DESCRIPTIONS.get((table_name, col_name), ""),
+                "constraints": {
+                    "required": not col["nullable"],
+                },
+                "arrowType": col["type"],
+                "nullable": col["nullable"],
+            }
+            if "format" in frictionless:
+                field["format"] = frictionless["format"]
+
+            # Mark which category this column belongs to
+            categories = meta.get("columns", {})
+            if col_name in categories.get("convenience", []):
+                field["columnCategory"] = "convenience"
+            elif col_name in categories.get("nested", []):
+                field["columnCategory"] = "nested"
+
+            fields.append(field)
+
+        # Build the resource descriptor
+        resource = {
+            "name": table_name,
+            "description": meta.get("description", table_info.get("description", "")),
+            "path": [f"{table_name}/{f}" for f in table_info.get("files", [])],
+            "format": "parquet",
+            "mediatype": "application/vnd.apache.parquet",
+            "encoding": "binary",
+            "compression": "zstd",
+            "schema": {
+                "fields": fields,
+                "primaryKey": meta.get("primary_key", table_info.get("primary_key", [])),
+                "foreignKeys": [
+                    {
+                        "fields": [fk_col],
+                        "reference": {
+                            "resource": ref.split(".")[0],
+                            "fields": [ref.split(".")[1]] if "." in ref else [ref],
+                        },
+                    }
+                    for fk_col, ref in meta.get("foreign_keys", table_info.get("foreign_keys", {})).items()
+                ],
+            },
+            "rowCount": table_info.get("row_count", 0),
+            "sortOrder": table_info.get("sort_order", []),
+        }
+
+        resources.append(resource)
+
+    datapackage = {
+        "$schema": "https://specs.frictionlessdata.io/schemas/data-package.json",
+        "name": "uniprot-parquet-lake",
+        "title": "UniProtKB Parquet Data Lake",
+        "description": (
+            "A denormalized, analysis-ready Parquet representation of the complete "
+            "UniProtKB database. Five sorted tables (entries, features, xrefs, "
+            "comments, publications) preserve all upstream data losslessly while "
+            "providing flattened convenience columns for common query patterns."
+        ),
+        "homepage": "https://github.com/dlrice/uniprot-parquet",
+        "version": "1.0.0",
+        "licenses": [
+            {
+                "name": "MIT",
+                "path": "https://opensource.org/licenses/MIT",
+            },
+            {
+                "name": "CC-BY-4.0",
+                "path": "https://creativecommons.org/licenses/by/4.0/",
+                "title": "UniProt data is licensed under Creative Commons Attribution 4.0",
+            },
+        ],
+        "sources": [
+            {
+                "title": "UniProt Knowledgebase (UniProtKB)",
+                "path": "https://www.uniprot.org/",
+            },
+        ],
+        "contributors": [
+            {
+                "title": "Daniel Rice",
+                "role": "author",
+            },
+        ],
+        "keywords": [
+            "UniProtKB", "UniProt", "proteomics", "bioinformatics",
+            "Parquet", "data lake", "FAIR",
+        ],
+        "created": manifest.get("generated_at", ""),
+        "uniprotRelease": release,
+        "resources": resources,
+    }
+
+    return datapackage
+
+
 # ─── Main ───────────────────────────────────────────────────────────────
 
 def main():
@@ -941,10 +1228,11 @@ def main():
         if tables_to_write:
             eprint("\n--- PARQUET STAGING ---")
             os.makedirs(staging_dir, exist_ok=True)
-            read_clause = stage_to_parquet(con, json_read_clause, staging_path)
+            read_clause, staged_bytes = stage_to_parquet(con, json_read_clause, staging_path)
         else:
             eprint("\n--- PARQUET STAGING (skipped — all tables already written) ---")
             read_clause = json_read_clause
+            staged_bytes = None
 
         # ── Discover schema (single source of truth for all SQL generation) ──
         # Only needed when we have tables to write (staging must have occurred).
@@ -1043,14 +1331,42 @@ def main():
             json.dump(manifest, f, indent=2)
         eprint(f"  Wrote {manifest_path}")
 
+        # ── Write datapackage.json (Frictionless Data Package descriptor) ──
+        datapackage = _build_datapackage(manifest, args.release)
+        datapackage_path = os.path.join(outdir, "datapackage.json")
+        with open(datapackage_path, "w") as f:
+            json.dump(datapackage, f, indent=2)
+        eprint(f"  Wrote {datapackage_path}")
+
+        # Validate against the Frictionless spec
+        report = Package.validate_descriptor(datapackage)
+        if report.valid:
+            eprint("  Frictionless validation: PASSED")
+        else:
+            eprint(f"  WARNING: Frictionless validation failed "
+                   f"({report.stats['errors']} errors, "
+                   f"{report.stats['warnings']} warnings)")
+
         # ── Summary ──
         elapsed = time.time() - t_total
         eprint("\n" + "=" * 60)
         eprint(f"DONE in {elapsed:.1f}s")
+        total_parquet_bytes = 0
         for name, _, _ in TABLE_DEFS:
+            table_dir = os.path.join(outdir, name)
+            table_bytes = sum(
+                os.path.getsize(os.path.join(table_dir, f))
+                for f in manifest_tables[name]["files"]
+            )
+            total_parquet_bytes += table_bytes
             status = " (skipped)" if name in skip_set else ""
-            eprint(f"  {name}: {manifest_tables[name]['row_count']:,} rows{status}")
-        eprint(f"  Total: {manifest['total_rows']:,} rows")
+            eprint(f"  {name}: {manifest_tables[name]['row_count']:,} rows, "
+                   f"{_human_size(table_bytes)}{status}")
+        eprint(f"  Total: {manifest['total_rows']:,} rows, {_human_size(total_parquet_bytes)} Parquet")
+        if staged_bytes and staged_bytes > 0:
+            ratio = staged_bytes / total_parquet_bytes if total_parquet_bytes > 0 else 0
+            eprint(f"  Compression: staged {_human_size(staged_bytes)} → "
+                   f"{_human_size(total_parquet_bytes)} Parquet ({ratio:.1f}x)")
         eprint("=" * 60)
 
     finally:

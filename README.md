@@ -1,5 +1,7 @@
 # UniProtKB Parquet Data Lake
 
+[![CI](https://github.com/dlrice/uniprot-parquet/actions/workflows/ci.yml/badge.svg)](https://github.com/dlrice/uniprot-parquet/actions/workflows/ci.yml)
+
 Analysis-ready Parquet tables covering the complete UniProtKB dataset — sorted, denormalized, and queryable from any language that reads Parquet.
 
 ## Tables
@@ -172,6 +174,8 @@ con.sql("SELECT reviewed, count(*) as n FROM entries GROUP BY reviewed").show()
 
 `manifest.json` inside the lake directory lists every Parquet file, its schema, row count, sort order, and semantic metadata (table descriptions, primary keys, foreign keys, column categories). Tools and LLM agents can read this to discover the data and generate correct joins without scanning files.
 
+`datapackage.json` is a [Frictionless Data Package](https://specs.frictionlessdata.io/data-package/) descriptor generated alongside the manifest. It makes the lake self-describing and machine-readable per [FAIR data principles](https://www.go-fair.org/fair-principles/) (Findable, Accessible, Interoperable, Reusable). Each resource includes the full Arrow type for every column, nullability constraints, semantic descriptions, primary keys, foreign keys, sort orders, and column categories (convenience vs nested). The descriptor also records the UniProt release, dual licensing (MIT for the pipeline code, CC-BY-4.0 for UniProt data), and provenance.
+
 ### JSONL (universal fallback)
 
 `sorted.jsonl.zst` is the complete dataset in a format any language can read. Sorted identically to the Parquet tables.
@@ -248,7 +252,7 @@ micromamba activate uniprot-lake
 Or with pip (core dependencies only):
 
 ```bash
-pip install duckdb pyarrow orjson ijson zstandard pytest
+pip install duckdb pyarrow orjson ijson zstandard pytest frictionless
 ```
 
 ### Demo
@@ -339,7 +343,7 @@ UniProtKB.json.gz
        |  (pre-sorted input makes DuckDB ORDER BY nearly free)
        v
 +--------------------+   DuckDB + PyArrow
-| PARQUET_TRANSFORM  |──> lake/ + manifest.json
+| PARQUET_TRANSFORM  |──> lake/ + manifest.json + datapackage.json
 +--------+-----------+   (JSONL staged to Parquet once, then 5 fast reads)
          |
          v
@@ -411,7 +415,7 @@ python -m pytest tests/ -v --stress
 
 The default fixture is fetched automatically on first `pytest` run if not already present. It pulls ~4,000 entries from UniProtKB via targeted REST API queries (viruses, fragments, isoforms, bacteria, fungi, multiple TrEMBL organisms, etc.) and always includes the top 100 most heavily annotated Swiss-Prot and TrEMBL entries, discovered by sampling candidate pools from well-studied organisms and ranking by total annotation count (features + xrefs + comments + references). The Swiss-Prot champion is P0DTD1 (SARS-CoV-2 replicase, ~6,300 annotations); the TrEMBL champion is typically a titin ortholog (~570 annotations). These stress-test every child table at maximum annotation volume.
 
-The `--stress` flag swaps in a ~15K-entry dataset assembled from 30+ queries spanning archaea, toxins, allergens, pharmaceuticals, long/short sequences, and TrEMBL from 10+ organisms. Both suites run the same 81 tests — row counts, column schemas, data integrity, sort order, manifest consistency, idempotency, `--skip-existing` resume, full roundtrip equivalence, and the production validator across all five tables. To re-fetch fixtures (e.g. after a UniProtKB release), pass `--force`:
+The `--stress` flag swaps in a ~15K-entry dataset assembled from 30+ queries spanning archaea, toxins, allergens, pharmaceuticals, long/short sequences, and TrEMBL from 10+ organisms. Both suites run the same 89 tests — row counts, column schemas, data integrity, sort order, manifest consistency, data package validation, idempotency, `--skip-existing` resume, full roundtrip equivalence, and the production validator across all five tables. To re-fetch fixtures (e.g. after a UniProtKB release), pass `--force`:
 
 ```bash
 python tests/fetch_fixtures.py --force                # re-fetch default
@@ -426,3 +430,6 @@ python tests/fetch_fixtures.py --scale stress --force  # re-fetch stress
 - **Streaming**: PyArrow (bounded-memory Arrow record batch → Parquet writing)
 - **Manifest**: `manifest.json` — file list, schemas, sort orders, semantic metadata
 - **Schema**: Inferred from data via DuckDB `read_json_auto` — no committed schema file
+- **FAIR metadata**: `datapackage.json` — [Frictionless Data Package](https://specs.frictionlessdata.io/data-package/) descriptor with Arrow types, nullability, semantic descriptions, keys, and licensing
+
+---

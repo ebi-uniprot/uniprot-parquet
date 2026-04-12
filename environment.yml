@@ -3,7 +3,7 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
-  - openjdk=17                        # Required for Nextflow
+  - openjdk=21                        # Required for Nextflow (LTS, supported through 2029)
   - nextflow>=25.10                   # Pipeline orchestration
   - python>=3.14
   - pigz                              # Parallel gzip decompression
@@ -14,8 +14,9 @@ dependencies:
   - ijson>=3.5,<4                     # Streaming JSON parser
   - zstandard>=0.25,<1                 # Zstd Python bindings for test fixtures
   - pytest>=9.0,<10                   # Test runner
+  - frictionless>=5.18,<6              # Frictionless Data Package validation
   # ── Demo notebook (demo/demo.ipynb) ──
   - notebook>=7.5,<8                  # Jupyter notebook server
   - polars>=1.39,<2                   # DataFrame library
-  - pandas>=2.3,<3                    # DataFrame library
+  - pandas>=3.0,<4                    # DataFrame library
   - matplotlib>=3.10,<4               # Plotting
