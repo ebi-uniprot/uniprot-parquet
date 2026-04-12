@@ -187,7 +187,7 @@ class TestDataPackage:
     def test_datapackage_valid_structure(self, lake_dir):
         with open(os.path.join(lake_dir, "datapackage.json")) as f:
             dp = json.load(f)
-        assert dp["name"] == "uniprot-parquet-lake"
+        assert dp["name"] == "uniprot-parquet"
         assert "resources" in dp
         assert len(dp["resources"]) == len(EXPECTED_TABLES)
 

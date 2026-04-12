@@ -22,10 +22,10 @@ All tables are sorted Swiss-Prot first (`reviewed`/`from_reviewed DESC`), then `
 
 ### Python (one-liner)
 
-`uniprot_lake.py` is a single-file client with no dependencies beyond DuckDB. It sets up views, macros, and httpfs automatically:
+`uniprot_parquet.py` is a single-file client with no dependencies beyond DuckDB. It sets up views, macros, and httpfs automatically:
 
 ```python
-from uniprot_lake import connect
+from uniprot_parquet import connect
 
 con = connect("/data/uniprot/2026_01/lake")                          # local
 con = connect("https://ftp.ebi.ac.uk/.../2026_01/lake")              # remote (auto-installs httpfs)
@@ -54,7 +54,7 @@ with open('setup_views.sql') as f:
 
 ### Helper macros
 
-Both `uniprot_lake.py` and `setup_views.sql` define parameterised table macros for common patterns:
+Both `uniprot_parquet.py` and `setup_views.sql` define parameterised table macros for common patterns:
 
 ```sql
 -- Annotation card for a single protein
@@ -113,7 +113,7 @@ df.filter(df.taxid == 9606).show()
 ### Example queries
 
 ```python
-from uniprot_lake import connect
+from uniprot_parquet import connect
 con = connect('/path/to/2026_01/lake')
 
 # All human kinases
@@ -246,7 +246,7 @@ Everything below is for pipeline operators who want to rebuild the lake from a U
 
 ```bash
 micromamba create -f environment.yml -y
-micromamba activate uniprot-lake
+micromamba activate uniprot-parquet
 ```
 
 Or with pip (core dependencies only):
@@ -281,7 +281,7 @@ Override defaults with flags:
 ./run_lake.sh full \
     --expected-count 248799253 \
     --input /path/to/UniProtKB.json.gz \
-    --outdir /scratch/uniprot_lake \
+    --outdir /scratch/uniprot_parquet \
     --duckdb-tmp /scratch/$USER/duckdb_tmp
 ```
 
@@ -297,7 +297,7 @@ nextflow run upjson2lake.nf -profile local \
 nextflow run upjson2lake.nf -profile prod \
     --inputfile /path/to/UniProtKB.json.gz \
     --release 2026_02 \
-    --outdir /scratch/uniprot_lake \
+    --outdir /scratch/uniprot_parquet \
     --process_memory '96 GB' \
     --expected_count 248799253 \
     --duckdb_temp /scratch/$USER/duckdb_tmp \
@@ -310,7 +310,7 @@ nextflow run upjson2lake.nf -profile prod \
 | Parameter          | Default                        | Description                                                                                |
 | ------------------ | ------------------------------ | ------------------------------------------------------------------------------------------ |
 | `--inputfile`      | `tests/fixtures/small.json.gz` | Input UniProtKB JSON(.gz) file                                                             |
-| `--outdir`         | `results/uniprot_lake`         | Output base directory                                                                      |
+| `--outdir`         | `results/uniprot_parquet`         | Output base directory                                                                      |
 | `--release`        | `2026_01`                      | Release label (output goes to `<outdir>/<release>/`)                                       |
 | `--process_memory` | `96 GB`                        | Memory for heavy processes (DuckDB gets 75% of this)                                       |
 | `--duckdb_pct`     | `75`                           | Percentage of process memory allocated to DuckDB buffer pool                               |

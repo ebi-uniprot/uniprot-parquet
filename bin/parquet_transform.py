@@ -1109,7 +1109,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
 
     datapackage = {
         "$schema": "https://specs.frictionlessdata.io/schemas/data-package.json",
-        "name": "uniprot-parquet-lake",
+        "name": "uniprot-parquet",
         "title": "UniProtKB Parquet Data Lake",
         "description": (
             "A denormalized, analysis-ready Parquet representation of the complete "
@@ -1319,7 +1319,7 @@ def main():
 
         # ── Write manifest.json ──
         manifest = {
-            "format": "uniprot-parquet-lake",
+            "format": "uniprot-parquet",
             "version": 1,
             "release": args.release,
             "generated_at": datetime.now(timezone.utc).isoformat(),

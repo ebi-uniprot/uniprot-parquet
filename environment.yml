@@ -1,4 +1,4 @@
-name: uniprot-lake
+name: uniprot-parquet
 channels:
   - conda-forge
   - bioconda

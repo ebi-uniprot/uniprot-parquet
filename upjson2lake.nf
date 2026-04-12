@@ -36,7 +36,7 @@ nextflow.enable.dsl = 2
 
 /* ── PARAMS ────────────────────────────────────────────────────────── */
 params.inputfile      = "${projectDir}/tests/fixtures/small.json.gz"
-params.outdir         = "${projectDir}/results/uniprot_lake"
+params.outdir         = "${projectDir}/results/uniprot_parquet"
 params.release        = "2026_01"
 params.process_memory = '96 GB'   // Total memory for heavy processes (Nextflow directive)
 params.duckdb_pct     = 75        // % of process_memory allocated to DuckDB buffer pool

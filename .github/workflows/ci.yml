@@ -60,6 +60,6 @@ jobs:
 
       - name: Check all scripts compile
         run: |
-          for f in bin/*.py uniprot_lake.py; do
+          for f in bin/*.py uniprot_parquet.py; do
             python -m py_compile "$f"
           done

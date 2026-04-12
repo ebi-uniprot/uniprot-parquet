@@ -6,7 +6,7 @@ to think about read_parquet() globs, httpfs setup, or join patterns.
 
 Usage (local):
 
-    from uniprot_lake import connect
+    from uniprot_parquet import connect
     con = connect("/data/uniprot/2026_01/lake")
 
     con.sql("SELECT * FROM entries WHERE taxid = 9606 LIMIT 5").show()
