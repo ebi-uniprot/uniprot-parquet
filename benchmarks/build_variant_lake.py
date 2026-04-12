@@ -2,23 +2,28 @@
 """
 Build VARIANT-based Parquet lakes for benchmarking against the star-schema baseline.
 
-Creates two layouts from the same sorted JSONL:
+Creates four layouts from the same sorted JSONL:
 
   Layout A (single table):
     entries/ with acc, taxid, reviewed (typed) + data VARIANT (full entry).
-    No child tables — features, xrefs, etc. accessed via dot notation at query time.
+    No child tables — everything accessed via dot notation at query time.
 
   Layout B (star schema + VARIANT):
     Same 5 tables as baseline, but convenience columns replaced by data VARIANT.
-    entries:      acc, taxid, reviewed, data VARIANT
-    features:     acc, taxid, type, data VARIANT (one row per feature)
-    xrefs:        acc, taxid, database, data VARIANT (one row per xref)
-    comments:     acc, taxid, comment_type, data VARIANT (one row per comment)
-    publications: acc, taxid, data VARIANT (one row per publication)
+
+  Layout C (star schema + VARIANT, arrays stripped from entries):
+    Like B, but entries VARIANT excludes array fields (features, xrefs, etc.)
+    to test whether stripping arrays improves entries query performance.
+
+  Layout D (hybrid — recommended):
+    Entries table uses the baseline's typed convenience columns.
+    Child tables use VARIANT data columns (same as B/C children).
+    Combines best of both: fast typed filtering on entries + schema-free children.
 
 Usage:
     python benchmarks/build_variant_lake.py [--input demo/lake/2026_01/sorted.jsonl.zst]
                                             [--outdir benchmarks/variant_lake]
+                                            [--baseline-lake demo/lake/2026_01/lake]
 """
 
 import argparse
@@ -156,8 +161,8 @@ def build_layout_b(con, read_clause, outdir):
                 e.organism.taxonId AS taxid,
                 CASE WHEN e.entryType LIKE '%Swiss-Prot%'
                      THEN true ELSE false END AS from_reviewed,
-                CAST(unnest.commentType AS VARCHAR) AS comment_type,
-                unnest::VARIANT AS data
+                trim('"' FROM CAST(unnest.commentType AS VARCHAR)) AS comment_type,
+                (unnest::JSON)::VARIANT AS data
             FROM {read_clause} e,
             LATERAL UNNEST(COALESCE(e.comments, [])) AS t(unnest)
             ORDER BY from_reviewed DESC, taxid, acc
@@ -310,8 +315,8 @@ def build_layout_c(con, read_clause, outdir):
                 e.organism.taxonId AS taxid,
                 CASE WHEN e.entryType LIKE '%Swiss-Prot%'
                      THEN true ELSE false END AS from_reviewed,
-                CAST(unnest.commentType AS VARCHAR) AS comment_type,
-                unnest::VARIANT AS data
+                trim('"' FROM CAST(unnest.commentType AS VARCHAR)) AS comment_type,
+                (unnest::JSON)::VARIANT AS data
             FROM {read_clause} e,
             LATERAL UNNEST(COALESCE(e.comments, [])) AS t(unnest)
             ORDER BY from_reviewed DESC, taxid, acc
@@ -351,12 +356,80 @@ def build_layout_c(con, read_clause, outdir):
     return total_elapsed
 
 
+def build_layout_d(con, read_clause, outdir, baseline_entries_path):
+    """Layout D: baseline entries (typed columns) + VARIANT child tables.
+
+    The hybrid approach — entries keep all 37 convenience columns for fast
+    filtering; child tables use VARIANT for schema flexibility.
+    """
+    import shutil
+
+    total_elapsed = 0.0
+
+    # ── entries — copy from baseline (typed convenience columns) ──
+    os.makedirs(os.path.join(outdir, "entries"), exist_ok=True)
+    dest = os.path.join(outdir, "entries", "entries_00001.parquet")
+    t0 = time.perf_counter()
+    shutil.copy2(baseline_entries_path, dest)
+    elapsed = time.perf_counter() - t0
+    total_elapsed += elapsed
+    size = os.path.getsize(dest)
+    rows = con.sql(f"SELECT count(*) FROM read_parquet('{dest}')").fetchone()[0]
+    print(f"  Layout D entries (baseline copy): {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
+          file=sys.stderr)
+
+    # ── Child tables — VARIANT (same as Layout B) ──
+    # Comments are MAP(VARCHAR, JSON) in JSONL, which becomes VARIANT(ARRAY)
+    # via unnest::VARIANT — dot notation won't work.  Go through JSON first
+    # to get VARIANT(OBJECT).
+    for table_name, array_field, typed_col_expr, variant_expr in [
+        ("features", "features",
+         "CAST(unnest.type AS VARCHAR) AS type,",
+         "unnest::VARIANT AS data"),
+        ("xrefs", "uniProtKBCrossReferences",
+         "CAST(unnest.database AS VARCHAR) AS database,",
+         "unnest::VARIANT AS data"),
+        ("comments", "comments",
+         "trim('\"' FROM CAST(unnest.commentType AS VARCHAR)) AS comment_type,",
+         "(unnest::JSON)::VARIANT AS data"),
+        ("publications", '"references"', "",
+         "unnest::VARIANT AS data"),
+    ]:
+        os.makedirs(os.path.join(outdir, table_name), exist_ok=True)
+        out = os.path.join(outdir, table_name, f"{table_name}_00001.parquet")
+        t0 = time.perf_counter()
+        con.sql(f"""
+            COPY (
+                SELECT
+                    e.primaryAccession AS acc,
+                    e.organism.taxonId AS taxid,
+                    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
+                         THEN true ELSE false END AS from_reviewed,
+                    {typed_col_expr}
+                    {variant_expr}
+                FROM {read_clause} e,
+                LATERAL UNNEST(COALESCE(e.{array_field}, [])) AS t(unnest)
+                ORDER BY from_reviewed DESC, taxid, acc
+            ) TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+        elapsed = time.perf_counter() - t0
+        total_elapsed += elapsed
+        size = os.path.getsize(out)
+        rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+        print(f"  Layout D {table_name}: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
+              file=sys.stderr)
+
+    return total_elapsed
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build VARIANT Parquet lakes")
     parser.add_argument("--input", default="demo/lake/2026_01/sorted.jsonl.zst",
                         help="Path to sorted JSONL(.zst) input")
     parser.add_argument("--outdir", default="benchmarks/variant_lake",
                         help="Output base directory")
+    parser.add_argument("--baseline-lake", default="demo/lake/2026_01/lake",
+                        help="Path to baseline star-schema lake (for Layout D entries)")
     parser.add_argument("--memory-limit", default="3GB",
                         help="DuckDB memory limit")
     args = parser.parse_args()
@@ -395,32 +468,42 @@ def main():
           file=sys.stderr)
     time_c = build_layout_c(con, read_clause, outdir_c)
 
+    # Layout D
+    baseline_entries = os.path.join(
+        args.baseline_lake, "entries", "entries_00001.parquet")
+    outdir_d = os.path.join(args.outdir, "layout_d")
+    os.makedirs(outdir_d, exist_ok=True)
+    print("\n--- Layout D (hybrid: typed entries + VARIANT children) ---",
+          file=sys.stderr)
+    time_d = build_layout_d(con, read_clause, outdir_d, baseline_entries)
+
     # Summary
-    total_a = sum(
-        os.path.getsize(os.path.join(r, f))
-        for r, _, files in os.walk(outdir_a) for f in files if f.endswith(".parquet")
-    )
-    total_b = sum(
-        os.path.getsize(os.path.join(r, f))
-        for r, _, files in os.walk(outdir_b) for f in files if f.endswith(".parquet")
-    )
-    total_c = sum(
-        os.path.getsize(os.path.join(r, f))
-        for r, _, files in os.walk(outdir_c) for f in files if f.endswith(".parquet")
-    )
+    totals = {}
+    for key, path in [("a", outdir_a), ("b", outdir_b),
+                      ("c", outdir_c), ("d", outdir_d)]:
+        totals[key] = sum(
+            os.path.getsize(os.path.join(r, f))
+            for r, _, files in os.walk(path) for f in files if f.endswith(".parquet")
+        )
 
     print(f"\n{'='*60}", file=sys.stderr)
-    print(f"  Layout A: {_human_size(total_a)} total, {time_a:.2f}s", file=sys.stderr)
-    print(f"  Layout B: {_human_size(total_b)} total, {time_b:.2f}s", file=sys.stderr)
-    print(f"  Layout C: {_human_size(total_c)} total, {time_c:.2f}s", file=sys.stderr)
+    print(f"  Layout A: {_human_size(totals['a'])} total, {time_a:.2f}s", file=sys.stderr)
+    print(f"  Layout B: {_human_size(totals['b'])} total, {time_b:.2f}s", file=sys.stderr)
+    print(f"  Layout C: {_human_size(totals['c'])} total, {time_c:.2f}s", file=sys.stderr)
+    print(f"  Layout D: {_human_size(totals['d'])} total, {time_d:.2f}s", file=sys.stderr)
     print(f"{'='*60}", file=sys.stderr)
 
     # Write metadata for benchmark script
     meta = {
         "input": args.input,
-        "layout_a": {"path": outdir_a, "total_bytes": total_a, "build_time_s": round(time_a, 3)},
-        "layout_b": {"path": outdir_b, "total_bytes": total_b, "build_time_s": round(time_b, 3)},
-        "layout_c": {"path": outdir_c, "total_bytes": total_c, "build_time_s": round(time_c, 3)},
+        "layout_a": {"path": outdir_a, "total_bytes": totals["a"],
+                      "build_time_s": round(time_a, 3)},
+        "layout_b": {"path": outdir_b, "total_bytes": totals["b"],
+                      "build_time_s": round(time_b, 3)},
+        "layout_c": {"path": outdir_c, "total_bytes": totals["c"],
+                      "build_time_s": round(time_c, 3)},
+        "layout_d": {"path": outdir_d, "total_bytes": totals["d"],
+                      "build_time_s": round(time_d, 3)},
         "duckdb_version": duckdb.__version__,
     }
     meta_path = os.path.join(args.outdir, "build_meta.json")

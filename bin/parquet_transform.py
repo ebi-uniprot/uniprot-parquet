@@ -638,6 +638,91 @@ ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
 """
 
 
+# ─── VARIANT child SQL builders (--variant-children) ───────────────────
+#
+# These replace the hand-extracted convenience columns with a single
+# VARIANT data column per child table.  Each row still has typed filter
+# columns (type, database, comment_type) for fast WHERE clauses;
+# everything else is accessed via data.field VARIANT dot notation.
+#
+# Advantages:
+#   - No schema_paths dependency — VARIANT absorbs any nested structure
+#   - ~300 fewer LOC than the convenience-column builders
+#   - Schema evolution "for free" — new fields appear automatically
+#
+# Requires: DuckDB ≥1.5 (VARIANT is a built-in type, no extension needed).
+
+
+def _build_features_variant_sql() -> str:
+    """Features with VARIANT data column."""
+    return """
+SELECT
+    e.primaryAccession                           AS acc,
+    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
+         THEN true ELSE false END                AS from_reviewed,
+    e.organism.taxonId                           AS taxid,
+    unnest.type                                  AS type,
+    unnest::VARIANT                              AS data
+FROM {read_clause} e,
+LATERAL UNNEST(COALESCE(e.features, [])) AS t(unnest)
+ORDER BY from_reviewed DESC, taxid, acc
+"""
+
+
+def _build_xrefs_variant_sql() -> str:
+    """Cross-references with VARIANT data column."""
+    return """
+SELECT
+    e.primaryAccession                           AS acc,
+    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
+         THEN true ELSE false END                AS from_reviewed,
+    e.organism.taxonId                           AS taxid,
+    unnest.database                              AS database,
+    unnest::VARIANT                              AS data
+FROM {read_clause} e,
+LATERAL UNNEST(COALESCE(e.uniProtKBCrossReferences, [])) AS t(unnest)
+ORDER BY from_reviewed DESC, taxid, acc
+"""
+
+
+def _build_comments_variant_sql() -> str:
+    """Comments with VARIANT data column.
+
+    Comments are MAP(VARCHAR, JSON) in the JSONL schema (not a typed struct),
+    so ``unnest::VARIANT`` produces VARIANT(ARRAY) with key-value pairs —
+    dot notation won't work.  Going through JSON first (``unnest::JSON``)
+    normalises the map to a JSON object, then ``::VARIANT`` gives us
+    VARIANT(OBJECT) with proper field access.
+    """
+    return """
+SELECT
+    e.primaryAccession                           AS acc,
+    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
+         THEN true ELSE false END                AS from_reviewed,
+    e.organism.taxonId                           AS taxid,
+    trim('"' FROM CAST(unnest.commentType AS VARCHAR)) AS comment_type,
+    (unnest::JSON)::VARIANT                      AS data
+FROM {read_clause} e,
+LATERAL UNNEST(COALESCE(e.comments, [])) AS t(unnest)
+ORDER BY from_reviewed DESC, taxid, acc
+"""
+
+
+def _build_publications_variant_sql() -> str:
+    """Publications with VARIANT data column."""
+    return """
+SELECT
+    e.primaryAccession                           AS acc,
+    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
+         THEN true ELSE false END                AS from_reviewed,
+    e.organism.taxonId                           AS taxid,
+    unnest::VARIANT                              AS data
+FROM {read_clause} e,
+LATERAL UNNEST(COALESCE(e."references", [])) AS t(unnest)
+ORDER BY from_reviewed DESC, taxid, acc
+"""
+
+
 # ─── Table definitions ──────────────────────────────────────────────────
 
 TABLE_DEFS = [
@@ -1186,6 +1271,12 @@ def main():
         help="Skip tables whose output directory already contains "
              "Parquet files. Enables resume after OOM.",
     )
+    parser.add_argument(
+        "--variant-children", action="store_true",
+        help="Use DuckDB VARIANT columns on child tables (features, xrefs, "
+             "comments, publications) instead of hand-extracted convenience "
+             "columns.  Requires DuckDB ≥1.5 (VARIANT is built-in).",
+    )
     args = parser.parse_args()
 
     jsonl_path = os.path.abspath(args.input)
@@ -1205,6 +1296,8 @@ def main():
 
     # ── Init DuckDB ──
     con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
+    if args.variant_children:
+        eprint("  VARIANT child tables enabled (DuckDB ≥1.5 built-in type)")
     staging_dir = os.path.join(outdir, ".staging")
     staging_path = os.path.join(staging_dir, "staged.parquet")
 
@@ -1293,15 +1386,26 @@ def main():
                 # All table SQL is built dynamically to handle optional fields.
                 # schema_paths is the single source of truth — no field is referenced
                 # without first checking that it exists in the staged Parquet schema.
-                _SQL_BUILDERS = {
-                    "entries":      _build_entries_sql,
-                    "features":     _build_features_sql,
-                    "xrefs":        _build_xrefs_sql,
-                    "comments":     _build_comments_sql,
-                    "publications": _build_publications_sql,
-                }
-                if sql_template is None:
-                    sql_template = _SQL_BUILDERS[name](schema_paths)
+                if getattr(args, "variant_children", False) and name != "entries":
+                    # VARIANT child tables — no schema_paths needed.
+                    _VARIANT_BUILDERS = {
+                        "features":     _build_features_variant_sql,
+                        "xrefs":        _build_xrefs_variant_sql,
+                        "comments":     _build_comments_variant_sql,
+                        "publications": _build_publications_variant_sql,
+                    }
+                    if sql_template is None:
+                        sql_template = _VARIANT_BUILDERS[name]()
+                else:
+                    _SQL_BUILDERS = {
+                        "entries":      _build_entries_sql,
+                        "features":     _build_features_sql,
+                        "xrefs":        _build_xrefs_sql,
+                        "comments":     _build_comments_sql,
+                        "publications": _build_publications_sql,
+                    }
+                    if sql_template is None:
+                        sql_template = _SQL_BUILDERS[name](schema_paths)
                 sql = sql_template.format(read_clause=read_clause)
                 row_count, files, arrow_schema = stream_to_parquet(
                     con, sql, table_dir, args.batch_size, label=name, sort_order=sort_order

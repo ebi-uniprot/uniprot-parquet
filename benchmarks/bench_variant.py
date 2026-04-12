@@ -243,17 +243,17 @@ def _layout_a_queries(base):
         {
             "name": "comment_function_search",
             "description": "FUNCTION comments for human (unnest at query time)",
+            # VARIANT arrays need element-wise extraction rather than a
+            # single CAST to a typed struct array.  Unnest comments, then
+            # unnest texts within each FUNCTION comment.
             "sql": f"""
                 SELECT e.acc,
-                       list_transform(
-                           CAST(c.texts AS STRUCT(value VARCHAR)[]),
-                           t -> t.value
-                       ) AS text_values
+                       CAST(tx.t.value AS VARCHAR) AS text_value
                 FROM {e} e,
-                LATERAL UNNEST(CAST(e.data.comments AS STRUCT(
-                    commentType VARCHAR, texts STRUCT(value VARCHAR)[]
-                )[])) AS t(c)
-                WHERE e.taxid = 9606 AND c.commentType = 'FUNCTION'
+                LATERAL UNNEST(e.data.comments) AS c1(cmt),
+                LATERAL UNNEST(cmt.texts) AS tx(t)
+                WHERE e.taxid = 9606
+                  AND CAST(cmt.commentType AS VARCHAR) = 'FUNCTION'
             """,
         },
         {
@@ -268,8 +268,16 @@ def _layout_a_queries(base):
     ]
 
 
-def _layout_b_queries(base):
-    """Layout B: star schema with VARIANT — child tables already unnested."""
+def _layout_b_queries(base, *, arrays_stripped=False):
+    """Layout B/C: star schema with VARIANT — child tables already unnested.
+
+    Args:
+        base: path to layout directory
+        arrays_stripped: True for Layout C where entries VARIANT has no
+            array fields (features, xrefs, comments, references).
+            Queries that would access those arrays on entries must
+            instead join with the appropriate child table.
+    """
     e = f"read_parquet('{base}/entries/*.parquet')"
     f = f"read_parquet('{base}/features/*.parquet')"
     x = f"read_parquet('{base}/xrefs/*.parquet')"
@@ -339,7 +347,16 @@ def _layout_b_queries(base):
         {
             "name": "go_term_search",
             "description": "Entries with GO:0005524 (ATP binding)",
-            "sql": f"""
+            # Layout C strips arrays from entries VARIANT, so xrefs live
+            # only in the child table — use a JOIN instead.
+            "sql": (f"""
+                SELECT DISTINCT e.acc,
+                       e.data.proteinDescription.recommendedName.fullName.value AS protein_name
+                FROM {e} e
+                JOIN {x} xr ON e.acc = xr.acc
+                WHERE xr.database = 'GO'
+                  AND CAST(xr.data.id AS VARCHAR) = 'GO:0005524'
+            """ if arrays_stripped else f"""
                 SELECT acc,
                        data.proteinDescription.recommendedName.fullName.value AS protein_name
                 FROM {e}
@@ -349,7 +366,7 @@ def _layout_b_queries(base):
                      IF x.database = 'GO'],
                     'GO:0005524'
                 )
-            """,
+            """),
         },
 
         # ── Aggregations ──
@@ -425,19 +442,158 @@ def _layout_b_queries(base):
         {
             "name": "comment_function_search",
             "description": "FUNCTION comments for human (pre-unnested table)",
+            # data.texts is VARIANT(ARRAY) — CAST to a typed struct array
+            # so LATERAL UNNEST can consume it.
             "sql": f"""
-                SELECT acc,
-                       list_transform(
-                           CAST(data.texts AS STRUCT(value VARCHAR)[]),
-                           t -> t.value
-                       ) AS text_values
-                FROM {c}
-                WHERE comment_type = 'FUNCTION' AND taxid = 9606
+                SELECT c.acc,
+                       CAST(tx.t.value AS VARCHAR) AS text_value
+                FROM {c} c,
+                LATERAL UNNEST(CAST(c.data.texts
+                    AS STRUCT(value VARCHAR, evidences JSON)[])) AS tx(t)
+                WHERE c.comment_type = 'FUNCTION' AND c.taxid = 9606
             """,
         },
         {
             "name": "publication_count_per_entry",
             "description": "Top 10 most-cited entries (pre-unnested table)",
+            "sql": f"SELECT acc, count(*) AS n FROM {p} GROUP BY acc ORDER BY n DESC LIMIT 10",
+        },
+    ]
+
+
+def _layout_d_queries(base):
+    """Layout D: typed entries (baseline columns) + VARIANT child tables.
+
+    Entries queries use typed convenience columns directly.
+    Child table queries use VARIANT dot notation (same as Layout B).
+    """
+    e = f"read_parquet('{base}/entries/*.parquet')"
+    f = f"read_parquet('{base}/features/*.parquet')"
+    x = f"read_parquet('{base}/xrefs/*.parquet')"
+    c = f"read_parquet('{base}/comments/*.parquet')"
+    p = f"read_parquet('{base}/publications/*.parquet')"
+
+    return [
+        # ── Point lookups (typed — same as baseline) ──
+        {
+            "name": "point_lookup_by_acc",
+            "description": "Single protein lookup by accession",
+            "sql": f"SELECT * FROM {e} WHERE acc = '{{acc}}'",
+            "setup": f"SELECT acc FROM {e} WHERE reviewed LIMIT 1",
+        },
+        {
+            "name": "protein_card_macro",
+            "description": "Protein card — key fields via typed columns",
+            "sql": f"""
+                SELECT acc, taxid, reviewed, organism_name, protein_name, sequence
+                FROM {e} WHERE acc = '{{acc}}'
+            """,
+            "setup": f"SELECT acc FROM {e} WHERE reviewed LIMIT 1",
+        },
+
+        # ── Organism filters (typed entries + VARIANT children) ──
+        {
+            "name": "organism_filter_human",
+            "description": "All human entries (taxid=9606)",
+            "sql": f"SELECT acc, gene_names, protein_name FROM {e} WHERE taxid = 9606",
+        },
+        {
+            "name": "organism_features",
+            "description": "Human domain features (VARIANT child table)",
+            "sql": f"""
+                SELECT acc,
+                       CAST(data.location.start.value AS INTEGER) AS start_pos,
+                       CAST(data.location.end.value AS INTEGER) AS end_pos,
+                       CAST(data.description AS VARCHAR) AS description
+                FROM {f} WHERE taxid = 9606 AND type = 'Domain'
+            """,
+        },
+
+        # ── Keyword / GO searches (typed entries) ──
+        {
+            "name": "keyword_search",
+            "description": "Entries with keyword 'Kinase'",
+            "sql": f"SELECT acc, protein_name FROM {e} WHERE list_contains(keyword_names, 'Kinase')",
+        },
+        {
+            "name": "go_term_search",
+            "description": "Entries with GO:0005524 (ATP binding, typed go_ids)",
+            "sql": f"SELECT acc, protein_name FROM {e} WHERE list_contains(go_ids, 'GO:0005524')",
+        },
+
+        # ── Aggregations ──
+        {
+            "name": "count_by_organism",
+            "description": "Entry count per organism (top 10)",
+            "sql": f"SELECT taxid, organism_name, count(*) AS n FROM {e} GROUP BY taxid, organism_name ORDER BY n DESC LIMIT 10",
+        },
+        {
+            "name": "feature_type_distribution",
+            "description": "Feature count by type (VARIANT child table)",
+            "sql": f"SELECT type, count(*) AS n FROM {f} GROUP BY type ORDER BY n DESC",
+        },
+        {
+            "name": "xref_database_distribution",
+            "description": "Xref count by database (top 10, VARIANT child table)",
+            "sql": f"SELECT database, count(*) AS n FROM {x} GROUP BY database ORDER BY n DESC LIMIT 10",
+        },
+
+        # ── Joins (typed entries + VARIANT children) ──
+        {
+            "name": "entries_join_features",
+            "description": "Entries + features for human",
+            "sql": f"""
+                SELECT e.acc, e.protein_name,
+                       ft.type,
+                       CAST(ft.data.location.start.value AS INTEGER) AS start_pos,
+                       CAST(ft.data.location.end.value AS INTEGER) AS end_pos,
+                       CAST(ft.data.description AS VARCHAR) AS description
+                FROM {e} e
+                JOIN {f} ft ON e.acc = ft.acc
+                WHERE e.taxid = 9606
+            """,
+        },
+
+        # ── Wide scan ──
+        {
+            "name": "full_scan_entries",
+            "description": "Full table scan — count all entries",
+            "sql": f"SELECT count(*) FROM {e}",
+        },
+        {
+            "name": "full_scan_xrefs",
+            "description": "Full table scan — count all xrefs",
+            "sql": f"SELECT count(*) FROM {x}",
+        },
+
+        # ── Nested column access ──
+        {
+            "name": "nested_organism_access",
+            "description": "Access organism via typed columns",
+            "sql": f"SELECT acc, taxid, organism_name FROM {e} WHERE taxid = 9606",
+        },
+        {
+            "name": "nested_protein_desc_access",
+            "description": "Access proteinDescription via typed column",
+            "sql": f"SELECT acc, protein_name FROM {e} WHERE protein_name IS NOT NULL LIMIT 50",
+        },
+
+        # ── Comment / publication queries (VARIANT children) ──
+        {
+            "name": "comment_function_search",
+            "description": "FUNCTION comments for human (VARIANT child table)",
+            "sql": f"""
+                SELECT c.acc,
+                       CAST(tx.t.value AS VARCHAR) AS text_value
+                FROM {c} c,
+                LATERAL UNNEST(CAST(c.data.texts
+                    AS STRUCT(value VARCHAR, evidences JSON)[])) AS tx(t)
+                WHERE c.comment_type = 'FUNCTION' AND c.taxid = 9606
+            """,
+        },
+        {
+            "name": "publication_count_per_entry",
+            "description": "Top 10 most-cited entries (VARIANT child table)",
             "sql": f"SELECT acc, count(*) AS n FROM {p} GROUP BY acc ORDER BY n DESC LIMIT 10",
         },
     ]
@@ -539,37 +695,40 @@ def format_comparison(all_results):
     lines.append("    A — single entries table, full VARIANT, no child tables")
     lines.append("    B — star schema + VARIANT (arrays included in entries VARIANT)")
     lines.append("    C — star schema + VARIANT (arrays STRIPPED from entries VARIANT)")
+    lines.append("    D — hybrid: typed entries (baseline) + VARIANT child tables")
 
     baseline = all_results.get("baseline", {})
     layout_a = all_results.get("layout_a", {})
     layout_b = all_results.get("layout_b", {})
     layout_c = all_results.get("layout_c", {})
+    layout_d = all_results.get("layout_d", {})
 
     bq = baseline.get("query_latency", {})
     aq = layout_a.get("query_latency", {})
     bq2 = layout_b.get("query_latency", {})
     cq = layout_c.get("query_latency", {})
+    dq = layout_d.get("query_latency", {})
 
     # ── Query Latency ──
     lines.append("\n┌────────────────────────────────────────────────────────────────────────────────┐")
     lines.append("│  1. QUERY LATENCY (median ms)                                                 │")
     lines.append("└────────────────────────────────────────────────────────────────────────────────┘\n")
 
-    lines.append(f"  {'Query':<28} {'Base':>8} {'A':>8} {'B':>8} {'C':>8} {'C/Base':>8}")
-    lines.append(f"  {'─'*28} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+    lines.append(f"  {'Query':<28} {'Base':>8} {'A':>8} {'B':>8} {'C':>8} {'D':>8} {'D/Base':>8}")
+    lines.append(f"  {'─'*28} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
 
     for name in bq:
         vals = {}
-        for key, src in [("base", bq), ("A", aq), ("B", bq2), ("C", cq)]:
+        for key, src in [("base", bq), ("A", aq), ("B", bq2), ("C", cq), ("D", dq)]:
             vals[key] = src.get(name, {}).get("median_ms")
 
         parts = []
-        for key in ["base", "A", "B", "C"]:
+        for key in ["base", "A", "B", "C", "D"]:
             v = vals[key]
             parts.append(f"{v:>7.1f}ms" if v is not None else f"{'ERR':>8}s")
 
-        if vals["base"] and vals["C"]:
-            ratio = vals["C"] / vals["base"]
+        if vals["base"] and vals.get("D"):
+            ratio = vals["D"] / vals["base"]
             r_str = f"{ratio:.1f}x"
             if ratio > 5.0:
                 r_str += " !!"
@@ -578,21 +737,22 @@ def format_comparison(all_results):
         else:
             r_str = "N/A"
 
-        lines.append(f"  {name:<28} {parts[0]} {parts[1]} {parts[2]} {parts[3]} {r_str:>8}")
+        lines.append(f"  {name:<28} {parts[0]} {parts[1]} {parts[2]} {parts[3]} {parts[4]} {r_str:>8}")
 
     # Row count verification
     lines.append(f"\n  Row count check:")
     mismatches = []
     for name in bq:
         b_rows = bq.get(name, {}).get("row_count")
-        c_rows = cq.get(name, {}).get("row_count")
-        if b_rows is not None and c_rows is not None and b_rows != c_rows:
-            mismatches.append(f"    {name}: base={b_rows} C={c_rows}")
+        for lbl, lq in [("C", cq), ("D", dq)]:
+            l_rows = lq.get(name, {}).get("row_count")
+            if b_rows is not None and l_rows is not None and b_rows != l_rows:
+                mismatches.append(f"    {name}: base={b_rows} {lbl}={l_rows}")
     if mismatches:
         for m in mismatches:
             lines.append(m)
     else:
-        lines.append(f"    All queries return identical row counts between Baseline and Layout C ✓")
+        lines.append(f"    All queries return identical row counts between Baseline and Layouts C/D ✓")
 
     # ── Storage ──
     lines.append("\n┌────────────────────────────────────────────────────────────────────────────────┐")
@@ -604,13 +764,14 @@ def format_comparison(all_results):
         "A": layout_a.get("storage", {}).get("totals", {}),
         "B": layout_b.get("storage", {}).get("totals", {}),
         "C": layout_c.get("storage", {}).get("totals", {}),
+        "D": layout_d.get("storage", {}).get("totals", {}),
     }
 
-    lines.append(f"  {'':>20} {'Base':>12} {'A':>12} {'B':>12} {'C':>12}")
-    lines.append(f"  {'─'*20} {'─'*12} {'─'*12} {'─'*12} {'─'*12}")
+    lines.append(f"  {'':>20} {'Base':>12} {'A':>12} {'B':>12} {'C':>12} {'D':>12}")
+    lines.append(f"  {'─'*20} {'─'*12} {'─'*12} {'─'*12} {'─'*12} {'─'*12}")
     for metric, key in [("Total size", "total_human"), ("Total rows", "total_rows"), ("Parquet columns", "total_parquet_columns")]:
         parts = []
-        for src_key in ["base", "A", "B", "C"]:
+        for src_key in ["base", "A", "B", "C", "D"]:
             v = storage_sources[src_key].get(key)
             if key == "total_rows" and v is not None:
                 parts.append(f"{v:>12,}")
@@ -618,20 +779,20 @@ def format_comparison(all_results):
                 parts.append(f"{v:>12}")
             else:
                 parts.append(f"{'—':>12}")
-        lines.append(f"  {metric:<20} {parts[0]} {parts[1]} {parts[2]} {parts[3]}")
+        lines.append(f"  {metric:<20} {parts[0]} {parts[1]} {parts[2]} {parts[3]} {parts[4]}")
 
     # Per-table
     lines.append(f"\n  Per-table:")
     all_tables = set()
-    for layout_key in ["baseline", "layout_a", "layout_b", "layout_c"]:
+    for layout_key in ["baseline", "layout_a", "layout_b", "layout_c", "layout_d"]:
         all_tables.update(all_results.get(layout_key, {}).get("storage", {}).get("tables", {}).keys())
 
     for table in sorted(all_tables):
         parts = []
-        for layout_key in ["baseline", "layout_a", "layout_b", "layout_c"]:
+        for layout_key in ["baseline", "layout_a", "layout_b", "layout_c", "layout_d"]:
             info = all_results.get(layout_key, {}).get("storage", {}).get("tables", {}).get(table, {})
             parts.append(info.get("total_human", "—"))
-        lines.append(f"    {table:<16} {parts[0]:>12} {parts[1]:>12} {parts[2]:>12} {parts[3]:>12}")
+        lines.append(f"    {table:<16} {parts[0]:>12} {parts[1]:>12} {parts[2]:>12} {parts[3]:>12} {parts[4]:>12}")
 
     # ── Build Time ──
     lines.append("\n┌────────────────────────────────────────────────────────────────────────────────┐")
@@ -644,6 +805,7 @@ def format_comparison(all_results):
     lines.append(f"  Layout A:           {bm.get('layout_a', {}).get('build_time_s', '?')}s")
     lines.append(f"  Layout B:           {bm.get('layout_b', {}).get('build_time_s', '?')}s")
     lines.append(f"  Layout C:           {bm.get('layout_c', {}).get('build_time_s', '?')}s")
+    lines.append(f"  Layout D:           {bm.get('layout_d', {}).get('build_time_s', '?')}s")
 
     # ── Schema Complexity ──
     lines.append("\n┌────────────────────────────────────────────────────────────────────────────────┐")
@@ -663,9 +825,9 @@ def format_comparison(all_results):
     lines.append("└────────────────────────────────────────────────────────────────────────────────┘\n")
 
     b_bytes = storage_sources["base"].get("total_parquet_bytes", storage_sources["base"].get("total_bytes", 0))
-    for key, label in [("A", "Layout A"), ("B", "Layout B"), ("C", "Layout C")]:
+    for key, label in [("A", "Layout A"), ("B", "Layout B"), ("C", "Layout C"), ("D", "Layout D")]:
         times_b = [v["median_ms"] for v in bq.values() if "median_ms" in v]
-        src = {"A": aq, "B": bq2, "C": cq}[key]
+        src = {"A": aq, "B": bq2, "C": cq, "D": dq}[key]
         times_x = [v["median_ms"] for v in src.values() if "median_ms" in v]
         x_bytes = storage_sources[key].get("total_bytes", 0)
 
@@ -715,7 +877,7 @@ def main():
     print("=" * 60, file=sys.stderr)
 
     # ── Run baseline queries (re-run for fair comparison) ──
-    print("\n[1/5] Re-running baseline queries...", file=sys.stderr)
+    print("\n[1/8] Re-running baseline queries...", file=sys.stderr)
     sys.path.insert(0, repo_root)
     from uniprot_parquet import connect
     baseline_con = connect(str(Path(args.baseline_lake).resolve()))
@@ -752,7 +914,7 @@ def main():
     print(f"  {len(baseline_results)} baseline queries", file=sys.stderr)
 
     # ── Layout A ──
-    print("\n[2/5] Running Layout A queries...", file=sys.stderr)
+    print("\n[2/8] Running Layout A queries...", file=sys.stderr)
     layout_a_path = os.path.join(args.variant_lake, "layout_a")
     a_queries = _layout_a_queries(layout_a_path)
     a_results = run_query_suite(con, a_queries)
@@ -766,7 +928,7 @@ def main():
         print(f"    ERROR {e}: {a_results[e]['error'][:100]}", file=sys.stderr)
 
     # ── Layout B ──
-    print("\n[3/5] Running Layout B queries...", file=sys.stderr)
+    print("\n[3/8] Running Layout B queries...", file=sys.stderr)
     layout_b_path = os.path.join(args.variant_lake, "layout_b")
     b_queries = _layout_b_queries(layout_b_path)
     b_results = run_query_suite(con, b_queries)
@@ -780,9 +942,9 @@ def main():
         print(f"    ERROR {e}: {b_results[e]['error'][:100]}", file=sys.stderr)
 
     # ── Layout C ──
-    print("\n[4/7] Running Layout C queries...", file=sys.stderr)
+    print("\n[4/8] Running Layout C queries...", file=sys.stderr)
     layout_c_path = os.path.join(args.variant_lake, "layout_c")
-    c_queries = _layout_b_queries(layout_c_path)  # same query shape as B
+    c_queries = _layout_b_queries(layout_c_path, arrays_stripped=True)
     c_results = run_query_suite(con, c_queries)
     all_results["layout_c"] = {
         "query_latency": c_results,
@@ -793,8 +955,25 @@ def main():
     for e in errors_c:
         print(f"    ERROR {e}: {c_results[e]['error'][:100]}", file=sys.stderr)
 
+    # ── Layout D ──
+    layout_d_path = os.path.join(args.variant_lake, "layout_d")
+    if os.path.isdir(layout_d_path):
+        print("\n[5/8] Running Layout D queries...", file=sys.stderr)
+        d_queries = _layout_d_queries(layout_d_path)
+        d_results = run_query_suite(con, d_queries)
+        all_results["layout_d"] = {
+            "query_latency": d_results,
+            "storage": analyze_storage(layout_d_path),
+        }
+        errors_d = [k for k, v in d_results.items() if "error" in v]
+        print(f"  {len(d_results)} queries ({len(errors_d)} errors)", file=sys.stderr)
+        for e in errors_d:
+            print(f"    ERROR {e}: {d_results[e]['error'][:100]}", file=sys.stderr)
+    else:
+        print("\n[5/8] Layout D not found, skipping...", file=sys.stderr)
+
     # ── Build metadata ──
-    print("\n[5/7] Loading build metadata...", file=sys.stderr)
+    print("\n[6/8] Loading build metadata...", file=sys.stderr)
     build_meta_path = os.path.join(args.variant_lake, "build_meta.json")
     if os.path.exists(build_meta_path):
         with open(build_meta_path) as f:
@@ -811,7 +990,7 @@ def main():
     all_results["build_meta"] = build_meta
 
     # ── Generate comparison ──
-    print("\n[6/7] Generating comparison report...", file=sys.stderr)
+    print("\n[7/8] Generating comparison report...", file=sys.stderr)
     report = format_comparison(all_results)
 
     json_path = os.path.join(args.output_dir, f"variant_{timestamp}.json")
