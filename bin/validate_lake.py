@@ -57,7 +57,11 @@ Checks (in order):
   12. SCHEMA TYPE PROTECTION
       - Critical columns have expected Arrow types (not silently cast)
 
-  13. SCHEMA EVOLUTION GUARD
+  13. FIELD COMPLETENESS
+      - Every top-level JSON field is captured in entries or a child table
+      - Catches silent data loss when UniProt adds new top-level fields
+
+  14. SCHEMA EVOLUTION GUARD
       - Inferred Parquet schema matches committed baseline
       - Detects renamed/dropped/new fields from upstream JSON changes
 
@@ -848,14 +852,107 @@ def check_schema_types(report, lake_dir):
             )
 
 
+def check_field_completeness(report, lake_dir, jsonl_path):
+    """Verify the lake captures every top-level field from the source JSON.
+
+    Samples one entry from the JSONL and checks that every top-level key is
+    either (a) a column or nested struct field in the entries table, or
+    (b) the source array for a child table (features, xrefs, comments,
+    publications).  Catches silent data loss when UniProt adds a new
+    top-level field that the pipeline's explicit SELECT list doesn't cover.
+
+    Uses a union of keys across a sample (not just one entry) because some
+    fields are rare (e.g. organismHosts only appears on virus entries,
+    geneLocations is uncommon).
+    """
+    report.checks.append("\n--- 13. FIELD COMPLETENESS ---")
+    eprint("\n--- 13. FIELD COMPLETENESS ---")
+
+    # ── Collect all top-level keys from a sample of source entries ──
+    eprint("  Sampling source JSONL for top-level field names...")
+    source_keys = set()
+    # Use the existing sample (up to 1000 entries) to cover rare fields.
+    sampled = sample_jsonl_entries(jsonl_path, 1000)
+    if not sampled:
+        report.check("field completeness sample non-empty", False, "no entries sampled")
+        return
+    for entry in sampled:
+        source_keys.update(entry.keys())
+    eprint(f"  Source has {len(source_keys)} unique top-level fields: {sorted(source_keys)}")
+
+    # ── Map source fields to where they land in the lake ──
+    # Entries table: columns and nested structs cover most fields.
+    # Child tables: the four array fields are unnested into their own tables.
+    child_array_fields = {
+        "features":                    "features",
+        "uniProtKBCrossReferences":    "xrefs",
+        "comments":                    "comments",
+        "references":                  "publications",
+    }
+
+    # Get entries column names from the Parquet schema
+    entries_ds = open_table(lake_dir, "entries")
+    entries_columns = {field.name for field in entries_ds.schema}
+
+    # Known mappings: source field name → entries column name.
+    # Only needed when the column name differs from the source field name.
+    source_to_entries = {
+        "primaryAccession":   "acc",
+        "uniProtkbId":        "id",
+        "entryType":          "entry_type",
+        "secondaryAccessions": "secondary_accs",
+        "organism":           "organism",
+        "proteinDescription": "protein_desc",
+        "genes":              "genes",
+        "keywords":           "keywords",
+        "sequence":           "sequence",
+        "proteinExistence":   "protein_existence",
+        "annotationScore":    "annotation_score",
+        "entryAudit":         "first_public",       # split across multiple columns
+        "extraAttributes":    "extra_attributes",
+        "organismHosts":      "organism_hosts",
+        "geneLocations":      "gene_locations",
+    }
+
+    uncaptured = []
+    for key in sorted(source_keys):
+        # Is it a child table array?
+        if key in child_array_fields:
+            continue
+        # Does it map to a known entries column?
+        mapped_col = source_to_entries.get(key)
+        if mapped_col and mapped_col in entries_columns:
+            continue
+        # Is the source field name itself a column? (fallback for future fields
+        # that might be added with matching names)
+        if key in entries_columns:
+            continue
+        uncaptured.append(key)
+
+    if uncaptured:
+        report.check(
+            "all source JSON fields captured in lake",
+            False,
+            f"{len(uncaptured)} uncaptured field(s): {', '.join(uncaptured)}"
+        )
+        for f in uncaptured:
+            report.checks.append(f"    ✗ '{f}' — not in entries columns or child tables")
+    else:
+        report.check(
+            "all source JSON fields captured in lake",
+            True,
+            f"all {len(source_keys)} source fields accounted for"
+        )
+
+
 def check_schema_evolution(report, lake_dir, baseline_path):
     """
     Detect upstream UniProtKB JSON schema changes by comparing inferred Parquet
     schema against a committed baseline.  Reports missing columns (ERROR) and
     new columns (WARNING) to alert on schema drift.
     """
-    report.checks.append("\n--- 13. SCHEMA EVOLUTION GUARD ---")
-    eprint("\n--- 13. SCHEMA EVOLUTION GUARD ---")
+    report.checks.append("\n--- 14. SCHEMA EVOLUTION GUARD ---")
+    eprint("\n--- 14. SCHEMA EVOLUTION GUARD ---")
 
     if not os.path.exists(baseline_path):
         report.check(
@@ -969,6 +1066,7 @@ def main():
     check_sequence_integrity(report, args.lake)
     check_feature_coordinates(report, args.lake)
     check_schema_types(report, args.lake)
+    check_field_completeness(report, args.lake, args.jsonl)
     if args.schema_baseline:
         check_schema_evolution(report, args.lake, args.schema_baseline)
 

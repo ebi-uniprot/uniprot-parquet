@@ -498,6 +498,10 @@ SELECT
     sub.taxid,
 
     -- Flattened convenience columns (fast querying)
+    -- Note: no lossless nested `xref` column — the UniProt xref schema
+    -- has exactly these five fields (database, id, properties, isoformId,
+    -- evidences), all of which are captured above. A duplicate nested
+    -- struct would be 100% redundant and ~410 GB at full UniProtKB scale.
     unnest.database                                 AS database,
     unnest.id                                       AS id,
     {properties}                                    AS properties,
