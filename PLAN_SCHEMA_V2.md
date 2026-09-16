@@ -1,6 +1,6 @@
 # Plan: schema for the first public release — accession lookup, `entries` columns, column order, Hive partitioning by review status, `entries` tier packaging
 
-**Status:** proposed 2026-09-11; open decisions settled 2026-09-16. Not started.
+**Status:** proposed 2026-09-11; open decisions settled 2026-09-16. Implementation started 2026-09-16 on `static-lake` (one commit per step of `PLAN_SCHEMA_V2_STEPS.md`).
 **Compatibility:** none required. Nothing in this repository has been published; there are no external readers, no back-catalogue and no v1 to migrate from. "Manifest version 2" below is an internal marker for the pipeline and its tests, not a user-facing schema version. Any decision elsewhere in the repo that was justified by "this would break users" (`AUDIT.md` O3/S10 naming freeze, single-release flips, deprecation windows) is open again; see "Decisions reopened by pre-public status" at the end.
 **Motivation:** `DEMAND_REVIEW.md` (R1, R2, R5–R9, S1/S5/S11 from `AUDIT.md`); the size/packaging note in the review of this plan (Part F).
 **Audience:** an implementer who has not read the rest of the repo. This file holds the design and the rationale. The ordered, file-by-file work order with verification commands is **`PLAN_SCHEMA_V2_STEPS.md`**; implement from that file and come back here only for the "why".
@@ -25,9 +25,9 @@ Every measurement and spike outcome the plan asks for is recorded here, in one p
 
 | Item | Produced by | Result |
 | --- | --- | --- |
-| Phase 0.1: PyArrow bloom-filter parameter name (or "not supported") | Step 1 | ______ |
-| Phase 0.2: DuckDB writes/reads bloom filters; row groups scanned for one lookup | Step 1 | ______ |
-| Phase 0.3: `candidate_groups / row_groups` on the largest available lake | Step 1 | ______ |
+| Phase 0.1: PyArrow bloom-filter parameter name (or "not supported") | Step 1 | **Not supported.** PyArrow 23.0.1 `ParquetWriter.__init__` has no bloom-related parameter (full list checked; none in `pyarrow._parquet` either). **B1 deferred** per §4.3; Step 12 skipped; `accession_map` ships alone. (2026-09-16, sandbox venv: pyarrow 23.0.1, duckdb 1.5.5) |
+| Phase 0.2: DuckDB writes/reads bloom filters; row groups scanned for one lookup | Step 1 | DuckDB 1.5.5 writes them: `COPY … (BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.001, DICTIONARY_SIZE_LIMIT 100000)` gives every one of 10 row groups a filter (65,553 bytes each). Reads them: single-accession lookup 1.26 ms with filters vs 3.55 ms on the same data rewritten without (`DICTIONARY_SIZE_LIMIT 0`). **`EXPLAIN ANALYZE` and the JSON profile in 1.5.5 do not print row groups scanned** (`operator_rows_scanned` reports 10,000,000 in both cases); the Step 20 benchmark must count candidate row groups from `parquet_metadata` statistics and say so. |
+| Phase 0.3: `candidate_groups / row_groups` on the largest available lake | Step 1 | Demo lake (`demo/lake/2026_01/lake/entries/`, one file, one row group): `row_groups = 1`, `candidate_groups = 0` (P04637 is not in the demo). Meaningless as a ratio; re-run on the slice is **deferred** (Step 3 not runnable in the sandbox: `rest.uniprot.org` blocked, no full dump). |
 | G.1: which map-access form works on the installed DuckDB | Step 2 | ______ |
 | F.1 table (see F.1) filled; `entries` share of lake; footer bytes | Step 3 | ______ |
 | B size gates (`go_terms`, `pubmed_ids`, `proteome_ids`, B.5) | Step 6 | ______ |
