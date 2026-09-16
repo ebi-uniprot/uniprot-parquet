@@ -238,10 +238,136 @@ def init_duckdb(memory_limit: str, threads: int | None,
 
 # ─── SQL for each table ─────────────────────────────────────────────────
 
+# ─── Declared DuckDB types for columns with an optional source path ─────
+# Every ``NULL`` fallback in the SQL builders is typed from this dict so the
+# column type never depends on which optional fields the input happened to
+# contain (plan G.2).  Strings are DuckDB ``DESCRIBE`` output, verbatim, taken
+# from a build where the field was present.  The validator's
+# ``check_schema_types`` compares each built table against this dict.
+COLUMN_TYPES: dict[tuple[str, str], str] = {
+    ("entries", "organism_hosts"): "STRUCT(scientificName VARCHAR, commonName VARCHAR, taxonId BIGINT, synonyms VARCHAR[])[]",
+    ("entries", "gene_locations"): 'STRUCT(geneEncodingType VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[]',
+    ("features", "feature_id"): "VARCHAR",
+    ("features", "original_sequence"): "VARCHAR",
+    ("features", "alternative_sequences"): "VARCHAR[]",
+    ("features", "ligand_name"): "VARCHAR",
+    ("features", "ligand_id"): "VARCHAR",
+    ("features", "ligand_label"): "VARCHAR",
+    ("features", "ligand_note"): "VARCHAR",
+    ("xrefs", "isoform_id"): "VARCHAR",
+    ("xrefs", "evidences"): 'STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[]',
+    ("xrefs", "properties"): 'STRUCT("key" VARCHAR, "value" VARCHAR)[]',
+    ("publications", "title"): "VARCHAR",
+    ("publications", "authors"): "VARCHAR[]",
+    ("publications", "authoring_group"): "VARCHAR[]",
+    ("publications", "journal"): "VARCHAR",
+    ("publications", "volume"): "VARCHAR",
+    ("publications", "first_page"): "VARCHAR",
+    ("publications", "last_page"): "VARCHAR",
+    ("publications", "submission_database"): "VARCHAR",
+    ("publications", "citation_xrefs"): 'STRUCT("database" VARCHAR, id VARCHAR)[]',
+    ("publications", "reference_positions"): "VARCHAR[]",
+    ("publications", "reference_comments"): 'STRUCT("value" VARCHAR, "type" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[]',
+    ("publications", "evidences"): 'STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[]',
+}
+
+
+# Source JSON path of every column in COLUMN_TYPES (dotted, list elements
+# carry no segment — the same convention as discover_schema_paths).  Used by
+# check_declared_types() to refuse a build whose input carries a nested field
+# the declared type would silently drop.  Step 8 (plan H.2) extends this dict
+# to every column for field metadata and SCHEMA.md.
+COLUMN_SOURCES: dict[tuple[str, str], str] = {
+    ("entries", "organism_hosts"): "organismHosts",
+    ("entries", "gene_locations"): "geneLocations",
+    ("features", "feature_id"): "features.featureId",
+    ("features", "original_sequence"): "features.alternativeSequence.originalSequence",
+    ("features", "alternative_sequences"): "features.alternativeSequence.alternativeSequences",
+    ("features", "ligand_name"): "features.ligand.name",
+    ("features", "ligand_id"): "features.ligand.id",
+    ("features", "ligand_label"): "features.ligand.label",
+    ("features", "ligand_note"): "features.ligand.note",
+    ("xrefs", "isoform_id"): "uniProtKBCrossReferences.isoformId",
+    ("xrefs", "evidences"): "uniProtKBCrossReferences.evidences",
+    ("xrefs", "properties"): "uniProtKBCrossReferences.properties",
+    ("publications", "title"): "references.citation.title",
+    ("publications", "authors"): "references.citation.authors",
+    ("publications", "authoring_group"): "references.citation.authoringGroup",
+    ("publications", "journal"): "references.citation.journal",
+    ("publications", "volume"): "references.citation.volume",
+    ("publications", "first_page"): "references.citation.firstPage",
+    ("publications", "last_page"): "references.citation.lastPage",
+    ("publications", "submission_database"): "references.citation.submissionDatabase",
+    ("publications", "citation_xrefs"): "references.citation.citationCrossReferences",
+    ("publications", "reference_positions"): "references.referencePositions",
+    ("publications", "reference_comments"): "references.referenceComments",
+    ("publications", "evidences"): "references.evidences",
+}
+
+
+def _null(table: str, column: str) -> str:
+    """Typed NULL fallback for an optional column.  KeyError is the intended
+    failure: every fallback must have a declared type in COLUMN_TYPES."""
+    return f"NULL::{COLUMN_TYPES[(table, column)]}"
+
+
+def _typed(table: str, column: str, expr: str, schema_paths: set[str]) -> str:
+    """SQL for an optional column: the source expression cast to its declared
+    type when the source path exists, else a typed NULL.
+
+    The cast matters even when the path exists: a struct's sub-fields are
+    themselves optional (a subset build whose geneLocations carry no ``value``
+    key infers a narrower struct), and DuckDB widens a struct by name, filling
+    missing sub-fields with NULL.  The cast would also silently *drop* a
+    sub-field the declared type does not know about, which is why main() runs
+    check_declared_types() before any table is built.
+    """
+    if COLUMN_SOURCES[(table, column)] not in schema_paths:
+        return _null(table, column)
+    return f"CAST({expr} AS {COLUMN_TYPES[(table, column)]})"
+
+
+def _declared_type_paths(con, type_str: str, prefix: str) -> set[str]:
+    """Dotted sub-paths covered by a DuckDB type string, discover_schema_paths style."""
+    paths: set[str] = set()
+
+    def _walk(t, pre):
+        if t.id == "list":
+            _walk(t.children[0][1], pre)
+        elif t.id == "struct":
+            for name, child in t.children:
+                path = f"{pre}.{name}"
+                paths.add(path)
+                _walk(child, path)
+
+    _walk(con.sql(f"SELECT NULL::{type_str}").types[0], prefix)
+    return paths
+
+
+def check_declared_types(con, schema_paths: set[str]) -> None:
+    """Abort the build if the input has a nested field that a declared type
+    (COLUMN_TYPES) would silently drop.  The fix is to extend the declared
+    type, never to skip the check."""
+    problems = []
+    for key, type_str in COLUMN_TYPES.items():
+        src = COLUMN_SOURCES[key]
+        if src not in schema_paths:
+            continue
+        covered = _declared_type_paths(con, type_str, src)
+        actual = {p for p in schema_paths if p.startswith(src + ".")}
+        extra = sorted(actual - covered)
+        if extra:
+            problems.append(f"{key[0]}.{key[1]} (source {src}): input has {extra} "
+                            f"but COLUMN_TYPES declares {type_str}")
+    if problems:
+        raise RuntimeError("COLUMN_TYPES is narrower than the input; update it:\n  "
+                           + "\n  ".join(problems))
+
+
 # Optional fields that may not appear in all UniProtKB subsets.
 # (e.g. organismHosts only exists in virus/parasite entries,
 #  geneLocations is rare in some organisms.)
-# The SQL generator substitutes NULL for any that are absent.
+# The SQL generator substitutes a typed NULL for any that are absent.
 _OPTIONAL_ENTRY_FIELDS = {"organismHosts", "geneLocations"}
 
 
@@ -257,8 +383,8 @@ def _build_entries_sql(schema_paths: set[str]) -> str:
     def has(path: str) -> bool:
         return path in schema_paths
 
-    organism_hosts = "e.organismHosts" if has("organismHosts") else "NULL"
-    gene_locations = "e.geneLocations" if has("geneLocations") else "NULL"
+    organism_hosts = _typed("entries", "organism_hosts", "e.organismHosts", schema_paths)
+    gene_locations = _typed("entries", "gene_locations", "e.geneLocations", schema_paths)
 
     # EC numbers: extract from recommended, alternative, and (if present) submitted names.
     # Each naming block's struct schema may or may not include ecNumbers depending on the
@@ -413,7 +539,7 @@ def _build_features_sql(schema_paths: set[str]) -> str:
     def has(path: str) -> bool:
         return path in schema_paths
 
-    feature_id = "unnest.featureId" if has("features.featureId") else "NULL"
+    feature_id = _typed("features", "feature_id", "unnest.featureId", schema_paths)
 
     if has("features.evidences"):
         evidence_codes = """list_transform(
@@ -423,13 +549,13 @@ def _build_features_sql(schema_paths: set[str]) -> str:
     else:
         evidence_codes = "CAST([] AS VARCHAR[])"
 
-    original_seq = "unnest.alternativeSequence.originalSequence" if has("features.alternativeSequence.originalSequence") else "NULL"
-    alt_seqs = "unnest.alternativeSequence.alternativeSequences" if has("features.alternativeSequence.alternativeSequences") else "NULL"
+    original_seq = _typed("features", "original_sequence", "unnest.alternativeSequence.originalSequence", schema_paths)
+    alt_seqs = _typed("features", "alternative_sequences", "unnest.alternativeSequence.alternativeSequences", schema_paths)
 
-    ligand_name = "unnest.ligand.name" if has("features.ligand.name") else "NULL"
-    ligand_id = "unnest.ligand.id" if has("features.ligand.id") else "NULL"
-    ligand_label = "unnest.ligand.label" if has("features.ligand.label") else "NULL"
-    ligand_note = "unnest.ligand.note" if has("features.ligand.note") else "NULL"
+    ligand_name = _typed("features", "ligand_name", "unnest.ligand.name", schema_paths)
+    ligand_id = _typed("features", "ligand_id", "unnest.ligand.id", schema_paths)
+    ligand_label = _typed("features", "ligand_label", "unnest.ligand.label", schema_paths)
+    ligand_note = _typed("features", "ligand_note", "unnest.ligand.note", schema_paths)
 
     return f"""
 SELECT
@@ -487,9 +613,9 @@ def _build_xrefs_sql(schema_paths: set[str]) -> str:
     def has(path: str) -> bool:
         return path in schema_paths
 
-    isoform_id = "unnest.isoformId" if has("uniProtKBCrossReferences.isoformId") else "NULL"
-    xref_evidences = "unnest.evidences" if has("uniProtKBCrossReferences.evidences") else "NULL"
-    properties = "unnest.properties" if has("uniProtKBCrossReferences.properties") else "NULL"
+    isoform_id = _typed("xrefs", "isoform_id", "unnest.isoformId", schema_paths)
+    xref_evidences = _typed("xrefs", "evidences", "unnest.evidences", schema_paths)
+    properties = _typed("xrefs", "properties", "unnest.properties", schema_paths)
 
     return f"""
 SELECT
@@ -586,18 +712,18 @@ def _build_publications_sql(schema_paths: set[str]) -> str:
         return path in schema_paths
 
     # Citation fields — all potentially absent depending on citation types in the dataset
-    title = "unnest.citation.title" if has("references.citation.title") else "NULL"
-    authors = "unnest.citation.authors" if has("references.citation.authors") else "NULL"
-    authoring_group = "unnest.citation.authoringGroup" if has("references.citation.authoringGroup") else "NULL"
-    journal = "unnest.citation.journal" if has("references.citation.journal") else "NULL"
-    volume = "unnest.citation.volume" if has("references.citation.volume") else "NULL"
-    first_page = "unnest.citation.firstPage" if has("references.citation.firstPage") else "NULL"
-    last_page = "unnest.citation.lastPage" if has("references.citation.lastPage") else "NULL"
-    submission_db = "unnest.citation.submissionDatabase" if has("references.citation.submissionDatabase") else "NULL"
-    citation_xrefs = "unnest.citation.citationCrossReferences" if has("references.citation.citationCrossReferences") else "NULL"
-    ref_positions = "unnest.referencePositions" if has("references.referencePositions") else "NULL"
-    ref_comments = "unnest.referenceComments" if has("references.referenceComments") else "NULL"
-    ref_evidences = "unnest.evidences" if has("references.evidences") else "NULL"
+    title = _typed("publications", "title", "unnest.citation.title", schema_paths)
+    authors = _typed("publications", "authors", "unnest.citation.authors", schema_paths)
+    authoring_group = _typed("publications", "authoring_group", "unnest.citation.authoringGroup", schema_paths)
+    journal = _typed("publications", "journal", "unnest.citation.journal", schema_paths)
+    volume = _typed("publications", "volume", "unnest.citation.volume", schema_paths)
+    first_page = _typed("publications", "first_page", "unnest.citation.firstPage", schema_paths)
+    last_page = _typed("publications", "last_page", "unnest.citation.lastPage", schema_paths)
+    submission_db = _typed("publications", "submission_database", "unnest.citation.submissionDatabase", schema_paths)
+    citation_xrefs = _typed("publications", "citation_xrefs", "unnest.citation.citationCrossReferences", schema_paths)
+    ref_positions = _typed("publications", "reference_positions", "unnest.referencePositions", schema_paths)
+    ref_comments = _typed("publications", "reference_comments", "unnest.referenceComments", schema_paths)
+    ref_evidences = _typed("publications", "evidences", "unnest.evidences", schema_paths)
 
     return f"""
 SELECT
@@ -1337,6 +1463,8 @@ def main():
             if not schema_paths:
                 eprint("FATAL: staging produced an empty schema — no field paths found")
                 sys.exit(1)
+            # Refuse to build if a declared type would drop a nested field (plan G.2).
+            check_declared_types(con, schema_paths)
         else:
             schema_paths = set()
 

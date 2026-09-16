@@ -854,6 +854,27 @@ def check_schema_types(report, lake_dir):
                 f"actual={actual_type}" if not matches else ""
             )
 
+    # ── Every declared column type (plan G.2) ──
+    # COLUMN_TYPES holds the DuckDB type of every column whose source path is
+    # optional; a build that lacked the field must still emit the declared
+    # type, never an int32 from an untyped NULL.
+    import duckdb
+    from parquet_transform import COLUMN_TYPES
+    by_table = {}
+    for (table_name, col_name), expected in COLUMN_TYPES.items():
+        by_table.setdefault(table_name, {})[col_name] = expected
+    for table_name, columns in sorted(by_table.items()):
+        path = os.path.join(lake_dir, table_name, "*.parquet")
+        actual = {r[0]: r[1] for r in
+                  duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()}
+        mismatches = [f"{c}: expected {e}, actual {actual.get(c)}"
+                      for c, e in columns.items() if actual.get(c) != e]
+        report.check(
+            f"{table_name}: {len(columns)} declared column types match",
+            not mismatches,
+            "; ".join(mismatches)
+        )
+
 
 def check_field_completeness(report, lake_dir, jsonl_path):
     """Verify the lake captures every top-level field from the source JSON.

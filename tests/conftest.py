@@ -27,6 +27,7 @@ PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 DIVERSE_JSON_GZ = os.path.join(FIXTURE_DIR, "diverse.json.gz")
 STRESS_JSON_GZ = os.path.join(FIXTURE_DIR, "diverse_stress.json.gz")
+SMALL_JSON_GZ = os.path.join(FIXTURE_DIR, "small.json.gz")
 FETCH_SCRIPT = os.path.join(os.path.dirname(__file__), "fetch_fixtures.py")
 
 
@@ -58,25 +59,48 @@ def fixture_json_gz(request):
     return _ensure_fixture(scale)
 
 
-@pytest.fixture(scope="session")
-def small_jsonl(fixture_json_gz, tmp_path_factory):
-    """Convert fixture JSON → JSONL.zst once for the entire test session."""
-    out_dir = tmp_path_factory.mktemp("jsonl")
-    jsonl_path = str(out_dir / "diverse.jsonl.zst")
-
-    with gzip.open(fixture_json_gz, "rt") as f:
+def _json_gz_to_jsonl_zst(src, dst):
+    """Convert a {"results": [...]} JSON.gz fixture to JSONL.zst."""
+    with gzip.open(src, "rt") as f:
         data = json.load(f)
 
     import orjson
     import zstandard as zstd
 
     cctx = zstd.ZstdCompressor(level=3)
-    with open(jsonl_path, "wb") as fout:
+    with open(dst, "wb") as fout:
         with cctx.stream_writer(fout) as writer:
             for entry in data["results"]:
                 writer.write(orjson.dumps(entry) + b"\n")
+    return dst
 
-    return jsonl_path
+
+def run_transform(jsonl_path, outdir, release="test_2026", extra_args=()):
+    """Run bin/parquet_transform.py as a subprocess; fail the test on error."""
+    transform_script = os.path.join(BIN_DIR, "parquet_transform.py")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = BIN_DIR + ":" + env.get("PYTHONPATH", "")
+
+    cmd = [
+        sys.executable, transform_script, jsonl_path,
+        "--outdir", outdir,
+        "--memory-limit", "4GB",
+        "--batch-size", "500",
+        "--release", release,
+        *extra_args,
+    ]
+
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        pytest.fail(f"parquet_transform failed:\n{result.stderr}")
+    return result
+
+
+@pytest.fixture(scope="session")
+def small_jsonl(fixture_json_gz, tmp_path_factory):
+    """Convert fixture JSON → JSONL.zst once for the entire test session."""
+    out_dir = tmp_path_factory.mktemp("jsonl")
+    return _json_gz_to_jsonl_zst(fixture_json_gz, str(out_dir / "diverse.jsonl.zst"))
 
 
 @pytest.fixture(scope="session")
@@ -84,24 +108,19 @@ def parquet_lake(small_jsonl, tmp_path_factory):
     """Run the full parquet_transform pipeline once, return lake directory path."""
     lake_dir = tmp_path_factory.mktemp("lake")
     outdir = str(lake_dir / "output")
-
-    transform_script = os.path.join(BIN_DIR, "parquet_transform.py")
-    env = os.environ.copy()
-    env["PYTHONPATH"] = BIN_DIR + ":" + env.get("PYTHONPATH", "")
-
-    cmd = [
-        sys.executable, transform_script, small_jsonl,
-        "--outdir", outdir,
-        "--memory-limit", "4GB",
-        "--batch-size", "500",
-        "--release", "test_2026",
-    ]
-
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if result.returncode != 0:
-        pytest.fail(f"parquet_transform failed:\n{result.stderr}")
-
+    result = run_transform(small_jsonl, outdir)
     return {
         "lake_dir": outdir,
         "stderr": result.stderr,
     }
+
+
+@pytest.fixture(scope="session")
+def small_lake(tmp_path_factory):
+    """A lake built from tests/fixtures/small.json.gz (52 entries, no
+    geneLocations); exercises the typed-NULL fallbacks (plan G.2)."""
+    out_dir = tmp_path_factory.mktemp("small")
+    jsonl_path = _json_gz_to_jsonl_zst(SMALL_JSON_GZ, str(out_dir / "small.jsonl.zst"))
+    outdir = str(out_dir / "lake")
+    run_transform(jsonl_path, outdir, release="small_2026")
+    return {"lake_dir": outdir, "jsonl": jsonl_path}

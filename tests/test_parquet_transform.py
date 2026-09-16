@@ -17,7 +17,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import pytest
 
-from conftest import DIVERSE_JSON_GZ
+from conftest import DIVERSE_JSON_GZ, SMALL_JSON_GZ
 
 
 def open_table(lake_dir, table_name):
@@ -313,6 +313,57 @@ class TestSchema:
 
 
 # ─── Data integrity ─────────────────────────────────────────────────
+
+
+class TestTypedFallbacks:
+    """Optional columns keep their declared type when the source lacks the field (plan G.2)."""
+
+    def test_absent_optional_field_keeps_declared_type(self, small_lake):
+        entries_small = open_table(small_lake["lake_dir"], "entries")
+        assert "geneLocations" not in _top_level_keys(SMALL_JSON_GZ), \
+            "small.json.gz gained geneLocations; pick another absent field"
+        t = str(entries_small.schema.field("gene_locations").type)
+        assert t != "int32"
+        assert t.startswith("list<"), t
+
+    def test_present_struct_is_widened_to_declared_type(self, small_lake):
+        """A present column whose struct lacks a sub-field is cast to the full declared type."""
+        import duckdb
+        from parquet_transform import COLUMN_TYPES
+        path = os.path.join(small_lake["lake_dir"], "entries", "*.parquet")
+        actual = {r[0]: r[1] for r in
+                  duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()}
+        assert actual["organism_hosts"] == COLUMN_TYPES[("entries", "organism_hosts")]
+
+    def test_guard_rejects_undeclared_nested_field(self):
+        """check_declared_types refuses an input with a sub-field the declared type would drop."""
+        import duckdb
+        from parquet_transform import check_declared_types
+        con = duckdb.connect()
+        ok = {"organismHosts", "organismHosts.scientificName", "organismHosts.taxonId"}
+        check_declared_types(con, ok)  # narrower input is fine (widened by cast)
+        with pytest.raises(RuntimeError, match="organismHosts.brandNew"):
+            check_declared_types(con, ok | {"organismHosts.brandNew"})
+
+    def test_declared_types_match_column_types(self, lake_dir):
+        """Every COLUMN_TYPES entry matches the built table (the validator's check, in-process)."""
+        import duckdb
+        from parquet_transform import COLUMN_TYPES
+        for (table, col), expected in COLUMN_TYPES.items():
+            path = os.path.join(lake_dir, table, "*.parquet")
+            actual = {r[0]: r[1] for r in
+                      duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()}
+            assert actual.get(col) == expected, f"{table}.{col}: {actual.get(col)} != {expected}"
+
+
+def _top_level_keys(json_gz):
+    import gzip, json
+    with gzip.open(json_gz, "rt") as f:
+        data = json.load(f)
+    keys = set()
+    for e in data["results"]:
+        keys.update(e.keys())
+    return keys
 
 
 class TestDataIntegrity:

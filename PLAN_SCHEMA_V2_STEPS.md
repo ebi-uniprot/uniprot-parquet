@@ -226,7 +226,7 @@ python -m pytest tests/ -q
 **Tests**
 
 - `tests/conftest.py`: add a session fixture `small_lake` that builds a lake from `tests/fixtures/small.json.gz` (it is a `{"results": [...]}` file like the others; reuse the JSON→JSONL code of `small_jsonl` by factoring it into a helper `_json_gz_to_jsonl_zst(src, dst)`).
-- `tests/test_parquet_transform.py`: new `TestTypedFallbacks::test_absent_optional_field_keeps_declared_type` — on `small_lake` (which lacks `organismHosts`), assert `str(entries_ds.schema.field("organism_hosts").type) != "int32"` and that it starts with `list<`.
+- `tests/test_parquet_transform.py`: new `TestTypedFallbacks::test_absent_optional_field_keeps_declared_type` — on `small_lake` (which lacks `geneLocations`; corrected 2026-09-16 — it does contain `organismHosts`), assert `str(entries_ds.schema.field("gene_locations").type) != "int32"` and that it starts with `list<`.
 
 **Verify** `python -m pytest tests/ -q`; then `python bin/validate_lake.py --lake demo/lake/2026_01/lake --jsonl demo/lake/2026_01/sorted.jsonl.zst -o /tmp/r.txt` **must now fail** on the demo lake (it still has the `int32` columns); that is expected until Step 21 regenerates the demo.
 
