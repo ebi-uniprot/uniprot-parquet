@@ -174,6 +174,8 @@ con.sql("SELECT reviewed, count(*) as n FROM entries GROUP BY reviewed").show()
 
 `manifest.json` inside the lake directory lists every Parquet file, its schema, row count, sort order, and semantic metadata (table descriptions, primary keys, foreign keys, column categories). Tools and LLM agents can read this to discover the data and generate correct joins without scanning files.
 
+`LICENSE` inside the lake directory carries the CC BY 4.0 text with a header naming UniProtKB as the source, so a copied directory keeps its terms. **Citing:** `CITATION.cff` at the repository root holds the pipeline entry and the UniProt Consortium's current paper as `preferred-citation`.
+
 `datapackage.json` is a [Frictionless Data Package](https://specs.frictionlessdata.io/data-package/) descriptor generated alongside the manifest. It makes the lake self-describing and machine-readable per [FAIR data principles](https://www.go-fair.org/fair-principles/) (Findable, Accessible, Interoperable, Reusable). Each resource includes the full Arrow type for every column, nullability constraints, semantic descriptions, primary keys, foreign keys, sort orders, and column categories (convenience vs nested). The descriptor also records the UniProt release, dual licensing (MIT for the pipeline code, CC-BY-4.0 for UniProt data), and provenance.
 
 ### JSONL (universal fallback)
@@ -235,6 +237,14 @@ Child tables (`features`, `xrefs`, `comments`, `publications`) include denormali
 ### Versioning
 
 Each release is a full rebuild into its own isolated directory (`<outdir>/<release>/`). Previous releases are preserved untouched. `provenance.json` in each release records input file checksums, git commit, and row counts.
+
+The **schema version** (`schema_version` in `manifest.json`, `version` in `datapackage.json`, and the `schema_version` key in every Parquet footer) is a semver that is independent of the UniProt data release: a data release normally ships with an unchanged schema. The policy (also in `SCHEMA.md`):
+
+- **Major**: any column renamed, removed, retyped or reordered; any table renamed or removed; a partition or sort-order change; a change in the NULL / empty-list convention.
+- **Minor**: a column or table added; an enumeration gaining a value; a new manifest key.
+- **Patch**: a bug fix that changes values without changing the schema, compression or file-size changes, documentation.
+
+`manifest.json` also carries an integer `version`, the manifest *format* version (currently 2), which changes only when the manifest's own structure changes.
 
 ---
 

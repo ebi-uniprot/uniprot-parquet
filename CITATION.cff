@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software or the data lake it builds, please cite both the pipeline and the UniProt Consortium's current paper (preferred-citation)."
+type: software
+title: uniprot-parquet
+abstract: "Pipeline that converts the UniProtKB JSON release into a sorted, validated Parquet data lake with a lossless nested layer and a Python client."
+license: MIT
+repository-code: "https://github.com/ebi-uniprot/uniprot-parquet"
+authors:
+  - name: "The UniProt Consortium"
+    website: "https://www.uniprot.org"
+keywords:
+  - UniProtKB
+  - Parquet
+  - DuckDB
+  - proteins
+preferred-citation:
+  type: article
+  title: "UniProt: the Universal Protein Knowledgebase in 2025"
+  authors:
+    - name: "The UniProt Consortium"
+  journal: "Nucleic Acids Research"
+  volume: 53
+  issue: D1
+  start: D609
+  end: D617
+  year: 2025
+  doi: 10.1093/nar/gkae1010
+  url: "https://doi.org/10.1093/nar/gkae1010"

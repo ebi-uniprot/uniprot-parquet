@@ -218,7 +218,7 @@ If hypothetically retaining all releases: ~7-8 TB/year, ~70-80 TB/decade. **D1 (
 | **A7** | Provenance + Parquet footer metadata: record Python/DuckDB/PyArrow/zstd versions, hostname, per-stage duration, embedded validator outcome. Embed `uniprot_release`/`schema_version`/`extraction_date`/`pipeline_commit` + 10-protein golden set in Parquet `key_value_metadata` (per survey: `BIOINFORMATICS_PARQUET_SURVEY.md:629-647`). | Q-H4 | 1-2 days | — |
 | **A8** | Extend round-trip validator to nested fields. Reuse `tests/test_roundtrip.py:30-60` helpers (`deep_sort`, `normalize_value`) in `validate_lake.py:509-554`. Same n=1000 reservoir; deep-compare all nested struct columns. | Q-C4 | 1 day | — |
 | **A9** | Sequence hash verification step (S7). | Q-H3, S7 | 1 day | — |
-| **A10** | Re-enable schema-drift detection. `--strict-on-type-changes` (block) + `--warn-on-name-changes` (emit diff into `RELEASE_NOTES.md`). | Q-C5 | 1 day | — |
+| **A10** | Re-enable schema-drift detection. `--strict-on-type-changes` (block) + `--warn-on-name-changes` (emit diff into `RELEASE_NOTES.md`). **2026-09-16:** the semver enforcement in `PLAN_SCHEMA_V2.md` H.4 (`check_schema_evolution` classifying a change as major/minor/patch against a committed baseline) starts with the *second* public release — there is no published baseline to compare against yet. `SCHEMA_VERSION` and the policy are in place (Step 9). | Q-C5 | 1 day | — |
 
 ### Tier 3 — High-value product moves (2-4 weeks)
 

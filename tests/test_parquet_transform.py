@@ -164,6 +164,29 @@ class TestManifest:
         assert manifest["tables"]["entries"]["row_count"] == expected["entries"]
         assert manifest["tables"]["features"]["row_count"] == expected["features"]
 
+    def test_versions_consistent(self, lake_dir):
+        """manifest, datapackage and Parquet footers agree on the schema version (plan H.4)."""
+        from parquet_transform import MANIFEST_FORMAT_VERSION, SCHEMA_VERSION
+        with open(os.path.join(lake_dir, "manifest.json")) as f:
+            manifest = json.load(f)
+        with open(os.path.join(lake_dir, "datapackage.json")) as f:
+            dp = json.load(f)
+        assert manifest["version"] == MANIFEST_FORMAT_VERSION == 2
+        assert manifest["schema_version"] == SCHEMA_VERSION == dp["version"]
+        first = os.path.join(lake_dir, "entries", sorted(manifest["tables"]["entries"]["files"])[0])
+        md = pq.read_schema(first).metadata
+        assert md[b"schema_version"].decode() == manifest["schema_version"]
+        assert md[b"uniprot_release"].decode() == manifest["release"]
+        assert md[b"license"] == b"CC-BY-4.0"
+
+    def test_license_file(self, lake_dir):
+        path = os.path.join(lake_dir, "LICENSE")
+        assert os.path.exists(path)
+        with open(path) as f:
+            text = f.read()
+        assert text.startswith("This directory contains data derived from UniProtKB")
+        assert "Creative Commons Attribution 4.0 International" in text
+
     def test_manifest_files_match_disk(self, lake_dir):
         with open(os.path.join(lake_dir, "manifest.json")) as f:
             manifest = json.load(f)

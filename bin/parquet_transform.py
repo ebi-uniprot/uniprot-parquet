@@ -52,6 +52,18 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from frictionless import Package
 
+# ─── Release constants ──────────────────────────────────────────────────
+SCHEMA_VERSION = "1.0.0"          # public schema semver (plan H.4)
+MANIFEST_FORMAT_VERSION = 2       # structure of manifest.json (plan §4.4)
+DATA_LICENSE = "CC-BY-4.0"        # UniProtKB data; the pipeline code is MIT
+GENERATOR = "uniprot-parquet parquet_transform.py"
+LICENSE_TEXT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "CC-BY-4.0.txt")
+LICENSE_HEADER = (
+    "This directory contains data derived from UniProtKB (https://www.uniprot.org),\n"
+    "licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).\n"
+    "Pipeline code: MIT, see the repository (https://github.com/ebi-uniprot/uniprot-parquet).\n"
+)
+
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
@@ -1111,7 +1123,14 @@ def _annotate_schema(schema: pa.Schema, label: str, file_meta: dict[str, str]) -
     return pa.schema(fields, metadata=file_meta)
 
 
-def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order=None):
+def _file_metadata(release) -> dict[str, str]:
+    """Key/value metadata written into every Parquet footer (plan H.4/H.6/A7)."""
+    return {"uniprot_release": release or "", "schema_version": SCHEMA_VERSION,
+            "license": DATA_LICENSE, "generator": GENERATOR}
+
+
+def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order=None,
+                      release=None):
     """Stream DuckDB result → Parquet files in bounded-memory batches.
 
     DuckDB executes the query lazily and yields Arrow record batches of
@@ -1167,7 +1186,7 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
                 continue
 
             if arrow_schema is None:
-                arrow_schema = _annotate_schema(arrow_tbl.schema, label, {})
+                arrow_schema = _annotate_schema(arrow_tbl.schema, label, _file_metadata(release))
                 # Build sorting columns once schema is available
                 if sort_order:
                     sorting_columns = build_sorting_columns(sort_order, arrow_schema)
@@ -1491,7 +1510,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
             "providing flattened convenience columns for common query patterns."
         ),
         "homepage": "https://github.com/dlrice/uniprot-parquet",
-        "version": "1.0.0",
+        "version": SCHEMA_VERSION,
         "licenses": [
             {
                 "name": "MIT",
@@ -1698,7 +1717,8 @@ def main():
                         sql_template = _SQL_BUILDERS[name](schema_paths)
                 sql = sql_template.format(read_clause=read_clause)
                 row_count, files, arrow_schema = stream_to_parquet(
-                    con, sql, table_dir, args.batch_size, label=name, sort_order=sort_order
+                    con, sql, table_dir, args.batch_size, label=name, sort_order=sort_order,
+                    release=args.release,
                 )
                 manifest_tables[name] = {
                     "description": meta.get("description", ""),
@@ -1714,7 +1734,8 @@ def main():
         # ── Write manifest.json ──
         manifest = {
             "format": "uniprot-parquet",
-            "version": 1,
+            "version": MANIFEST_FORMAT_VERSION,
+            "schema_version": SCHEMA_VERSION,
             "release": args.release,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "tables": manifest_tables,
@@ -1724,6 +1745,14 @@ def main():
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
         eprint(f"  Wrote {manifest_path}")
+
+        # ── Write LICENSE (plan H.6): the data terms travel with the lake ──
+        license_path = os.path.join(outdir, "LICENSE")
+        with open(LICENSE_TEXT_PATH) as f:
+            legal_code = f.read()
+        with open(license_path, "w") as f:
+            f.write(LICENSE_HEADER + "\n" + legal_code)
+        eprint(f"  Wrote {license_path}")
 
         # ── Write datapackage.json (Frictionless Data Package descriptor) ──
         datapackage = _build_datapackage(manifest, args.release)
