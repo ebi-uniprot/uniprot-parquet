@@ -279,8 +279,83 @@ COLUMN_TYPES: dict[tuple[str, str], str] = {
 # the declared type would silently drop.  Step 8 (plan H.2) extends this dict
 # to every column for field metadata and SCHEMA.md.
 COLUMN_SOURCES: dict[tuple[str, str], str] = {
+    # entries — single-path columns (derived columns such as gene_name,
+    # division, go_terms, *_count, pubmed_ids have no entry)
+    ("entries", "acc"): "primaryAccession",
+    ("entries", "id"): "uniProtkbId",
+    ("entries", "reviewed"): "entryType",
+    ("entries", "taxid"): "organism.taxonId",
+    ("entries", "organism_name"): "organism.scientificName",
+    ("entries", "gene_names"): "genes.geneName.value",
+    ("entries", "protein_name"): "proteinDescription.recommendedName.fullName.value",
+    ("entries", "seq_length"): "sequence.length",
+    ("entries", "sequence"): "sequence.value",
+    ("entries", "secondary_accs"): "secondaryAccessions",
+    ("entries", "organism_common"): "organism.commonName",
+    ("entries", "lineage"): "organism.lineage",
+    ("entries", "gene_synonyms"): "genes.synonyms.value",
+    ("entries", "alt_protein_names"): "proteinDescription.alternativeNames.fullName.value",
+    ("entries", "protein_flag"): "proteinDescription.flag",
+    ("entries", "protein_existence"): "proteinExistence",
+    ("entries", "annotation_score"): "annotationScore",
+    ("entries", "seq_mass"): "sequence.molWeight",
+    ("entries", "seq_md5"): "sequence.md5",
+    ("entries", "seq_crc64"): "sequence.crc64",
+    ("entries", "go_ids"): "uniProtKBCrossReferences.id",
+    ("entries", "xref_dbs"): "uniProtKBCrossReferences.database",
+    ("entries", "proteome_ids"): "uniProtKBCrossReferences.id",
+    ("entries", "keyword_ids"): "keywords.id",
+    ("entries", "keyword_names"): "keywords.name",
+    ("entries", "first_public"): "entryAudit.firstPublicDate",
+    ("entries", "last_modified"): "entryAudit.lastAnnotationUpdateDate",
+    ("entries", "last_seq_modified"): "entryAudit.lastSequenceUpdateDate",
+    ("entries", "entry_version"): "entryAudit.entryVersion",
+    ("entries", "seq_version"): "entryAudit.sequenceVersion",
+    ("entries", "uniparc_id"): "extraAttributes.uniParcId",
+    ("entries", "entry_type"): "entryType",
+    ("entries", "extra_attributes"): "extraAttributes",
+    ("entries", "organism"): "organism",
+    ("entries", "protein_desc"): "proteinDescription",
+    ("entries", "genes"): "genes",
+    ("entries", "keywords"): "keywords",
     ("entries", "organism_hosts"): "organismHosts",
     ("entries", "gene_locations"): "geneLocations",
+    # features
+    ("features", "acc"): "primaryAccession",
+    ("features", "reviewed"): "entryType",
+    ("features", "taxid"): "organism.taxonId",
+    ("features", "organism_name"): "organism.scientificName",
+    ("features", "seq_length"): "sequence.length",
+    ("features", "type"): "features.type",
+    ("features", "start_pos"): "features.location.start.value",
+    ("features", "end_pos"): "features.location.end.value",
+    ("features", "start_modifier"): "features.location.start.modifier",
+    ("features", "end_modifier"): "features.location.end.modifier",
+    ("features", "description"): "features.description",
+    ("features", "evidence_codes"): "features.evidences.evidenceCode",
+    ("features", "feature"): "features",
+    # xrefs
+    ("xrefs", "acc"): "primaryAccession",
+    ("xrefs", "reviewed"): "entryType",
+    ("xrefs", "taxid"): "organism.taxonId",
+    ("xrefs", "database"): "uniProtKBCrossReferences.database",
+    ("xrefs", "id"): "uniProtKBCrossReferences.id",
+    # comments
+    ("comments", "acc"): "primaryAccession",
+    ("comments", "reviewed"): "entryType",
+    ("comments", "taxid"): "organism.taxonId",
+    ("comments", "comment_type"): "comments.commentType",
+    ("comments", "text_value"): "comments.texts.value",
+    ("comments", "comment"): "comments",
+    # publications
+    ("publications", "acc"): "primaryAccession",
+    ("publications", "reviewed"): "entryType",
+    ("publications", "taxid"): "organism.taxonId",
+    ("publications", "reference_number"): "references.referenceNumber",
+    ("publications", "citation_type"): "references.citation.citationType",
+    ("publications", "citation_id"): "references.citation.id",
+    ("publications", "publication_date"): "references.citation.publicationDate",
+    ("publications", "reference"): "references",
     ("features", "feature_id"): "features.featureId",
     ("features", "original_sequence"): "features.alternativeSequence.originalSequence",
     ("features", "alternative_sequences"): "features.alternativeSequence.alternativeSequences",
@@ -1013,6 +1088,29 @@ TABLE_META = {
 
 # ─── Core pipeline ──────────────────────────────────────────────────────
 
+def _annotate_schema(schema: pa.Schema, label: str, file_meta: dict[str, str]) -> pa.Schema:
+    """Attach description / category / source_path metadata to every field
+    (plan H.2) and the release-level key/values to the schema.  A column
+    without a COLUMN_DESCRIPTIONS entry is a build failure, so files and
+    manifest can never disagree about what a column means."""
+    cats = TABLE_META.get(label, {}).get("columns", {})
+    missing = [f.name for f in schema if (label, f.name) not in COLUMN_DESCRIPTIONS]
+    if missing:
+        raise RuntimeError(f"{label}: no COLUMN_DESCRIPTIONS entry for {missing}")
+    fields = []
+    for f in schema:
+        md = {"description": COLUMN_DESCRIPTIONS[(label, f.name)]}
+        if f.name in cats.get("convenience", []):
+            md["category"] = "convenience"
+        elif f.name in cats.get("nested", []):
+            md["category"] = "nested"
+        src = COLUMN_SOURCES.get((label, f.name))
+        if src:
+            md["source_path"] = src
+        fields.append(f.with_metadata(md))
+    return pa.schema(fields, metadata=file_meta)
+
+
 def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order=None):
     """Stream DuckDB result → Parquet files in bounded-memory batches.
 
@@ -1069,10 +1167,12 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
                 continue
 
             if arrow_schema is None:
-                arrow_schema = arrow_tbl.schema
+                arrow_schema = _annotate_schema(arrow_tbl.schema, label, {})
                 # Build sorting columns once schema is available
                 if sort_order:
                     sorting_columns = build_sorting_columns(sort_order, arrow_schema)
+            # Re-wrap every batch so the written schema carries the field metadata.
+            arrow_tbl = pa.Table.from_arrays(list(arrow_tbl.columns), schema=arrow_schema)
 
             total_rows += n
 

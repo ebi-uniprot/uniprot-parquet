@@ -283,6 +283,19 @@ class TestSchema:
         ]
         assert entries_ds.schema.names[9] == "gene_name"
 
+    def test_field_metadata(self, lake_dir):
+        """Every field of every table carries a non-empty description (plan H.2)."""
+        import glob
+        for table in EXPECTED_TABLES:
+            first = sorted(glob.glob(os.path.join(lake_dir, table, "**", "*.parquet"), recursive=True))[0]
+            schema = pq.read_schema(first)
+            for field in schema:
+                md = field.metadata or {}
+                assert md.get(b"description"), f"{table}.{field.name} has no description metadata"
+        md = pq.read_schema(os.path.join(lake_dir, "entries", "entries_00001.parquet")).field("taxid").metadata
+        assert md[b"source_path"] == b"organism.taxonId"
+        assert md[b"category"] == b"convenience"
+
     def test_entries_view_has_single_gene_name(self, lake_dir):
         """gene_name is a real column; the client view must not synthesise a second one."""
         import uniprot_parquet
