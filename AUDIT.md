@@ -172,7 +172,7 @@ Two in-repo measurements disagree by 14×:
 | `demo/lake/2026_01/` (committed demo) | 5,378 | 3.23 MB | 0.6 KB | **~150 GB** |
 | `DEDUPLICATION_PROPOSAL.md` baseline | 4,591 | 38.1 MB | 8.5 KB | **~2.4 TB** |
 
-Both fixtures are biased. Production is dominated by lean TrEMBL entries (~248M, ~20 xrefs/entry, ~1 comment/entry, ~330 AA sequence). Best-guess range:
+Both fixtures are biased; the representative measurement (A12) is the F.1 slice of `PLAN_SCHEMA_V2.md` — human reviewed + unreviewed plus 1M random TrEMBL entries, sampled with `bin/sample_jsonl.py` (Step 3 of `PLAN_SCHEMA_V2_STEPS.md`). As of 2026-09-16 the sampler exists but the slice has not been built; the F.1 table is still empty. Production is dominated by lean TrEMBL entries (~248M, ~20 xrefs/entry, ~1 comment/entry, ~330 AA sequence). Best-guess range:
 
 - **Parquet lake: ~300 GB – 1 TB per release**
 - **Plus `sorted.jsonl.zst`: ~180-220 GB**
