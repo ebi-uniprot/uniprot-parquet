@@ -465,15 +465,27 @@ def _build_entries_sql(schema_paths: set[str]) -> str:
 
     return f"""
 SELECT
-    -- Identity
+    -- Nine hot columns first and contiguous (plan Part C): the seven UniProt
+    -- default columns plus taxid and sequence.  Adjacent column chunks mean
+    -- fewer range requests for remote readers of the default projection.
     e.primaryAccession                              AS acc,
     e.uniProtkbId                                   AS id,
     {REVIEWED_EXPR}                                 AS reviewed,
-    e.secondaryAccessions                           AS secondary_accs,
-
-    -- Organism (flattened)
     e.organism.taxonId                              AS taxid,
     e.organism.scientificName                       AS organism_name,
+    list_transform(
+        COALESCE(e.genes, []),
+        g -> g.geneName.value
+    )                                               AS gene_names,
+    {protein_name_expr}                                AS protein_name,
+    CAST(e.sequence.length AS INTEGER)              AS seq_length,
+    e.sequence.value                                AS sequence,
+
+    -- Primary gene name = first of gene_names (plan B.4)
+    list_extract(list_transform(COALESCE(e.genes, []), g -> g.geneName.value), 1) AS gene_name,
+
+    -- Identity / organism (remaining)
+    e.secondaryAccessions                           AS secondary_accs,
     e.organism.commonName                           AS organism_common,
     e.organism.lineage                              AS lineage,
     -- UniProt taxonomic division (plan D.5), most specific rule first.
@@ -494,19 +506,12 @@ SELECT
       ELSE 'unclassified'
     END                                             AS division,
 
-    -- Gene & protein (flattened)
-    list_transform(
-        COALESCE(e.genes, []),
-        g -> g.geneName.value
-    )                                               AS gene_names,
-    -- Primary gene name = first of gene_names (plan B.4)
-    list_extract(list_transform(COALESCE(e.genes, []), g -> g.geneName.value), 1) AS gene_name,
+    -- Gene & protein (remaining)
     -- All gene synonyms across all genes (searchable list)
     flatten(list_transform(
         COALESCE(e.genes, []),
         g -> list_transform(COALESCE(g.synonyms, []), s -> s.value)
     ))                                              AS gene_synonyms,
-    {protein_name_expr}                                AS protein_name,
     -- Alternative protein names (searchable list)
     list_transform(
         COALESCE(e.proteinDescription.alternativeNames, []),
@@ -519,9 +524,7 @@ SELECT
     e.proteinExistence                              AS protein_existence,
     e.annotationScore                               AS annotation_score,
 
-    -- Sequence (flattened)
-    e.sequence.value                                AS sequence,
-    CAST(e.sequence.length AS INTEGER)              AS seq_length,
+    -- Sequence (remaining)
     CAST(e.sequence.molWeight AS INTEGER)           AS seq_mass,
     e.sequence.md5                                  AS seq_md5,
     e.sequence.crc64                                AS seq_crc64,

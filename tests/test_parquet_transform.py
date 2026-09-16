@@ -275,6 +275,14 @@ class TestSchema:
         missing = required - names
         assert not missing, f"Missing columns: {missing}"
 
+    def test_entries_hot_columns_first(self, entries_ds):
+        """The nine hot columns are first and contiguous (plan Part C)."""
+        assert entries_ds.schema.names[:9] == [
+            "acc", "id", "reviewed", "taxid", "organism_name", "gene_names",
+            "protein_name", "seq_length", "sequence",
+        ]
+        assert entries_ds.schema.names[9] == "gene_name"
+
     def test_entries_view_has_single_gene_name(self, lake_dir):
         """gene_name is a real column; the client view must not synthesise a second one."""
         import uniprot_parquet
