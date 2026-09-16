@@ -14,7 +14,7 @@ Analysis-ready Parquet tables covering the complete UniProtKB dataset — sorted
 | `comments`     | One row per comment               | ~300M                 |
 | `publications` | One row per citation              | ~500M                 |
 
-All tables are sorted Swiss-Prot first (`reviewed`/`from_reviewed DESC`), then `taxid ASC`, then `acc ASC`. Parquet row-group min/max statistics mean predicate pushdown works automatically — engines skip irrelevant row groups without configuration.
+All tables are sorted Swiss-Prot first (`reviewed DESC`), then `taxid ASC`, then `acc ASC`. Parquet row-group min/max statistics mean predicate pushdown works automatically — engines skip irrelevant row groups without configuration.
 
 ---
 
@@ -190,7 +190,7 @@ The lake adopts a **denormalized-first + full nested** design. Each table has tw
 
 No UniProtKB data is discarded. Users needing isoforms, GO aspects, EC numbers from alternative names, multi-paragraph comments, or evidence codes can always query the nested columns. Parquet's columnar storage means queries touching 5 of 40+ columns only read those 5 from disk.
 
-Child tables (`features`, `xrefs`, `comments`, `publications`) include denormalized entry-level fields (`acc`, `from_reviewed`, `taxid`) so most queries don't need joins. The boolean column is called `reviewed` on entries and `from_reviewed` on child tables to clarify it's inherited from the parent entry.
+Child tables (`features`, `xrefs`, `comments`, `publications`) include denormalized entry-level fields (`acc`, `reviewed`, `taxid`) so most queries don't need joins.
 
 <details>
 <summary>Column reference</summary>
@@ -209,24 +209,24 @@ Child tables (`features`, `xrefs`, `comments`, `publications`) include denormali
 
 **features** — one row per positional annotation:
 
-- `acc`, `from_reviewed`, `taxid`, `organism_name`, `seq_length`
+- `acc`, `reviewed`, `taxid`, `organism_name`, `seq_length`
 - Flattened: `type`, `start_pos`, `end_pos`, `start_modifier`, `end_modifier`, `description`, `feature_id`, `evidence_codes`, `original_sequence`, `alternative_sequences`, `ligand_name`, `ligand_id`, `ligand_label`, `ligand_note`
 - Full nested: `feature` (preserves evidences with source/id, featureCrossReferences, ligandPart)
 
 **xrefs** — one row per cross-reference:
 
-- `acc`, `from_reviewed`, `taxid`
+- `acc`, `reviewed`, `taxid`
 - `database`, `id`, `properties`, `isoform_id`, `evidences`
 
 **comments** — one row per comment annotation:
 
-- `acc`, `from_reviewed`, `taxid`
+- `acc`, `reviewed`, `taxid`
 - Flattened: `comment_type`, `text_value` (covers 15 of 25 comment types; the other 10 store data in type-specific keys)
 - Full nested: `comment` (JSON — preserves all polymorphic comment fields). Use `comment->>'$.key'` to extract text values or `comment->'$.key'` for nested objects.
 
 **publications** — one row per literature citation:
 
-- `acc`, `from_reviewed`, `taxid`
+- `acc`, `reviewed`, `taxid`
 - Flattened: `reference_number`, `citation_type`, `citation_id`, `title`, `authors`, `authoring_group`, `publication_date`, `journal`, `volume`, `first_page`, `last_page`, `submission_database`, `citation_xrefs`, `reference_positions`, `reference_comments`, `evidences`
 - Full nested: `reference` (preserves complete citation structure)
 
@@ -391,13 +391,13 @@ The `VALIDATE` step runs the checks below against the source JSONL as ground tru
 
 1. **Completeness** — JSONL line count == entries rows; child table counts match `sum(entries.*_count)`
 2. **Uniqueness** — `entries.acc` has zero duplicates
-3. **Null keys and empty strings** — `acc`, `reviewed`/`from_reviewed`, `taxid` never null; identity columns never empty
+3. **Null keys and empty strings** — `acc`, `reviewed`, `taxid` never null; identity columns never empty
 4. **Referential integrity** — every `acc` in child tables exists in entries (DuckDB anti-join)
-5. **Sort order** — all tables sorted by `(reviewed/from_reviewed DESC, taxid ASC, acc ASC)`
+5. **Sort order** — all tables sorted by `(reviewed DESC, taxid ASC, acc ASC)`
 6. **Round-trip spot check** — 1000 reservoir-sampled entries verified field-by-field against JSONL
 7. **Parquet file integrity** — every `.parquet` file in the lake is readable
 8. **Manifest consistency** — `manifest.json` file list matches actual files on disk
-9. **Denormalized column sync** — `taxid` and `from_reviewed` in child tables match entries (DuckDB join)
+9. **Denormalized column sync** — `taxid` and `reviewed` in child tables match entries (DuckDB join)
 10. **Sequence integrity** — `len(sequence) == seq_length` for every entry; no zero-length sequences
 11. **Feature coordinate boundaries** — `start_pos <= end_pos` where both are non-null
 12. **Schema type protection** — critical columns have expected Arrow types (not silently cast by inference)
@@ -429,7 +429,7 @@ python tests/fetch_fixtures.py --scale stress --force  # re-fetch stress
 
 - **Orchestration**: Nextflow (DSL2, SLURM support)
 - **Compute**: DuckDB (JSON parsing via `read_json_auto`, SQL transforms, out-of-core sorting)
-- **Storage**: Parquet (zstd compression, sorted by `reviewed`/`from_reviewed DESC`, `taxid ASC`, `acc ASC`)
+- **Storage**: Parquet (zstd compression, sorted by `reviewed DESC`, `taxid ASC`, `acc ASC`)
 - **Streaming**: PyArrow (bounded-memory Arrow record batch → Parquet writing)
 - **Manifest**: `manifest.json` — file list, schemas, sort orders, semantic metadata
 - **Schema**: Inferred from data via DuckDB `read_json_auto` — no committed schema file

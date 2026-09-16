@@ -45,7 +45,7 @@ Checks (in order):
      - manifest.json file lists match actual files on disk
 
   9. DENORMALIZED COLUMN SYNC
-     - taxid and from_reviewed in child tables match entries
+     - taxid and reviewed in child tables match entries
 
   10. SEQUENCE INTEGRITY
       - len(sequence) == seq_length for every entry
@@ -299,10 +299,10 @@ def check_null_keys(report, lake_dir):
 
     key_checks = [
         ("entries",    ["acc", "reviewed", "taxid", "entry_type"]),
-        ("features",   ["acc", "from_reviewed", "taxid", "type"]),
-        ("xrefs",      ["acc", "from_reviewed", "taxid", "database", "id"]),
-        ("comments",   ["acc", "from_reviewed", "taxid", "comment_type"]),
-        ("publications", ["acc", "from_reviewed", "taxid", "citation_type", "reference_number"]),
+        ("features",   ["acc", "reviewed", "taxid", "type"]),
+        ("xrefs",      ["acc", "reviewed", "taxid", "database", "id"]),
+        ("comments",   ["acc", "reviewed", "taxid", "comment_type"]),
+        ("publications", ["acc", "reviewed", "taxid", "citation_type", "reference_number"]),
     ]
 
     # Identity columns that must never be empty strings
@@ -391,16 +391,16 @@ def check_referential_integrity(report, lake_dir, entry_count):
 
 
 def check_sort_order(report, lake_dir):
-    """Verify all tables are sorted by (reviewed/from_reviewed DESC, taxid ASC, acc ASC)."""
+    """Verify all tables are sorted by (reviewed/reviewed DESC, taxid ASC, acc ASC)."""
     report.checks.append("\n--- 5. SORT ORDER ---")
     eprint("\n--- 5. SORT ORDER ---")
 
     sort_check_tables = [
         ("entries",    "reviewed"),
-        ("features",   "from_reviewed"),
-        ("xrefs",      "from_reviewed"),
-        ("comments",   "from_reviewed"),
-        ("publications", "from_reviewed"),
+        ("features",   "reviewed"),
+        ("xrefs",      "reviewed"),
+        ("comments",   "reviewed"),
+        ("publications", "reviewed"),
     ]
 
     for table_name, rev_col in sort_check_tables:
@@ -681,7 +681,7 @@ def check_denormalized_sync(report, lake_dir):
             result = duckdb.sql(f"""
                 SELECT
                     count(*) FILTER (WHERE c.taxid != e.taxid) AS taxid_mismatches,
-                    count(*) FILTER (WHERE c.from_reviewed != e.reviewed) AS reviewed_mismatches
+                    count(*) FILTER (WHERE c.reviewed != e.reviewed) AS reviewed_mismatches
                 FROM read_parquet('{child_path}') c
                 JOIN read_parquet('{entries_path}') e ON c.acc = e.acc
             """).fetchone()
@@ -695,7 +695,7 @@ def check_denormalized_sync(report, lake_dir):
                 f"{taxid_mismatches:,} mismatches ({elapsed:.1f}s)" if taxid_mismatches else f"({elapsed:.1f}s)"
             )
             report.check(
-                f"{child_name}.from_reviewed matches entries.reviewed",
+                f"{child_name}.reviewed matches entries.reviewed",
                 reviewed_mismatches == 0,
                 f"{reviewed_mismatches:,} mismatches" if reviewed_mismatches else ""
             )
@@ -817,7 +817,7 @@ def check_schema_types(report, lake_dir):
         },
         "features": {
             "acc":              "string",
-            "from_reviewed":    "bool",
+            "reviewed":    "bool",
             "taxid":            "int",
             "type":             "string",
             "start_pos":        "int",
@@ -825,7 +825,7 @@ def check_schema_types(report, lake_dir):
         },
         "xrefs": {
             "acc":              "string",
-            "from_reviewed":    "bool",
+            "reviewed":    "bool",
             "taxid":            "int",
             "database":         "string",
             "id":               "string",

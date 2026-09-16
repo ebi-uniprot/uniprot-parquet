@@ -277,7 +277,7 @@ class TestSchema:
     def test_features_required_columns(self, features_ds):
         names = set(features_ds.schema.names)
         required = {
-            "acc", "from_reviewed", "taxid", "organism_name", "seq_length",
+            "acc", "reviewed", "taxid", "organism_name", "seq_length",
             "type", "start_pos", "end_pos", "description", "feature",
         }
         missing = required - names
@@ -286,7 +286,7 @@ class TestSchema:
     def test_xrefs_required_columns(self, xrefs_ds):
         names = set(xrefs_ds.schema.names)
         required = {
-            "acc", "from_reviewed", "taxid", "database", "id", "properties",
+            "acc", "reviewed", "taxid", "database", "id", "properties",
             "isoform_id", "evidences",
         }
         missing = required - names
@@ -294,7 +294,7 @@ class TestSchema:
 
     def test_comments_required_columns(self, comments_ds):
         names = set(comments_ds.schema.names)
-        required = {"acc", "from_reviewed", "taxid", "comment_type", "text_value", "comment"}
+        required = {"acc", "reviewed", "taxid", "comment_type", "text_value", "comment"}
         missing = required - names
         assert not missing, f"Missing columns: {missing}"
 
@@ -304,7 +304,7 @@ class TestSchema:
     def test_publications_required_columns(self, publications_ds):
         names = set(publications_ds.schema.names)
         required = {
-            "acc", "from_reviewed", "taxid", "citation_type", "citation_id",
+            "acc", "reviewed", "taxid", "citation_type", "citation_id",
             "title", "authors", "publication_date",
             "reference_number", "evidences", "reference",
         }
@@ -466,39 +466,39 @@ class TestSortOrder:
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
         assert keys == sorted(keys), "Entries not sorted by (reviewed DESC, taxid ASC, acc ASC)"
 
-    def test_features_sorted_by_from_reviewed_desc_taxid_asc_acc_asc(self, features_ds):
-        """Features sorted by (from_reviewed DESC, taxid ASC, acc ASC).
+    def test_features_sorted_by_reviewed_desc_taxid_asc_acc_asc(self, features_ds):
+        """Features sorted by (reviewed DESC, taxid ASC, acc ASC).
 
         Within-protein start_pos sort is deliberately omitted to avoid
         ~1.2 TB of sort spill at production scale.
         """
-        arrow = features_ds.to_table(columns=["from_reviewed", "taxid", "acc"])
-        reviewed = arrow.column("from_reviewed").to_pylist()
+        arrow = features_ds.to_table(columns=["reviewed", "taxid", "acc"])
+        reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
         accs = arrow.column("acc").to_pylist()
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
-        assert keys == sorted(keys), "Features not sorted by (from_reviewed DESC, taxid ASC, acc ASC)"
+        assert keys == sorted(keys), "Features not sorted by (reviewed DESC, taxid ASC, acc ASC)"
 
-    def test_xrefs_sorted_by_from_reviewed_desc_taxid_asc_acc_asc(self, xrefs_ds):
-        arrow = xrefs_ds.to_table(columns=["from_reviewed", "taxid", "acc"])
-        reviewed = arrow.column("from_reviewed").to_pylist()
+    def test_xrefs_sorted_by_reviewed_desc_taxid_asc_acc_asc(self, xrefs_ds):
+        arrow = xrefs_ds.to_table(columns=["reviewed", "taxid", "acc"])
+        reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
         accs = arrow.column("acc").to_pylist()
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
-        assert keys == sorted(keys), "Xrefs not sorted by (from_reviewed DESC, taxid ASC, acc ASC)"
+        assert keys == sorted(keys), "Xrefs not sorted by (reviewed DESC, taxid ASC, acc ASC)"
 
-    def test_comments_sorted_by_from_reviewed_desc_taxid_asc_acc_asc(self, comments_ds):
-        arrow = comments_ds.to_table(columns=["from_reviewed", "taxid", "acc"])
-        reviewed = arrow.column("from_reviewed").to_pylist()
+    def test_comments_sorted_by_reviewed_desc_taxid_asc_acc_asc(self, comments_ds):
+        arrow = comments_ds.to_table(columns=["reviewed", "taxid", "acc"])
+        reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
         accs = arrow.column("acc").to_pylist()
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
-        assert keys == sorted(keys), "Comments not sorted by (from_reviewed DESC, taxid ASC, acc ASC)"
+        assert keys == sorted(keys), "Comments not sorted by (reviewed DESC, taxid ASC, acc ASC)"
 
-    def test_publications_sorted_by_from_reviewed_desc_taxid_asc_acc_asc(self, publications_ds):
-        arrow = publications_ds.to_table(columns=["from_reviewed", "taxid", "acc"])
-        reviewed = arrow.column("from_reviewed").to_pylist()
+    def test_publications_sorted_by_reviewed_desc_taxid_asc_acc_asc(self, publications_ds):
+        arrow = publications_ds.to_table(columns=["reviewed", "taxid", "acc"])
+        reviewed = arrow.column("reviewed").to_pylist()
         taxids = arrow.column("taxid").to_pylist()
         accs = arrow.column("acc").to_pylist()
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
-        assert keys == sorted(keys), "Publications not sorted by (from_reviewed DESC, taxid ASC, acc ASC)"
+        assert keys == sorted(keys), "Publications not sorted by (reviewed DESC, taxid ASC, acc ASC)"

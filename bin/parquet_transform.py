@@ -560,7 +560,7 @@ def _build_features_sql(schema_paths: set[str]) -> str:
     return f"""
 SELECT
     sub.acc,
-    sub.from_reviewed,
+    sub.reviewed,
     sub.taxid,
     sub.organism_name,
     sub.seq_length,
@@ -591,7 +591,7 @@ FROM (
     SELECT
         e.primaryAccession                           AS acc,
         CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-             THEN true ELSE false END                AS from_reviewed,
+             THEN true ELSE false END                AS reviewed,
         e.organism.taxonId                           AS taxid,
         e.organism.scientificName                    AS organism_name,
         CAST(e.sequence.length AS INTEGER)           AS seq_length,
@@ -599,7 +599,7 @@ FROM (
     FROM {{read_clause}} e
     WHERE e.features IS NOT NULL AND len(e.features) > 0
 ) sub, LATERAL unnest(sub.features)
-ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
+ORDER BY sub.reviewed DESC, sub.taxid, sub.acc
 """
 
 
@@ -620,7 +620,7 @@ def _build_xrefs_sql(schema_paths: set[str]) -> str:
     return f"""
 SELECT
     sub.acc,
-    sub.from_reviewed,
+    sub.reviewed,
     sub.taxid,
 
     -- Flattened convenience columns (fast querying)
@@ -638,14 +638,14 @@ FROM (
     SELECT
         e.primaryAccession                           AS acc,
         CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-             THEN true ELSE false END                AS from_reviewed,
+             THEN true ELSE false END                AS reviewed,
         e.organism.taxonId                           AS taxid,
         e.uniProtKBCrossReferences
     FROM {{read_clause}} e
     WHERE e.uniProtKBCrossReferences IS NOT NULL
       AND len(e.uniProtKBCrossReferences) > 0
 ) sub, LATERAL unnest(sub.uniProtKBCrossReferences)
-ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
+ORDER BY sub.reviewed DESC, sub.taxid, sub.acc
 """
 
 
@@ -671,7 +671,7 @@ def _build_comments_sql(schema_paths: set[str]) -> str:
     return f"""
 SELECT
     sub.acc,
-    sub.from_reviewed,
+    sub.reviewed,
     sub.taxid,
 
     -- Strip embedded double quotes from commentType (JSON scalar → VARCHAR)
@@ -689,13 +689,13 @@ FROM (
     SELECT
         e.primaryAccession                           AS acc,
         CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-             THEN true ELSE false END                AS from_reviewed,
+             THEN true ELSE false END                AS reviewed,
         e.organism.taxonId                           AS taxid,
         e.comments
     FROM {{read_clause}} e
     WHERE e.comments IS NOT NULL AND len(e.comments) > 0
 ) sub, LATERAL unnest(sub.comments)
-ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
+ORDER BY sub.reviewed DESC, sub.taxid, sub.acc
 """
 
 
@@ -728,7 +728,7 @@ def _build_publications_sql(schema_paths: set[str]) -> str:
     return f"""
 SELECT
     sub.acc,
-    sub.from_reviewed,
+    sub.reviewed,
     sub.taxid,
 
     -- Flattened convenience columns (fast querying)
@@ -756,13 +756,13 @@ FROM (
     SELECT
         e.primaryAccession                           AS acc,
         CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-             THEN true ELSE false END                AS from_reviewed,
+             THEN true ELSE false END                AS reviewed,
         e.organism.taxonId                           AS taxid,
         e."references"
     FROM {{read_clause}} e
     WHERE e."references" IS NOT NULL AND len(e."references") > 0
 ) sub, LATERAL unnest(sub."references")
-ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
+ORDER BY sub.reviewed DESC, sub.taxid, sub.acc
 """
 
 
@@ -787,13 +787,13 @@ def _build_features_variant_sql() -> str:
 SELECT
     e.primaryAccession                           AS acc,
     CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END                AS from_reviewed,
+         THEN true ELSE false END                AS reviewed,
     e.organism.taxonId                           AS taxid,
     unnest.type                                  AS type,
     unnest::VARIANT                              AS data
 FROM {read_clause} e,
 LATERAL UNNEST(COALESCE(e.features, [])) AS t(unnest)
-ORDER BY from_reviewed DESC, taxid, acc
+ORDER BY reviewed DESC, taxid, acc
 """
 
 
@@ -803,13 +803,13 @@ def _build_xrefs_variant_sql() -> str:
 SELECT
     e.primaryAccession                           AS acc,
     CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END                AS from_reviewed,
+         THEN true ELSE false END                AS reviewed,
     e.organism.taxonId                           AS taxid,
     unnest.database                              AS database,
     unnest::VARIANT                              AS data
 FROM {read_clause} e,
 LATERAL UNNEST(COALESCE(e.uniProtKBCrossReferences, [])) AS t(unnest)
-ORDER BY from_reviewed DESC, taxid, acc
+ORDER BY reviewed DESC, taxid, acc
 """
 
 
@@ -826,13 +826,13 @@ def _build_comments_variant_sql() -> str:
 SELECT
     e.primaryAccession                           AS acc,
     CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END                AS from_reviewed,
+         THEN true ELSE false END                AS reviewed,
     e.organism.taxonId                           AS taxid,
     trim('"' FROM CAST(unnest.commentType AS VARCHAR)) AS comment_type,
     (unnest::JSON)::VARIANT                      AS data
 FROM {read_clause} e,
 LATERAL UNNEST(COALESCE(e.comments, [])) AS t(unnest)
-ORDER BY from_reviewed DESC, taxid, acc
+ORDER BY reviewed DESC, taxid, acc
 """
 
 
@@ -842,12 +842,12 @@ def _build_publications_variant_sql() -> str:
 SELECT
     e.primaryAccession                           AS acc,
     CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END                AS from_reviewed,
+         THEN true ELSE false END                AS reviewed,
     e.organism.taxonId                           AS taxid,
     unnest::VARIANT                              AS data
 FROM {read_clause} e,
 LATERAL UNNEST(COALESCE(e."references", [])) AS t(unnest)
-ORDER BY from_reviewed DESC, taxid, acc
+ORDER BY reviewed DESC, taxid, acc
 """
 
 
@@ -855,17 +855,17 @@ ORDER BY from_reviewed DESC, taxid, acc
 
 TABLE_DEFS = [
     ("entries",      None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
-    # Child tables inherit (from_reviewed DESC, taxid ASC, acc ASC) from the
+    # Child tables inherit (reviewed DESC, taxid ASC, acc ASC) from the
     # pre-sorted JSONL input — DuckDB's ORDER BY on these three columns is
     # essentially free (data arrives already in order after LATERAL unnest).
     # Within-protein sort keys (start_pos, database, comment_type, citation_type)
     # are deliberately omitted to avoid ~1.2 TB of sort spill at production
     # scale (~3B xref + ~1.3B feature + ~1B publication + ~400M comment rows).
     # Users who need within-protein ordering can add it at query time.
-    ("features",     None, ["from_reviewed DESC", "taxid ASC", "acc ASC"]),
-    ("xrefs",        None, ["from_reviewed DESC", "taxid ASC", "acc ASC"]),
-    ("comments",     None, ["from_reviewed DESC", "taxid ASC", "acc ASC"]),
-    ("publications", None, ["from_reviewed DESC", "taxid ASC", "acc ASC"]),
+    ("features",     None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
+    ("xrefs",        None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
+    ("comments",     None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
+    ("publications", None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
 ]
 
 
@@ -899,12 +899,12 @@ TABLE_META = {
         },
     },
     "features": {
-        "description": "One row per positional annotation (domain, signal, transmembrane, etc). Sorted by (from_reviewed DESC, taxid ASC, acc ASC) for locality; use ORDER BY start_pos for position-sorted queries within a protein.",
+        "description": "One row per positional annotation (domain, signal, transmembrane, etc). Sorted by (reviewed DESC, taxid ASC, acc ASC) for locality; use ORDER BY start_pos for position-sorted queries within a protein.",
         "primary_key": [],
         "foreign_keys": {"acc": "entries.acc", "taxid": "entries.taxid"},
         "columns": {
             "convenience": [
-                "acc", "from_reviewed", "taxid", "organism_name", "seq_length",
+                "acc", "reviewed", "taxid", "organism_name", "seq_length",
                 "type", "start_pos", "end_pos", "start_modifier", "end_modifier",
                 "description", "feature_id", "evidence_codes",
                 "original_sequence", "alternative_sequences",
@@ -919,7 +919,7 @@ TABLE_META = {
         "foreign_keys": {"acc": "entries.acc", "taxid": "entries.taxid"},
         "columns": {
             "convenience": [
-                "acc", "from_reviewed", "taxid",
+                "acc", "reviewed", "taxid",
                 "database", "id", "properties", "isoform_id", "evidences",
             ],
             "nested": [],
@@ -931,7 +931,7 @@ TABLE_META = {
         "foreign_keys": {"acc": "entries.acc", "taxid": "entries.taxid"},
         "columns": {
             "convenience": [
-                "acc", "from_reviewed", "taxid",
+                "acc", "reviewed", "taxid",
                 "comment_type", "text_value",
             ],
             "nested": ["comment"],  # JSON — use comment->>'$.key' to extract
@@ -943,7 +943,7 @@ TABLE_META = {
         "foreign_keys": {"acc": "entries.acc", "taxid": "entries.taxid"},
         "columns": {
             "convenience": [
-                "acc", "from_reviewed", "taxid",
+                "acc", "reviewed", "taxid",
                 "reference_number", "citation_type", "citation_id", "title",
                 "authors", "authoring_group", "publication_date",
                 "journal", "volume", "first_page", "last_page",
@@ -1147,7 +1147,7 @@ COLUMN_DESCRIPTIONS = {
 
     # ── features ──
     ("features", "acc"):               "Parent entry's primary accession. Foreign key → entries.acc.",
-    ("features", "from_reviewed"):     "True if the parent entry is Swiss-Prot (reviewed).",
+    ("features", "reviewed"):     "True if the parent entry is Swiss-Prot (reviewed).",
     ("features", "taxid"):             "NCBI taxonomy ID of the parent entry. Foreign key → entries.taxid.",
     ("features", "organism_name"):     "Scientific name of the parent entry's organism (denormalized for convenience).",
     ("features", "seq_length"):        "Sequence length of the parent entry (denormalized for coverage calculations).",
@@ -1169,7 +1169,7 @@ COLUMN_DESCRIPTIONS = {
 
     # ── xrefs ──
     ("xrefs", "acc"):                  "Parent entry's primary accession. Foreign key → entries.acc.",
-    ("xrefs", "from_reviewed"):        "True if the parent entry is Swiss-Prot (reviewed).",
+    ("xrefs", "reviewed"):        "True if the parent entry is Swiss-Prot (reviewed).",
     ("xrefs", "taxid"):               "NCBI taxonomy ID of the parent entry. Foreign key → entries.taxid.",
     ("xrefs", "database"):            "External database name (e.g. 'PDB', 'Ensembl', 'GO', 'InterPro').",
     ("xrefs", "id"):                  "Identifier in the external database (e.g. '1ABC' for PDB).",
@@ -1179,7 +1179,7 @@ COLUMN_DESCRIPTIONS = {
 
     # ── comments ──
     ("comments", "acc"):               "Parent entry's primary accession. Foreign key → entries.acc.",
-    ("comments", "from_reviewed"):     "True if the parent entry is Swiss-Prot (reviewed).",
+    ("comments", "reviewed"):     "True if the parent entry is Swiss-Prot (reviewed).",
     ("comments", "taxid"):            "NCBI taxonomy ID of the parent entry. Foreign key → entries.taxid.",
     ("comments", "comment_type"):     "Comment type (e.g. 'FUNCTION', 'DISEASE', 'SUBCELLULAR LOCATION').",
     ("comments", "text_value"):       "Concatenated free-text values (paragraphs joined by double newline). Null for structured-only comments.",
@@ -1187,7 +1187,7 @@ COLUMN_DESCRIPTIONS = {
 
     # ── publications ──
     ("publications", "acc"):           "Parent entry's primary accession. Foreign key → entries.acc.",
-    ("publications", "from_reviewed"): "True if the parent entry is Swiss-Prot (reviewed).",
+    ("publications", "reviewed"): "True if the parent entry is Swiss-Prot (reviewed).",
     ("publications", "taxid"):        "NCBI taxonomy ID of the parent entry. Foreign key → entries.taxid.",
     ("publications", "reference_number"): "Position of this reference in the entry's reference list (1-based).",
     ("publications", "citation_type"): "Citation type: 'journal article', 'submission', 'book', 'patent', etc.",
