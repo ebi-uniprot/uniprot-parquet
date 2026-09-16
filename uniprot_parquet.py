@@ -39,7 +39,7 @@ import duckdb
 
 _SETUP_SQL = """\
 -- Base views
-CREATE OR REPLACE VIEW entries    AS SELECT *, gene_names[1] AS gene_name FROM read_parquet('{BASE}/entries/*.parquet');
+CREATE OR REPLACE VIEW entries    AS SELECT * FROM read_parquet('{BASE}/entries/*.parquet');
 CREATE OR REPLACE VIEW features   AS SELECT * FROM read_parquet('{BASE}/features/*.parquet');
 CREATE OR REPLACE VIEW xrefs      AS SELECT * FROM read_parquet('{BASE}/xrefs/*.parquet');
 CREATE OR REPLACE VIEW comments   AS SELECT * REPLACE (comment::JSON AS comment) FROM read_parquet('{BASE}/comments/*.parquet');
@@ -50,7 +50,7 @@ CREATE OR REPLACE VIEW publications AS SELECT * FROM read_parquet('{BASE}/public
 -- Annotation card for a single protein
 CREATE OR REPLACE MACRO protein_card(target_acc) AS TABLE (
     SELECT
-        e.acc, e.gene_names[1] AS gene_name, e.protein_name, e.organism_name, e.taxid,
+        e.acc, e.gene_name, e.protein_name, e.organism_name, e.taxid,
         e.reviewed, e.seq_length, e.protein_existence, e.annotation_score,
         e.go_ids, e.keyword_names, e.ec_numbers,
         e.feature_count, e.xref_count, e.comment_count, e.reference_count
@@ -85,7 +85,7 @@ CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
 
 -- Entries joined with features for an organism (filter first, join second)
 CREATE OR REPLACE MACRO entries_with_features(target_taxid) AS TABLE (
-    SELECT e.acc, e.gene_names[1] AS gene_name, e.protein_name, e.reviewed,
+    SELECT e.acc, e.gene_name, e.protein_name, e.reviewed,
            f.type, f.start_pos, f.end_pos, f.description, f.feature_id
     FROM entries e
     JOIN features f ON f.acc = e.acc AND f.taxid = e.taxid
@@ -95,7 +95,7 @@ CREATE OR REPLACE MACRO entries_with_features(target_taxid) AS TABLE (
 
 -- Entries joined with xrefs for an organism + specific databases
 CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
-    SELECT e.acc, e.gene_names[1] AS gene_name, e.protein_name, e.reviewed,
+    SELECT e.acc, e.gene_name, e.protein_name, e.reviewed,
            x.database, x.id, x.properties
     FROM entries e
     JOIN xrefs x ON x.acc = e.acc AND x.taxid = e.taxid
@@ -107,7 +107,7 @@ CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
 CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
     SELECT
         i.acc,
-        e.gene_names[1] AS gene_name,
+        e.gene_name,
         iso.name.value                  AS isoform_name,
         unnest(iso.isoformIds)          AS isoform_id,
         iso.isoformSequenceStatus       AS sequence_status,

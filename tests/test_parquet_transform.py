@@ -270,9 +270,18 @@ class TestSchema:
             "sequence", "seq_length", "go_ids", "xref_dbs",
             "feature_count", "xref_count", "comment_count", "reference_count",
             "entry_type", "extra_attributes",
+            "gene_name", "go_terms", "proteome_ids", "pubmed_ids", "division",
         }
         missing = required - names
         assert not missing, f"Missing columns: {missing}"
+
+    def test_entries_view_has_single_gene_name(self, lake_dir):
+        """gene_name is a real column; the client view must not synthesise a second one."""
+        import uniprot_parquet
+        con = uniprot_parquet.connect(lake_dir)
+        names = [r[0] for r in con.sql("DESCRIBE entries").fetchall()]
+        assert names.count("gene_name") == 1
+        assert len(names) == len(set(names)), "duplicate column names in the entries view"
 
     def test_features_required_columns(self, features_ds):
         names = set(features_ds.schema.names)

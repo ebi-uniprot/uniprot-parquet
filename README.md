@@ -198,12 +198,12 @@ Child tables (`features`, `xrefs`, `comments`, `publications`) include denormali
 **entries** — one row per protein, the primary table for 90% of use cases:
 
 - Identity: `acc`, `id`, `reviewed`, `secondary_accs`, `entry_type`
-- Organism: `taxid`, `organism_name`, `organism_common`, `lineage`
-- Gene/protein: `gene_names`, `gene_synonyms`, `protein_name` (falls back to submittedName for TrEMBL entries), `alt_protein_names`, `protein_flag`, `ec_numbers`, `protein_existence`, `annotation_score`
+- Organism: `taxid`, `organism_name`, `organism_common`, `lineage`, `division` (the UniProt FTP taxonomic division: `archaea`, `bacteria`, `fungi`, `human`, `invertebrates`, `mammals`, `plants`, `rodents`, `vertebrates`, `viruses`, `unclassified`)
+- Gene/protein: `gene_name` (primary, = `gene_names[1]`), `gene_names`, `gene_synonyms`, `protein_name` (falls back to submittedName for TrEMBL entries), `alt_protein_names`, `protein_flag`, `ec_numbers`, `protein_existence`, `annotation_score`
 - Sequence: `sequence`, `seq_length`, `seq_mass`, `seq_md5`, `seq_crc64`
-- Shortcuts: `go_ids`, `xref_dbs`, `keyword_ids`, `keyword_names`
+- Shortcuts: `go_ids`, `go_terms` (`{id, aspect (P/F/C), term, evidence_type}`), `xref_dbs`, `proteome_ids`, `keyword_ids`, `keyword_names`
 - Versioning: `first_public`, `last_modified`, `last_seq_modified`, `entry_version`, `seq_version`
-- Counts: `feature_count`, `xref_count`, `comment_count`, `reference_count`, `uniparc_id`
+- Counts: `feature_count`, `xref_count`, `comment_count`, `reference_count`, `pubmed_ids` (distinct, numerically sorted, stored as strings), `uniparc_id`
 - Lossless: `extra_attributes` (countByCommentType, countByFeatureType)
 - Full nested: `organism`, `protein_desc`, `genes`, `keywords`, `organism_hosts`, `gene_locations`
 

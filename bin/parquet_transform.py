@@ -246,6 +246,7 @@ def init_duckdb(memory_limit: str, threads: int | None,
 # ``check_schema_types`` compares each built table against this dict.
 COLUMN_TYPES: dict[tuple[str, str], str] = {
     ("entries", "organism_hosts"): "STRUCT(scientificName VARCHAR, commonName VARCHAR, taxonId BIGINT, synonyms VARCHAR[])[]",
+    ("entries", "go_terms"): "STRUCT(id VARCHAR, aspect VARCHAR, term VARCHAR, evidence_type VARCHAR)[]",
     ("entries", "gene_locations"): 'STRUCT(geneEncodingType VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[]',
     ("features", "feature_id"): "VARCHAR",
     ("features", "original_sequence"): "VARCHAR",
@@ -350,8 +351,8 @@ def check_declared_types(con, schema_paths: set[str]) -> None:
     type, never to skip the check."""
     problems = []
     for key, type_str in COLUMN_TYPES.items():
-        src = COLUMN_SOURCES[key]
-        if src not in schema_paths:
+        src = COLUMN_SOURCES.get(key)      # derived columns have no single source
+        if src is None or src not in schema_paths:
             continue
         covered = _declared_type_paths(con, type_str, src)
         actual = {p for p in schema_paths if p.startswith(src + ".")}
@@ -363,6 +364,10 @@ def check_declared_types(con, schema_paths: set[str]) -> None:
         raise RuntimeError("COLUMN_TYPES is narrower than the input; update it:\n  "
                            + "\n  ".join(problems))
 
+
+# The review flag, shared by every table builder (plan §5.2): Swiss-Prot
+# entries are "UniProtKB reviewed (Swiss-Prot)", TrEMBL "UniProtKB unreviewed (TrEMBL)".
+REVIEWED_EXPR = "CASE WHEN e.entryType LIKE '%Swiss-Prot%' THEN true ELSE false END"
 
 # Optional fields that may not appear in all UniProtKB subsets.
 # (e.g. organismHosts only exists in virus/parasite entries,
@@ -431,13 +436,39 @@ def _build_entries_sql(schema_paths: set[str]) -> str:
     protein_name_parts.append("(list_extract(COALESCE(e.proteinDescription.alternativeNames, []), 1)).fullName.value")
     protein_name_expr = "COALESCE(" + ", ".join(protein_name_parts) + ")"
 
+    # go_terms (plan B.1): GO xrefs carry properties GoTerm ('F:ATP binding')
+    # and GoEvidenceType ('IEA:InterPro').  aspect/term are NULL, never '',
+    # when GoTerm is absent.
+    if has("uniProtKBCrossReferences.properties"):
+        go_terms_expr = """[ struct_pack(
+            id            := x.id,
+            aspect        := left(list_filter(COALESCE(x.properties, []), p -> p.key = 'GoTerm')[1].value, 1),
+            term          := substr(list_filter(COALESCE(x.properties, []), p -> p.key = 'GoTerm')[1].value, 3),
+            evidence_type := list_filter(COALESCE(x.properties, []), p -> p.key = 'GoEvidenceType')[1].value)
+        FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
+        IF x.database = 'GO' ]"""
+    else:
+        go_terms_expr = _null("entries", "go_terms")
+
+    # pubmed_ids (plan B.2): distinct PubMed ids, sorted numerically, stored as strings.
+    if has("references.citation.citationCrossReferences"):
+        pubmed_ids_expr = """list_transform(
+        list_sort(list_transform(
+            list_distinct(flatten(list_transform(
+                COALESCE(e."references", []),
+                r -> [ c.id FOR c IN COALESCE(r.citation.citationCrossReferences, []) IF c.database = 'PubMed' ]
+            ))),
+            x -> CAST(x AS BIGINT))),
+        x -> CAST(x AS VARCHAR))"""
+    else:
+        pubmed_ids_expr = "CAST([] AS VARCHAR[])"
+
     return f"""
 SELECT
     -- Identity
     e.primaryAccession                              AS acc,
     e.uniProtkbId                                   AS id,
-    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END                   AS reviewed,
+    {REVIEWED_EXPR}                                 AS reviewed,
     e.secondaryAccessions                           AS secondary_accs,
 
     -- Organism (flattened)
@@ -445,12 +476,31 @@ SELECT
     e.organism.scientificName                       AS organism_name,
     e.organism.commonName                           AS organism_common,
     e.organism.lineage                              AS lineage,
+    -- UniProt taxonomic division (plan D.5), most specific rule first.
+    -- First approximation of the FTP taxonomic_divisions/ rules; the D.5
+    -- correctness gate (per-division counts vs the FTP) decides the final CASE.
+    -- Protists land in 'invertebrates' as on the FTP; 'unclassified' is the rest.
+    CASE
+      WHEN e.organism.taxonId = 9606                             THEN 'human'
+      WHEN list_contains(e.organism.lineage, 'Rodentia')         THEN 'rodents'
+      WHEN list_contains(e.organism.lineage, 'Mammalia')         THEN 'mammals'
+      WHEN list_contains(e.organism.lineage, 'Vertebrata')       THEN 'vertebrates'
+      WHEN list_contains(e.organism.lineage, 'Fungi')            THEN 'fungi'
+      WHEN list_contains(e.organism.lineage, 'Viridiplantae')    THEN 'plants'
+      WHEN list_contains(e.organism.lineage, 'Eukaryota')        THEN 'invertebrates'
+      WHEN list_contains(e.organism.lineage, 'Bacteria')         THEN 'bacteria'
+      WHEN list_contains(e.organism.lineage, 'Archaea')          THEN 'archaea'
+      WHEN list_contains(e.organism.lineage, 'Viruses')          THEN 'viruses'
+      ELSE 'unclassified'
+    END                                             AS division,
 
     -- Gene & protein (flattened)
     list_transform(
         COALESCE(e.genes, []),
         g -> g.geneName.value
     )                                               AS gene_names,
+    -- Primary gene name = first of gene_names (plan B.4)
+    list_extract(list_transform(COALESCE(e.genes, []), g -> g.geneName.value), 1) AS gene_name,
     -- All gene synonyms across all genes (searchable list)
     flatten(list_transform(
         COALESCE(e.genes, []),
@@ -482,10 +532,16 @@ SELECT
         FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
         IF x.database = 'GO'
     ])                                              AS go_ids,
+    {go_terms_expr}                                 AS go_terms,
     list_distinct([
         x.database
         FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
     ])                                              AS xref_dbs,
+    list_sort(list_distinct([
+        x.id
+        FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
+        IF x.database = 'Proteomes'
+    ]))                                             AS proteome_ids,
     list_transform(
         COALESCE(e.keywords, []),
         x -> x.id
@@ -507,6 +563,7 @@ SELECT
     CAST(len(COALESCE(e.uniProtKBCrossReferences, [])) AS INTEGER) AS xref_count,
     CAST(len(COALESCE(e.comments, [])) AS INTEGER)  AS comment_count,
     CAST(len(COALESCE(e."references", [])) AS INTEGER) AS reference_count,
+    {pubmed_ids_expr}                               AS pubmed_ids,
     e.extraAttributes.uniParcId                     AS uniparc_id,
 
     -- Entry type (lossless round-trip — the boolean 'reviewed' loses the exact string)
@@ -590,8 +647,7 @@ SELECT
 FROM (
     SELECT
         e.primaryAccession                           AS acc,
-        CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-             THEN true ELSE false END                AS reviewed,
+        {REVIEWED_EXPR}                             AS reviewed,
         e.organism.taxonId                           AS taxid,
         e.organism.scientificName                    AS organism_name,
         CAST(e.sequence.length AS INTEGER)           AS seq_length,
@@ -637,8 +693,7 @@ SELECT
 FROM (
     SELECT
         e.primaryAccession                           AS acc,
-        CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-             THEN true ELSE false END                AS reviewed,
+        {REVIEWED_EXPR}                             AS reviewed,
         e.organism.taxonId                           AS taxid,
         e.uniProtKBCrossReferences
     FROM {{read_clause}} e
@@ -688,8 +743,7 @@ SELECT
 FROM (
     SELECT
         e.primaryAccession                           AS acc,
-        CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-             THEN true ELSE false END                AS reviewed,
+        {REVIEWED_EXPR}                             AS reviewed,
         e.organism.taxonId                           AS taxid,
         e.comments
     FROM {{read_clause}} e
@@ -755,8 +809,7 @@ SELECT
 FROM (
     SELECT
         e.primaryAccession                           AS acc,
-        CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-             THEN true ELSE false END                AS reviewed,
+        {REVIEWED_EXPR}                             AS reviewed,
         e.organism.taxonId                           AS taxid,
         e."references"
     FROM {{read_clause}} e
@@ -783,15 +836,14 @@ ORDER BY sub.reviewed DESC, sub.taxid, sub.acc
 
 def _build_features_variant_sql() -> str:
     """Features with VARIANT data column."""
-    return """
+    return f"""
 SELECT
     e.primaryAccession                           AS acc,
-    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END                AS reviewed,
+    {REVIEWED_EXPR}                             AS reviewed,
     e.organism.taxonId                           AS taxid,
     unnest.type                                  AS type,
     unnest::VARIANT                              AS data
-FROM {read_clause} e,
+FROM {{read_clause}} e,
 LATERAL UNNEST(COALESCE(e.features, [])) AS t(unnest)
 ORDER BY reviewed DESC, taxid, acc
 """
@@ -799,15 +851,14 @@ ORDER BY reviewed DESC, taxid, acc
 
 def _build_xrefs_variant_sql() -> str:
     """Cross-references with VARIANT data column."""
-    return """
+    return f"""
 SELECT
     e.primaryAccession                           AS acc,
-    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END                AS reviewed,
+    {REVIEWED_EXPR}                             AS reviewed,
     e.organism.taxonId                           AS taxid,
     unnest.database                              AS database,
     unnest::VARIANT                              AS data
-FROM {read_clause} e,
+FROM {{read_clause}} e,
 LATERAL UNNEST(COALESCE(e.uniProtKBCrossReferences, [])) AS t(unnest)
 ORDER BY reviewed DESC, taxid, acc
 """
@@ -822,15 +873,14 @@ def _build_comments_variant_sql() -> str:
     normalises the map to a JSON object, then ``::VARIANT`` gives us
     VARIANT(OBJECT) with proper field access.
     """
-    return """
+    return f"""
 SELECT
     e.primaryAccession                           AS acc,
-    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END                AS reviewed,
+    {REVIEWED_EXPR}                             AS reviewed,
     e.organism.taxonId                           AS taxid,
     trim('"' FROM CAST(unnest.commentType AS VARCHAR)) AS comment_type,
     (unnest::JSON)::VARIANT                      AS data
-FROM {read_clause} e,
+FROM {{read_clause}} e,
 LATERAL UNNEST(COALESCE(e.comments, [])) AS t(unnest)
 ORDER BY reviewed DESC, taxid, acc
 """
@@ -838,14 +888,13 @@ ORDER BY reviewed DESC, taxid, acc
 
 def _build_publications_variant_sql() -> str:
     """Publications with VARIANT data column."""
-    return """
+    return f"""
 SELECT
     e.primaryAccession                           AS acc,
-    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END                AS reviewed,
+    {REVIEWED_EXPR}                             AS reviewed,
     e.organism.taxonId                           AS taxid,
     unnest::VARIANT                              AS data
-FROM {read_clause} e,
+FROM {{read_clause}} e,
 LATERAL UNNEST(COALESCE(e."references", [])) AS t(unnest)
 ORDER BY reviewed DESC, taxid, acc
 """
@@ -881,15 +930,18 @@ TABLE_META = {
         "foreign_keys": {},
         "columns": {
             "convenience": [
-                "acc", "id", "reviewed", "secondary_accs",
-                "taxid", "organism_name", "organism_common", "lineage",
-                "gene_names", "gene_synonyms", "protein_name", "alt_protein_names",
-                "protein_flag", "ec_numbers", "protein_existence", "annotation_score",
-                "sequence", "seq_length", "seq_mass", "seq_md5", "seq_crc64",
-                "go_ids", "xref_dbs", "keyword_ids", "keyword_names",
+                # Same order as the SELECT in _build_entries_sql (plan Part C):
+                # nine hot columns first, then gene_name, then the rest.
+                "acc", "id", "reviewed", "taxid", "organism_name", "gene_names",
+                "protein_name", "seq_length", "sequence",
+                "gene_name",
+                "secondary_accs", "organism_common", "lineage", "division",
+                "gene_synonyms", "alt_protein_names", "protein_flag", "ec_numbers",
+                "protein_existence", "annotation_score", "seq_mass", "seq_md5", "seq_crc64",
+                "go_ids", "go_terms", "xref_dbs", "proteome_ids", "keyword_ids", "keyword_names",
                 "first_public", "last_modified", "last_seq_modified",
                 "entry_version", "seq_version",
-                "feature_count", "xref_count", "comment_count", "reference_count",
+                "feature_count", "xref_count", "comment_count", "reference_count", "pubmed_ids",
                 "uniparc_id", "entry_type", "extra_attributes",
             ],
             "nested": [
@@ -1109,7 +1161,9 @@ COLUMN_DESCRIPTIONS = {
     ("entries", "organism_name"):      "Scientific name of the source organism.",
     ("entries", "organism_common"):    "Common name of the source organism (e.g. 'Human'). May be null.",
     ("entries", "lineage"):            "Full taxonomic lineage as a list of taxon names, root to species.",
+    ("entries", "division"):           "UniProt taxonomic division (archaea, bacteria, fungi, human, invertebrates, mammals, plants, rodents, vertebrates, viruses, unclassified), derived from lineage and taxid.",
     ("entries", "gene_names"):         "List of primary gene names across all genes associated with this entry.",
+    ("entries", "gene_name"):          "Primary gene name (first of gene_names).",
     ("entries", "gene_synonyms"):      "Flattened list of gene name synonyms across all genes.",
     ("entries", "protein_name"):       "Recommended (Swiss-Prot) or submitted (TrEMBL) full protein name.",
     ("entries", "alt_protein_names"):  "List of alternative full protein names from proteinDescription.alternativeNames.",
@@ -1123,7 +1177,9 @@ COLUMN_DESCRIPTIONS = {
     ("entries", "seq_md5"):            "MD5 hash of the sequence (lowercase hex). Useful for deduplication.",
     ("entries", "seq_crc64"):          "CRC64 checksum of the sequence. Used by UniProt for integrity checks.",
     ("entries", "go_ids"):             "Distinct Gene Ontology term IDs (e.g. GO:0005634) from cross-references.",
+    ("entries", "go_terms"):           "GO annotations as {id, aspect (P/F/C), term, evidence_type}; go_ids is the flat id list.",
     ("entries", "xref_dbs"):           "Distinct database names referenced in cross-references (e.g. PDB, Ensembl).",
+    ("entries", "proteome_ids"):       "Distinct UniProt proteome ids (UP…) from cross-references, sorted.",
     ("entries", "keyword_ids"):        "UniProt keyword IDs (e.g. KW-0181).",
     ("entries", "keyword_names"):      "UniProt keyword names (e.g. 'Complete proteome').",
     ("entries", "first_public"):       "Date the entry was first made public in UniProtKB.",
@@ -1135,6 +1191,7 @@ COLUMN_DESCRIPTIONS = {
     ("entries", "xref_count"):         "Number of cross-references to external databases.",
     ("entries", "comment_count"):      "Number of comment annotations (function, disease, etc.).",
     ("entries", "reference_count"):    "Number of literature/submission references.",
+    ("entries", "pubmed_ids"):         "Distinct PubMed ids cited by the entry, sorted numerically, stored as strings.",
     ("entries", "uniparc_id"):         "UniParc identifier (UPI) linking to the sequence archive.",
     ("entries", "entry_type"):         "Raw entryType string (e.g. 'UniProtKB reviewed (Swiss-Prot)'). Lossless.",
     ("entries", "extra_attributes"):   "Nested struct with countByCommentType, countByFeatureType, uniParcId.",

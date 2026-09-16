@@ -504,6 +504,50 @@ class TestConvenienceColumns:
                 f"{acc}: go_ids mismatch"
             )
 
+    def test_gene_name_matches(self, originals, lake_entries):
+        for acc in originals:
+            lake = lake_entries[acc]
+            assert lake["gene_name"] == (lake["gene_names"] or [None])[0], f"{acc}: gene_name"
+
+    def test_go_terms_match_go_ids(self, originals, lake_entries):
+        for acc in originals:
+            lake = lake_entries[acc]
+            go_terms = lake.get("go_terms") or []
+            go_ids = lake.get("go_ids") or []
+            assert {t["id"] for t in go_terms} == set(go_ids), f"{acc}: go_terms ids"
+            assert len(go_terms) == len(go_ids), f"{acc}: go_terms length"
+            for t in go_terms:
+                assert t["aspect"] in {"P", "F", "C", None}, f"{acc}: aspect {t['aspect']!r}"
+                if t["aspect"] is not None:
+                    assert t["term"], f"{acc}: empty term"
+
+    def test_pubmed_ids_match(self, originals, lake_entries):
+        for acc, orig in originals.items():
+            ids = set()
+            for r in orig.get("references") or []:
+                for c in (r.get("citation") or {}).get("citationCrossReferences") or []:
+                    if c["database"] == "PubMed":
+                        ids.add(c["id"])
+            expected = sorted(ids, key=int)
+            assert (lake_entries[acc].get("pubmed_ids") or []) == expected, f"{acc}: pubmed_ids"
+
+    def test_proteome_ids_match(self, originals, lake_entries):
+        for acc, orig in originals.items():
+            expected = sorted({
+                x["id"] for x in (orig.get("uniProtKBCrossReferences") or [])
+                if x["database"] == "Proteomes"
+            })
+            assert (lake_entries[acc].get("proteome_ids") or []) == expected, f"{acc}: proteome_ids"
+
+    def test_division_values(self, originals, lake_entries):
+        allowed = {"archaea", "bacteria", "fungi", "human", "invertebrates", "mammals",
+                   "plants", "rodents", "vertebrates", "viruses", "unclassified"}
+        for acc in originals:
+            lake = lake_entries[acc]
+            assert lake["division"] in allowed, f"{acc}: division {lake['division']!r}"
+            if lake["taxid"] == 9606:
+                assert lake["division"] == "human", acc
+
     def test_xref_dbs_match(self, originals, lake_entries):
         for acc, orig in originals.items():
             lake = lake_entries[acc]
