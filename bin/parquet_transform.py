@@ -524,25 +524,23 @@ ORDER BY sub.from_reviewed DESC, sub.taxid, sub.acc
 
 
 def _build_comments_sql(schema_paths: set[str]) -> str:
-    """Build comments SQL with NULLs for any fields absent from the schema.
+    """Build comments SQL.
 
-    The ``texts`` field only appears on text-based comment types (FUNCTION,
-    SUBUNIT, etc.) — not on structured types like COFACTOR, INTERACTION, or
-    CATALYTIC_ACTIVITY.  DuckDB's union schema *should* include it if any
-    comment in the dataset has it, but on a subset that only contains
-    structured comment types, ``texts`` could be absent entirely.
+    ``comments`` is ``MAP(VARCHAR, JSON)[]`` in the staged schema, so
+    ``discover_schema_paths`` never yields a ``comments.texts`` path and the
+    column cannot be guarded with ``has()`` (plan G.1).  The ``texts`` key is
+    read unconditionally: map access on a missing key yields NULL, so
+    structured-only comment types (COFACTOR, INTERACTION, CATALYTIC ACTIVITY,
+    ALTERNATIVE PRODUCTS, ...) get NULL rather than an error.  DISEASE and
+    SUBCELLULAR LOCATION keep their prose under ``note.texts`` and are also
+    NULL here; the full comment is in the ``comment`` column.
     """
+    del schema_paths  # no optional paths in this builder (see docstring)
 
-    def has(path: str) -> bool:
-        return path in schema_paths
-
-    if has("comments.texts"):
-        text_value_expr = """array_to_string(
+    text_value_expr = """NULLIF(array_to_string(
         from_json(unnest.texts->'$[*].value', '["VARCHAR"]'),
         chr(10) || chr(10)
-    )"""
-    else:
-        text_value_expr = "NULL"
+    ), '')"""
 
     return f"""
 SELECT

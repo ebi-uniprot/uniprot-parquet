@@ -65,6 +65,9 @@ Checks (in order):
       - Inferred Parquet schema matches committed baseline
       - Detects renamed/dropped/new fields from upstream JSON changes
 
+  15. COMMENT TEXT
+      - Every text-bearing comment type has a populated text_value
+
 Usage:
     validate_lake.py \
         --lake /path/to/lake \
@@ -945,6 +948,35 @@ def check_field_completeness(report, lake_dir, jsonl_path):
         )
 
 
+# Comment types whose prose lives in a top-level ``texts`` key (plan G.1).
+# DISEASE and SUBCELLULAR LOCATION keep theirs under ``note.texts`` and are
+# deliberately absent: ``text_value`` is NULL for them by design.
+TEXT_COMMENT_TYPES = {
+    "FUNCTION", "SUBUNIT", "TISSUE SPECIFICITY", "DOMAIN", "PTM",
+    "SIMILARITY", "CAUTION", "MISCELLANEOUS", "ACTIVITY REGULATION",
+    "ALLERGEN", "BIOTECHNOLOGY", "DEVELOPMENTAL STAGE",
+    "DISRUPTION PHENOTYPE", "INDUCTION", "PATHWAY", "POLYMORPHISM",
+    "TOXIC DOSE",
+}
+
+
+def check_text_value(report, lake_dir):
+    """Text-bearing comment types must have a populated text_value."""
+    report.checks.append("\n--- 15. COMMENT TEXT ---")
+    eprint("\n--- 15. COMMENT TEXT ---")
+    import duckdb
+    path = os.path.join(lake_dir, "comments", "*.parquet")
+    rows = duckdb.sql(f"""
+        SELECT comment_type, count(*) AS n, count(text_value) AS with_text
+        FROM read_parquet('{path}') GROUP BY 1
+    """).fetchall()
+    present = {r[0]: (r[1], r[2]) for r in rows}
+    for ctype in sorted(TEXT_COMMENT_TYPES & set(present)):
+        n, with_text = present[ctype]
+        report.check(f"comments.text_value populated for {ctype}", with_text > 0,
+                     f"{with_text:,}/{n:,} rows have text")
+
+
 def check_schema_evolution(report, lake_dir, baseline_path):
     """
     Detect upstream UniProtKB JSON schema changes by comparing inferred Parquet
@@ -1067,6 +1099,7 @@ def main():
     check_feature_coordinates(report, args.lake)
     check_schema_types(report, args.lake)
     check_field_completeness(report, args.lake, args.jsonl)
+    check_text_value(report, args.lake)
     if args.schema_baseline:
         check_schema_evolution(report, args.lake, args.schema_baseline)
 

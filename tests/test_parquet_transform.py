@@ -298,6 +298,9 @@ class TestSchema:
         missing = required - names
         assert not missing, f"Missing columns: {missing}"
 
+    def test_comments_text_value_is_string(self, comments_ds):
+        assert str(comments_ds.schema.field("text_value").type) in ("string", "large_string")
+
     def test_publications_required_columns(self, publications_ds):
         names = set(publications_ds.schema.names)
         required = {

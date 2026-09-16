@@ -428,6 +428,24 @@ class TestCommentContent:
                 f"{acc}: {len(missing)} comments missing from lake"
             )
 
+    def test_text_value_matches_texts(self, originals, lake_comments):
+        """text_value is the double-newline join of texts[*].value, else NULL."""
+        for acc, orig in originals.items():
+            by_type = defaultdict(list)
+            for row in lake_comments.get(acc, []):
+                by_type[row["comment_type"]].append(row["text_value"])
+            for c in orig.get("comments") or []:
+                lake_values = by_type[c["commentType"]]
+                if "texts" in c:
+                    expected = "\n\n".join(t["value"] for t in c["texts"])
+                    assert expected in lake_values, (
+                        f"{acc}: {c['commentType']} text_value not found"
+                    )
+                else:
+                    assert all(v is None for v in lake_values), (
+                        f"{acc}: {c['commentType']} has no texts but text_value is set"
+                    )
+
 
 class TestPublicationContent:
     """The 'reference' column preserves the full original reference struct."""

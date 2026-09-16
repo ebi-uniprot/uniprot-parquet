@@ -387,7 +387,7 @@ The pipeline is **idempotent** — re-running on the same release directory over
 
 ### Validation
 
-The `VALIDATE` step runs 12 checks against the source JSONL as ground truth. All checks use bounded-memory streaming or DuckDB joins (no Python dicts for billion-row tables). Any single failure exits 1 and blocks the provenance manifest:
+The `VALIDATE` step runs the checks below against the source JSONL as ground truth. All checks use bounded-memory streaming or DuckDB joins (no Python dicts for billion-row tables). Any single failure exits 1 and blocks the provenance manifest:
 
 1. **Completeness** — JSONL line count == entries rows; child table counts match `sum(entries.*_count)`
 2. **Uniqueness** — `entries.acc` has zero duplicates
@@ -401,6 +401,9 @@ The `VALIDATE` step runs 12 checks against the source JSONL as ground truth. All
 10. **Sequence integrity** — `len(sequence) == seq_length` for every entry; no zero-length sequences
 11. **Feature coordinate boundaries** — `start_pos <= end_pos` where both are non-null
 12. **Schema type protection** — critical columns have expected Arrow types (not silently cast by inference)
+13. **Field completeness** — every top-level JSON field is captured in `entries` or a child table
+14. **Schema evolution guard** — Parquet schema matches a committed baseline (when `--schema-baseline` is given)
+15. **Comment text** — every text-bearing comment type has a populated `text_value`
 
 ### Testing
 

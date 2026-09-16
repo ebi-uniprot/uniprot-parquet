@@ -115,8 +115,12 @@ print(pq.ParquetWriter.__init__.__doc__)   # read the bloom paragraph, note the 
            SELECT comment_type, count(*) AS n, count(text_value) AS with_text
            FROM read_parquet('{path}') GROUP BY 1
        """).fetchall()
-       text_types = {"FUNCTION", "SUBUNIT", "SUBCELLULAR LOCATION", "TISSUE SPECIFICITY",
-                     "DISEASE", "DOMAIN", "PTM", "SIMILARITY", "CAUTION", "MISCELLANEOUS"}
+       # Corrected 2026-09-16: DISEASE and SUBCELLULAR LOCATION carry their prose
+       # under note.texts, not texts, so text_value is NULL for them by design.
+       text_types = {"FUNCTION", "SUBUNIT", "TISSUE SPECIFICITY", "DOMAIN", "PTM",
+                     "SIMILARITY", "CAUTION", "MISCELLANEOUS", "ACTIVITY REGULATION",
+                     "ALLERGEN", "BIOTECHNOLOGY", "DEVELOPMENTAL STAGE", "DISRUPTION PHENOTYPE",
+                     "INDUCTION", "PATHWAY", "POLYMORPHISM", "TOXIC DOSE"}
        present = {r[0]: (r[1], r[2]) for r in rows}
        for ctype in sorted(text_types & set(present)):
            n, with_text = present[ctype]
