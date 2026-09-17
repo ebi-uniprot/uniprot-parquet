@@ -139,9 +139,18 @@ def load_original_entries(fixture_path):
     return {e["primaryAccession"]: e for e in data["results"]}
 
 
+def table_files(lake_dir, name):
+    """Every Parquet file of a table (recursive over the Hive partition dirs),
+    sorted so review_status=swissprot files precede review_status=trembl."""
+    import glob
+    return sorted(glob.glob(os.path.join(lake_dir, name, "**", "*.parquet"), recursive=True))
+
+
 def open_table(lake_dir, name):
+    """PyArrow dataset over the explicit file list: no Hive column is added,
+    so tests see exactly the stored schema (validate_lake.open_table does the same)."""
     import pyarrow.dataset as ds
-    return ds.dataset(os.path.join(lake_dir, name), format="parquet")
+    return ds.dataset(table_files(lake_dir, name), format="parquet")
 
 
 def _rows_by_acc(lake_dir, name):

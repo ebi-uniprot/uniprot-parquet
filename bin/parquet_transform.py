@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 
 import duckdb
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from frictionless import Package
 
@@ -1156,8 +1157,18 @@ ORDER BY reviewed DESC, acc, primary_acc
 
 # ─── Table definitions ──────────────────────────────────────────────────
 
+# ─── Writer constants ───────────────────────────────────────────────────
+TARGET_FILE_BYTES = 256 * 1024 * 1024   # per-file roll-over target; plan F.4 measures 512 MB / 1 GB
+ROW_GROUP_SIZE = 100_000
+ZSTD_LEVEL = 1                          # plan H.1: measured in Step 18
+PARTITION_KEY = "review_status"         # plan Part D: Hive directory key ...
+PARTITION_VALUES = {True: "swissprot", False: "trembl"}   # ... derived from the stored `reviewed`
+
+# (name, sql_template, sort_order, partition_column).  Every table names its
+# partition column explicitly so a future table cannot be written
+# unpartitioned by accident.
 TABLE_DEFS = [
-    ("entries",      None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
+    ("entries",      None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
     # Child tables inherit (reviewed DESC, taxid ASC, acc ASC) from the
     # pre-sorted JSONL input — DuckDB's ORDER BY on these three columns is
     # essentially free (data arrives already in order after LATERAL unnest).
@@ -1165,14 +1176,14 @@ TABLE_DEFS = [
     # are deliberately omitted to avoid ~1.2 TB of sort spill at production
     # scale (~3B xref + ~1.3B feature + ~1B publication + ~400M comment rows).
     # Users who need within-protein ordering can add it at query time.
-    ("features",     None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
-    ("xrefs",        None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
-    ("comments",     None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
-    ("publications", None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
+    ("features",     None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
+    ("xrefs",        None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
+    ("comments",     None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
+    ("publications", None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
     # accession_map is acc-sorted within each review side: the lookup table
     # (plan Part A).  A real sort at production scale (~250M + secondaries rows
     # of five narrow columns; low tens of GB of spill).
-    ("accession_map", None, ["reviewed DESC", "acc ASC", "primary_acc ASC"]),
+    ("accession_map", None, ["reviewed DESC", "acc ASC", "primary_acc ASC"], "reviewed"),
 ]
 
 
@@ -1307,13 +1318,24 @@ def _file_metadata(release) -> dict[str, str]:
             "license": DATA_LICENSE, "generator": GENERATOR}
 
 
+def _bloom_kwargs(label: str) -> dict:
+    """Bloom-filter writer options (plan Part A, B1).  Deferred: PyArrow 23
+    cannot write bloom filters (Phase 0.1), so this returns {} and the writer
+    is identical with or without B1."""
+    return {}
+
+
 def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order=None,
-                      release=None):
-    """Stream DuckDB result → Parquet files in bounded-memory batches.
+                      partition_column="reviewed", release=None):
+    """Stream DuckDB result → Hive-partitioned Parquet files in bounded-memory batches.
 
     DuckDB executes the query lazily and yields Arrow record batches of
-    `batch_size` rows. Multiple batches are accumulated into larger files
-    targeting ~256MB per file using ParquetWriter.
+    `batch_size` rows.  Batches are accumulated into files of ~TARGET_FILE_BYTES
+    under ``<table_dir>/review_status=<swissprot|trembl>/`` (plan Part D):
+    rows arrive sorted ``reviewed DESC`` so every ``true`` row precedes every
+    ``false`` row, a batch contains at most one flip, and the writer switches
+    partition directory (and restarts the file counter) exactly once.  The
+    ``reviewed`` column itself stays stored in every file.
 
     The Arrow schema is determined once by DuckDB before the first batch
     is yielded — all batches share the same schema.
@@ -1321,117 +1343,146 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
     Memory model: only one Arrow batch is held at a time (plus whatever
     DuckDB needs for the ORDER BY spill).
 
-    Atomicity: Files are written to a temporary .tmp/ directory and moved
-    to the final location after all batches are successfully written.
+    Atomicity: files are written to ``<partition>/.tmp/`` and moved to their
+    final location only after the whole table has been written, so nothing
+    is visible under the final directories until the table is complete
+    (--skip-existing relies on this).
 
     Args:
         con: DuckDB connection
         sql: SQL query to execute
-        table_dir: Output directory for Parquet files
+        table_dir: Output directory for the table
         batch_size: Rows per Arrow batch
-        label: Table name (for logging)
+        label: Table name (for file names and logging)
         sort_order: List of sort order strings (e.g. ["reviewed DESC", "taxid ASC"])
                    to embed in Parquet footer metadata (PyArrow 16.0+).
+        partition_column: boolean column that decides the partition directory
+        release: UniProt release name, written into the footer metadata
 
-    Returns (total_rows, file_list, arrow_schema).
+    Returns (total_rows, file_list, arrow_schema); file paths are relative to
+    ``table_dir`` (``review_status=swissprot/entries_00001.parquet``).
     """
-    TARGET_FILE_BYTES = 256 * 1024 * 1024  # ~256 MB per file
-
     eprint(f"  Querying DuckDB for {label}...")
+    reader = con.sql(sql).to_arrow_reader(batch_size=batch_size)
+    os.makedirs(table_dir, exist_ok=True)
     t0 = time.time()
 
-    result = con.sql(sql)
-    reader = result.to_arrow_reader(batch_size=batch_size)
-
-    # Create main output directory and temporary directory
-    os.makedirs(table_dir, exist_ok=True)
-    tmp_dir = os.path.join(table_dir, ".tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-
     total_rows = 0
-    parquet_files = []
     arrow_schema = None
-    writer = None
-    current_file_num = 0
-    current_file_path = None
     sorting_columns = None
+    pending = []                       # (tmp_path, final_path, relative_path)
+    st = {"side": None, "writer": None, "file_num": 0, "path": None}
+
+    def part_dir(side):
+        return os.path.join(table_dir, f"{PARTITION_KEY}={side}")
+
+    def open_writer():
+        st["file_num"] += 1
+        tmp = os.path.join(part_dir(st["side"]), ".tmp")
+        os.makedirs(tmp, exist_ok=True)
+        st["path"] = os.path.join(tmp, f"{label}_{st['file_num']:05d}.parquet")
+        kwargs = {"compression": "zstd", "compression_level": ZSTD_LEVEL,
+                  "write_page_index": True}
+        if sorting_columns:
+            kwargs["sorting_columns"] = sorting_columns
+        kwargs.update(_bloom_kwargs(label))
+        st["writer"] = pq.ParquetWriter(st["path"], arrow_schema, **kwargs)
+
+    def close_writer():
+        if st["writer"] is None:
+            return
+        st["writer"].close()
+        st["writer"] = None
+        final = os.path.join(part_dir(st["side"]), os.path.basename(st["path"]))
+        pending.append((st["path"], final, os.path.relpath(final, table_dir)))
+
+    def write_part(tbl):
+        if st["writer"] is None:
+            open_writer()
+        st["writer"].write_table(tbl, row_group_size=ROW_GROUP_SIZE)
+        if os.path.getsize(st["path"]) >= TARGET_FILE_BYTES:
+            close_writer()
 
     try:
         for record_batch in reader:
-            arrow_tbl = pa.Table.from_batches([record_batch])
-            n = arrow_tbl.num_rows
-            if n == 0:
+            tbl = pa.Table.from_batches([record_batch])
+            if tbl.num_rows == 0:
                 continue
-
             if arrow_schema is None:
-                arrow_schema = _annotate_schema(arrow_tbl.schema, label, _file_metadata(release))
-                # Build sorting columns once schema is available
-                if sort_order:
-                    sorting_columns = build_sorting_columns(sort_order, arrow_schema)
+                arrow_schema = _annotate_schema(tbl.schema, label, _file_metadata(release))
+                sorting_columns = build_sorting_columns(sort_order, arrow_schema) if sort_order else None
             # Re-wrap every batch so the written schema carries the field metadata.
-            arrow_tbl = pa.Table.from_arrays(list(arrow_tbl.columns), schema=arrow_schema)
+            tbl = pa.Table.from_arrays(list(tbl.columns), schema=arrow_schema)
+            total_rows += tbl.num_rows
 
-            total_rows += n
+            flags = tbl.column(partition_column)
+            if flags.null_count:
+                raise RuntimeError(f"{label}: {partition_column} has NULLs; cannot partition")
+            n_true = pc.sum(flags).as_py() or 0
+            first = flags[0].as_py()
+            if first and n_true < tbl.num_rows:            # the flip is inside this batch
+                parts = [(True, tbl.slice(0, n_true)), (False, tbl.slice(n_true))]
+            else:
+                if not first and n_true:
+                    raise RuntimeError(f"{label}: batch not sorted {partition_column} DESC")
+                parts = [(first, tbl)]
 
-            # Initialize writer for first batch or if we haven't started yet
-            if writer is None:
-                current_file_num += 1
-                filename = f"{label}_{current_file_num:05d}.parquet"
-                current_file_path = os.path.join(tmp_dir, filename)
-                writer_kwargs = {
-                    "compression": "zstd",
-                }
-                if sorting_columns:
-                    writer_kwargs["sorting_columns"] = sorting_columns
-                writer = pq.ParquetWriter(
-                    current_file_path,
-                    arrow_schema,
-                    **writer_kwargs
-                )
-
-            # Write batch to current file (row_group_size controls Parquet row group boundaries)
-            writer.write_table(arrow_tbl, row_group_size=100_000)
-
-            # Check current file size and close if it exceeds target
-            current_size = os.path.getsize(current_file_path)
-            if current_size >= TARGET_FILE_BYTES:
-                writer.close()
-                parquet_files.append(os.path.basename(current_file_path))
-                writer = None
-
+            for flag, part in parts:
+                side = PARTITION_VALUES[flag]
+                if st["side"] != side:
+                    if st["side"] is not None and flag:           # true after false: input is not sorted
+                        raise RuntimeError(f"{label}: {partition_column} flipped back to true")
+                    close_writer()
+                    st["side"], st["file_num"] = side, 0
+                write_part(part)
             elapsed = time.time() - t0
-            rate = total_rows / elapsed if elapsed > 0 else 0
-            eprint(
-                f"    batch {current_file_num}: {n:,} rows "
-                f"(total {total_rows:,}, "
-                f"{elapsed:.0f}s elapsed, "
-                f"{rate:,.0f} rows/s)"
-            )
+            eprint(f"    {label}: {total_rows:,} rows so far "
+                   f"({elapsed:.0f}s, {total_rows / elapsed if elapsed else 0:,.0f} rows/s)")
 
-        # Close final writer if it's still open
-        if writer is not None:
-            writer.close()
-            parquet_files.append(os.path.basename(current_file_path))
-
-        # Move all files from .tmp/ to final location atomically
-        for filename in parquet_files:
-            tmp_path = os.path.join(tmp_dir, filename)
-            final_path = os.path.join(table_dir, filename)
+        close_writer()
+        for tmp_path, final_path, _ in pending:            # all-or-nothing publish
             shutil.move(tmp_path, final_path)
-
-        # Clean up empty .tmp/ directory
-        if os.path.isdir(tmp_dir) and not os.listdir(tmp_dir):
-            os.rmdir(tmp_dir)
-
+        for side in PARTITION_VALUES.values():
+            tmp = os.path.join(part_dir(side), ".tmp")
+            if os.path.isdir(tmp) and not os.listdir(tmp):
+                os.rmdir(tmp)
     except Exception:
-        # On error, close writer and leave .tmp/ for cleanup by caller
-        if writer is not None:
-            writer.close()
+        # On error, close the writer and leave .tmp/ for cleanup by the caller
+        if st["writer"] is not None:
+            st["writer"].close()
         raise
 
-    elapsed = time.time() - t0
-    eprint(f"  {label}: {total_rows:,} rows in {len(parquet_files)} files ({elapsed:.1f}s)")
-    return total_rows, parquet_files, arrow_schema
+    files = [rel for _, _, rel in pending]
+    eprint(f"  {label}: {total_rows:,} rows in {len(files)} files ({time.time()-t0:.1f}s)")
+    return total_rows, files, arrow_schema
+
+
+def _list_table_files(table_dir):
+    """Parquet files of a table, relative to table_dir, in partition order."""
+    from glob import glob
+    return sorted(os.path.relpath(p, table_dir)
+                  for p in glob(os.path.join(table_dir, f"{PARTITION_KEY}=*", "*.parquet")))
+
+
+def _partition_row_counts(table_dir, files):
+    counts = {}
+    for rel in files:
+        side = rel.split("/")[0].split("=", 1)[1]
+        counts[side] = counts.get(side, 0) + pq.read_metadata(os.path.join(table_dir, rel)).num_rows
+    return counts
+
+
+def _partitioning_block(name, files, table_dir, partition_column):
+    """The manifest's per-table partitioning descriptor (plan D.3)."""
+    return {
+        "scheme": "hive",
+        "keys": [{"name": PARTITION_KEY, "type": "string",
+                  "values": sorted({f.split("/")[0].split("=", 1)[1] for f in files}),
+                  "derived_from": partition_column,
+                  "row_counts": _partition_row_counts(table_dir, files)}],
+        "note": ("accession_map is excluded from any future second partition level (plan D.5)"
+                 if name == "accession_map" else ""),
+    }
 
 
 def _schema_to_dict(arrow_schema):
@@ -1682,6 +1733,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
             },
             "rowCount": table_info.get("row_count", 0),
             "sortOrder": table_info.get("sort_order", []),
+            "partitioning": table_info.get("partitioning"),
         }
 
         resources.append(resource)
@@ -1801,15 +1853,15 @@ def main():
         # ── Determine which tables to write ──
         skip_set = set()
         if args.skip_existing:
-            for name, _, _ in TABLE_DEFS:
+            for name, _, _, _ in TABLE_DEFS:
                 table_dir = os.path.join(outdir, name)
                 if os.path.isdir(table_dir):
-                    existing = [f for f in os.listdir(table_dir) if f.endswith(".parquet")]
+                    existing = _list_table_files(table_dir)
                     if existing:
                         skip_set.add(name)
                         eprint(f"  SKIP {name} (already has {len(existing)} Parquet files, --skip-existing)")
 
-        tables_to_write = {name for name, _, _ in TABLE_DEFS} - skip_set
+        tables_to_write = {name for name, _, _, _ in TABLE_DEFS} - skip_set
 
         # ── Stage JSONL → Parquet (parse JSON once, read Parquet 5× faster) ──
         if tables_to_write:
@@ -1853,14 +1905,14 @@ def main():
         t_total = time.time()
         manifest_tables = {}
 
-        for name, sql_template, sort_order in TABLE_DEFS:
+        for name, sql_template, sort_order, partition_column in TABLE_DEFS:
             eprint(f"\n--- {name.upper()} ---")
             table_dir = os.path.join(outdir, name)
 
             meta = TABLE_META.get(name, {})
 
             if name in skip_set:
-                existing = sorted(f for f in os.listdir(table_dir) if f.endswith(".parquet"))
+                existing = _list_table_files(table_dir)
                 # Count rows from existing files
                 row_count = 0
                 for fname in existing:
@@ -1876,6 +1928,7 @@ def main():
                     "files": existing,
                     "row_count": row_count,
                     "sort_order": sort_order,
+                    "partitioning": _partitioning_block(name, existing, table_dir, partition_column),
                     "columns": _schema_to_dict(schema),
                     "column_categories": meta.get("columns", {}),
                 }
@@ -1907,7 +1960,7 @@ def main():
                 sql = sql_template.format(read_clause=read_clause)
                 row_count, files, arrow_schema = stream_to_parquet(
                     con, sql, table_dir, args.batch_size, label=name, sort_order=sort_order,
-                    release=args.release,
+                    partition_column=partition_column, release=args.release,
                 )
                 manifest_tables[name] = {
                     "description": meta.get("description", ""),
@@ -1916,6 +1969,7 @@ def main():
                     "files": files,
                     "row_count": row_count,
                     "sort_order": sort_order,
+                    "partitioning": _partitioning_block(name, files, table_dir, partition_column),
                     "columns": _schema_to_dict(arrow_schema) if arrow_schema else [],
                     "column_categories": meta.get("columns", {}),
                 }
@@ -1964,7 +2018,7 @@ def main():
         eprint("\n" + "=" * 60)
         eprint(f"DONE in {elapsed:.1f}s")
         total_parquet_bytes = 0
-        for name, _, _ in TABLE_DEFS:
+        for name, _, _, _ in TABLE_DEFS:
             table_dir = os.path.join(outdir, name)
             table_bytes = sum(
                 os.path.getsize(os.path.join(table_dir, f))

@@ -11,18 +11,15 @@ Expected values are derived from the fixture at test time, not hardcoded.
 import gzip
 import json
 import os
+import re
 
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import pytest
 
-from conftest import DIVERSE_JSON_GZ, SMALL_JSON_GZ
+from conftest import DIVERSE_JSON_GZ, SMALL_JSON_GZ, open_table, table_files  # noqa: F401
 
-
-def open_table(lake_dir, table_name):
-    """Open a Parquet dataset from the lake directory."""
-    return ds.dataset(os.path.join(lake_dir, table_name), format="parquet")
 
 
 # ─── Derive expected values from the fixture JSON ──────────────────
@@ -163,6 +160,87 @@ class TestRowCounts:
         assert flags.length() - pc.sum(flags).as_py() == n_secs
 
 
+# ─── Partitions (plan Part D) ──────────────────────────────────────
+
+
+class TestPartitions:
+    PATH_RE = re.compile(r"^review_status=(swissprot|trembl)/([a-z_]+)_\d{5}\.parquet$")
+
+    def test_only_partition_directories(self, lake_dir):
+        """Every Parquet file lives in <table>/review_status=<side>/."""
+        for table in EXPECTED_TABLES:
+            table_dir = os.path.join(lake_dir, table)
+            rels = [os.path.relpath(f, table_dir) for f in table_files(lake_dir, table)]
+            assert rels, table
+            for rel in rels:
+                m = self.PATH_RE.match(rel)
+                assert m and m.group(2) == table, f"{table}: unexpected path {rel}"
+            assert {r.split("/")[0] for r in rels} == {"review_status=swissprot", "review_status=trembl"}
+
+    def test_duckdb_hive_column_counts(self, lake_dir, expected):
+        import duckdb
+        rows = duckdb.sql(f"""
+            SELECT review_status, count(*) FROM read_parquet('{lake_dir}/entries/*/*.parquet')
+            GROUP BY 1 ORDER BY 1
+        """).fetchall()
+        assert dict(rows) == {"swissprot": expected["reviewed"], "trembl": expected["unreviewed"]}
+        cols = [r[0] for r in duckdb.sql(
+            f"DESCRIBE SELECT * FROM read_parquet('{lake_dir}/entries/*/*.parquet', hive_partitioning = false)"
+        ).fetchall()]
+        assert "review_status" not in cols and "reviewed" in cols
+        n = duckdb.sql(f"SELECT count(*) FROM read_parquet('{lake_dir}/entries/**/*.parquet')").fetchone()[0]
+        assert n == expected["entries"]
+        n_sp = duckdb.sql(
+            f"SELECT count(*) FROM read_parquet('{lake_dir}/entries/review_status=swissprot/*.parquet')"
+        ).fetchone()[0]
+        assert n_sp == expected["reviewed"]
+
+    def test_polars_and_pyarrow_directory_reads(self, lake_dir, expected):
+        import polars as pl
+        assert pl.scan_parquet(os.path.join(lake_dir, "entries") + "/").select(pl.len()).collect().item() == expected["entries"]
+        lf = pl.scan_parquet(os.path.join(lake_dir, "entries") + "/").filter(pl.col("review_status") == "swissprot")
+        assert lf.select(pl.len()).collect().item() == expected["reviewed"]
+        t = pq.read_table(os.path.join(lake_dir, "entries"))
+        assert t.num_rows == expected["entries"] and "review_status" in t.column_names
+        import pandas as pd
+        df = pd.read_parquet(os.path.join(lake_dir, "entries"), columns=["acc", "reviewed"])
+        assert len(df) == expected["entries"]
+
+    def test_partition_side_matches_stored_flag(self, lake_dir):
+        for table in EXPECTED_TABLES:
+            for side, flag in (("swissprot", True), ("trembl", False)):
+                for f in table_files(lake_dir, table):
+                    if f"review_status={side}/" not in f:
+                        continue
+                    col = pq.read_table(f, columns=["reviewed"]).column("reviewed")
+                    assert pc.all(pc.equal(col, flag)).as_py(), f"{f}: reviewed != {flag}"
+
+    def test_manifest_partitioning_block(self, lake_dir, expected):
+        with open(os.path.join(lake_dir, "manifest.json")) as f:
+            manifest = json.load(f)
+        part = manifest["tables"]["entries"]["partitioning"]
+        assert part["scheme"] == "hive"
+        key = part["keys"][0]
+        assert key["name"] == "review_status" and key["derived_from"] == "reviewed"
+        assert key["values"] == ["swissprot", "trembl"]
+        assert key["row_counts"] == {"swissprot": expected["reviewed"], "trembl": expected["unreviewed"]}
+        assert "second partition level" in manifest["tables"]["accession_map"]["partitioning"]["note"]
+
+    def test_mid_batch_flip(self, tmp_path):
+        """A batch that straddles the Swiss-Prot/TrEMBL boundary is split correctly."""
+        from conftest import SMALL_JSON_GZ, _json_gz_to_jsonl_zst, run_transform
+        jsonl = _json_gz_to_jsonl_zst(SMALL_JSON_GZ, str(tmp_path / "small.jsonl.zst"))
+        outdir = str(tmp_path / "lake")
+        run_transform(jsonl, outdir, release="flip", extra_args=["--batch-size", "7"])
+        with open(os.path.join(outdir, "manifest.json")) as f:
+            manifest = json.load(f)
+        for table, info in manifest["tables"].items():
+            counts = info["partitioning"]["keys"][0]["row_counts"]
+            assert set(counts) == {"swissprot", "trembl"}, table
+            assert sum(counts.values()) == info["row_count"], table
+        assert manifest["tables"]["entries"]["partitioning"]["keys"][0]["row_counts"] == {"swissprot": 31, "trembl": 21}
+
+
 # ─── Manifest ──────────────────────────────────────────────────────
 
 
@@ -209,7 +287,7 @@ class TestManifest:
             manifest = json.load(f)
         for table_name, info in manifest["tables"].items():
             table_dir = os.path.join(lake_dir, table_name)
-            actual = sorted(f for f in os.listdir(table_dir) if f.endswith(".parquet"))
+            actual = sorted(os.path.relpath(f, table_dir) for f in table_files(lake_dir, table_name))
             expected_files = sorted(info["files"])
             assert actual == expected_files, f"{table_name}: disk {actual} != manifest {expected_files}"
 
@@ -337,12 +415,12 @@ class TestSchema:
         """Every field of every table carries a non-empty description (plan H.2)."""
         import glob
         for table in EXPECTED_TABLES:
-            first = sorted(glob.glob(os.path.join(lake_dir, table, "**", "*.parquet"), recursive=True))[0]
+            first = table_files(lake_dir, table)[0]
             schema = pq.read_schema(first)
             for field in schema:
                 md = field.metadata or {}
                 assert md.get(b"description"), f"{table}.{field.name} has no description metadata"
-        md = pq.read_schema(os.path.join(lake_dir, "entries", "entries_00001.parquet")).field("taxid").metadata
+        md = pq.read_schema(table_files(lake_dir, "entries")[0]).field("taxid").metadata
         assert md[b"source_path"] == b"organism.taxonId"
         assert md[b"category"] == b"convenience"
 
@@ -410,7 +488,7 @@ class TestTypedFallbacks:
         """A present column whose struct lacks a sub-field is cast to the full declared type."""
         import duckdb
         from parquet_transform import COLUMN_TYPES
-        path = os.path.join(small_lake["lake_dir"], "entries", "*.parquet")
+        path = os.path.join(small_lake["lake_dir"], "entries", "**", "*.parquet")
         actual = {r[0]: r[1] for r in
                   duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()}
         assert actual["organism_hosts"] == COLUMN_TYPES[("entries", "organism_hosts")]
@@ -430,7 +508,7 @@ class TestTypedFallbacks:
         import duckdb
         from parquet_transform import COLUMN_TYPES
         for (table, col), expected in COLUMN_TYPES.items():
-            path = os.path.join(lake_dir, table, "*.parquet")
+            path = os.path.join(lake_dir, table, "**", "*.parquet")
             actual = {r[0]: r[1] for r in
                       duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()}
             assert actual.get(col) == expected, f"{table}.{col}: {actual.get(col)} != {expected}"

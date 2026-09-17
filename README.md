@@ -17,6 +17,17 @@ Analysis-ready Parquet tables covering the complete UniProtKB dataset — sorted
 
 All tables are sorted Swiss-Prot first (`reviewed DESC`), then `taxid ASC`, then `acc ASC`. Parquet row-group min/max statistics mean predicate pushdown works automatically — engines skip irrelevant row groups without configuration.
 
+Every table is Hive-partitioned by `review_status=swissprot|trembl` (Swiss-Prot / TrEMBL). `reviewed` is also stored in every file, so files are self-describing; the directory is what lets engines skip TrEMBL entirely. Raw DuckDB reads use `<table>/**/*.parquet`; Polars, pandas, PyArrow, Spark and R take the table directory.
+
+```
+lake/
+  entries/
+    review_status=swissprot/entries_00001.parquet …
+    review_status=trembl/entries_00001.parquet …
+  features/  xrefs/  comments/  publications/  accession_map/   (same layout)
+  manifest.json  datapackage.json  LICENSE
+```
+
 ---
 
 ## Using the lake
@@ -85,18 +96,22 @@ SELECT * FROM unnest_isoforms('P04637');
 The lake is plain Parquet files in directories — any engine that reads Parquet works out of the box:
 
 ```python
-# Polars
+# Polars (directory scan; Hive partitioning auto-detected, review_status as String)
 import polars as pl
-df = pl.scan_parquet("lake/entries/*.parquet").filter(pl.col("taxid") == 9606).collect()
+df = pl.scan_parquet("lake/entries/").filter(pl.col("taxid") == 9606).collect()
 
 # pandas / PyArrow
 import pandas as pd
 df = pd.read_parquet("lake/entries/", filters=[("taxid", "==", 9606)])
 
-# DuckDB (standalone, no setup_views.sql)
+# DuckDB (standalone, no setup_views.sql): ** crosses the partition directories
 import duckdb
-duckdb.sql("SELECT * FROM read_parquet('lake/entries/*.parquet') WHERE taxid = 9606")
+duckdb.sql("SELECT * FROM read_parquet('lake/entries/**/*.parquet') WHERE taxid = 9606")
+# Swiss-Prot only: one directory, no TrEMBL file is opened
+duckdb.sql("SELECT count(*) FROM read_parquet('lake/entries/review_status=swissprot/*.parquet')")
 ```
+
+A flat glob (`lake/entries/*.parquet`) matches nothing — DuckDB reports "No files found". Reading with `hive_partitioning = false` gives exactly the stored schema (no `review_status` column).
 
 #### Looking up by accession
 

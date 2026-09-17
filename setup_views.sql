@@ -26,18 +26,33 @@
 --
 
 -- ── Base views ─────────────────────────────────────────────────────────
+-- Every table is Hive-partitioned as <table>/review_status=swissprot|trembl/
+-- (plan Part D).  The views read '<table>/*/*.parquet' with hive_partitioning
+-- = true and REPLACE the stored `reviewed` column with (review_status =
+-- 'swissprot'): the two are equal by construction (validator check 19), and
+-- deriving `reviewed` from the path lets DuckDB prune whole files on
+-- `WHERE reviewed = true` before opening any TrEMBL footer (verified with
+-- EXPLAIN ANALYZE, D.3 spike, 2026-09-17: 1 file read vs 2 without the
+-- partition key).  `review_status` itself is EXCLUDEd so the view schema
+-- equals the stored schema.
 -- These hide the read_parquet() glob and give you clean table names.
 -- Parquet predicate pushdown and column pruning work through views —
 -- DuckDB pushes filters down to the row-group level automatically.
 
-CREATE OR REPLACE VIEW entries    AS SELECT * FROM read_parquet('${BASE}/entries/*.parquet');
-CREATE OR REPLACE VIEW features   AS SELECT * FROM read_parquet('${BASE}/features/*.parquet');
-CREATE OR REPLACE VIEW xrefs      AS SELECT * FROM read_parquet('${BASE}/xrefs/*.parquet');
-CREATE OR REPLACE VIEW comments   AS SELECT * REPLACE (comment::JSON AS comment) FROM read_parquet('${BASE}/comments/*.parquet');
+CREATE OR REPLACE VIEW entries AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
+    FROM read_parquet('${BASE}/entries/*/*.parquet', hive_partitioning = true);
+CREATE OR REPLACE VIEW features AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
+    FROM read_parquet('${BASE}/features/*/*.parquet', hive_partitioning = true);
+CREATE OR REPLACE VIEW xrefs AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
+    FROM read_parquet('${BASE}/xrefs/*/*.parquet', hive_partitioning = true);
+CREATE OR REPLACE VIEW comments AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed, comment::JSON AS comment)
+    FROM read_parquet('${BASE}/comments/*/*.parquet', hive_partitioning = true);
 -- Named "publications" to match UniProt's entry page terminology.
 -- ("references" is also a reserved word in SQL.)
-CREATE OR REPLACE VIEW publications AS SELECT * FROM read_parquet('${BASE}/publications/*.parquet');
-CREATE OR REPLACE VIEW accession_map AS SELECT * FROM read_parquet('${BASE}/accession_map/*.parquet');
+CREATE OR REPLACE VIEW publications AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
+    FROM read_parquet('${BASE}/publications/*/*.parquet', hive_partitioning = true);
+CREATE OR REPLACE VIEW accession_map AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
+    FROM read_parquet('${BASE}/accession_map/*/*.parquet', hive_partitioning = true);
 
 
 -- ── Macros for common query patterns ───────────────────────────────────

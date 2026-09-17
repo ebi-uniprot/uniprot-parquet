@@ -39,7 +39,7 @@ class TestAccessionMap:
 
     def test_secondaries_resolve(self, originals, lake):
         import duckdb
-        rows = duckdb.sql(f"SELECT acc, primary_acc, is_primary FROM read_parquet('{lake}/accession_map/*.parquet')").fetchall()
+        rows = duckdb.sql(f"SELECT acc, primary_acc, is_primary FROM read_parquet('{lake}/accession_map/**/*.parquet')").fetchall()
         secondary = {(a, p) for a, p, is_p in rows if not is_p}
         primary = {a for a, p, is_p in rows if is_p and a == p}
         for acc, orig in originals.items():

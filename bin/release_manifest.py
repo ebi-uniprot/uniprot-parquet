@@ -120,9 +120,11 @@ def main():
             # Compute total file sizes on disk
             table_dir = os.path.join(args.lake, table_name)
             if os.path.isdir(table_dir):
+                # Recursive: tables are Hive-partitioned (<table>/review_status=<side>/)
                 total_size = sum(
-                    os.path.getsize(os.path.join(table_dir, f))
-                    for f in os.listdir(table_dir) if f.endswith(".parquet")
+                    os.path.getsize(os.path.join(root, f))
+                    for root, _, files in os.walk(table_dir)
+                    for f in files if f.endswith(".parquet")
                 )
                 info["total_size_bytes"] = total_size
             tables_info[table_name] = info

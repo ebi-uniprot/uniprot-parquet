@@ -78,6 +78,11 @@ Checks (in order):
         (reviewed, taxid) match entries  (17 is reserved for bloom filters,
         deferred: PyArrow 23 cannot write them)
 
+  19. PARTITIONS
+      - review_status=swissprot|trembl directories agree with the stored
+        `reviewed` column (row-group statistics), per-partition row counts
+        match the manifest and sum to row_count, swissprot files first
+
 Usage:
     validate_lake.py \
         --lake /path/to/lake \
@@ -115,12 +120,26 @@ def eprint(*args, **kwargs):
 ALL_TABLES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
 
 
+def _table_files(lake_dir, table_name):
+    """Every Parquet file of a table, recursively (Hive partition dirs), sorted
+    so review_status=swissprot files precede review_status=trembl files."""
+    from glob import glob
+    return sorted(glob(os.path.join(lake_dir, table_name, "**", "*.parquet"), recursive=True))
+
+
+def _table_glob(lake_dir, table_name):
+    """DuckDB glob for a table: `**` crosses the partition directories."""
+    return os.path.join(lake_dir, table_name, "**", "*.parquet")
+
+
 def open_table(lake_dir, table_name):
-    """Open a Parquet dataset from the lake directory."""
+    """Open a table as a PyArrow dataset over its explicit, sorted file list
+    (lazy, bounded memory).  No Hive columns are added: the validator sees
+    exactly the stored schema."""
     table_dir = os.path.join(lake_dir, table_name)
     if not os.path.isdir(table_dir):
         raise FileNotFoundError(f"Table directory not found: {table_dir}")
-    return ds.dataset(table_dir, format="parquet")
+    return ds.dataset(_table_files(lake_dir, table_name), format="parquet")
 
 
 def count_rows(dataset):
@@ -290,7 +309,7 @@ def check_uniqueness(report, lake_dir):
     eprint("\n--- 2. UNIQUENESS ---")
 
     import duckdb
-    entries_path = os.path.join(lake_dir, "entries", "*.parquet")
+    entries_path = _table_glob(lake_dir, "entries")
     row = duckdb.sql(f"""
         SELECT count(*) AS total, count(DISTINCT acc) AS unique_count
         FROM read_parquet('{entries_path}')
@@ -375,10 +394,10 @@ def check_referential_integrity(report, lake_dir, entry_count):
     eprint(f"  Entries: {entry_count:,} unique accessions")
 
     import duckdb
-    entries_path = os.path.join(lake_dir, "entries", "*.parquet")
+    entries_path = _table_glob(lake_dir, "entries")
 
     for child_name in ["features", "xrefs", "comments", "publications"]:
-        child_path = os.path.join(lake_dir, child_name, "*.parquet")
+        child_path = _table_glob(lake_dir, child_name)
         t0 = time.time()
         try:
             result = duckdb.sql(f"""
@@ -538,7 +557,7 @@ def check_round_trip(report, lake_dir, jsonl_path, n):
 
     # Read matching entries from lake via DuckDB (avoids scanning all 250M rows in Python)
     import duckdb
-    entries_path = os.path.join(lake_dir, "entries", "*.parquet")
+    entries_path = _table_glob(lake_dir, "entries")
     acc_list = list(jsonl_lookup.keys())
     lake_lookup = {}
     try:
@@ -610,11 +629,8 @@ def check_parquet_integrity(report, lake_dir):
         table_dir = os.path.join(lake_dir, table_name)
         if not os.path.isdir(table_dir):
             continue
-        for fname in os.listdir(table_dir):
-            if not fname.endswith(".parquet"):
-                continue
+        for fpath in _table_files(lake_dir, table_name):
             total_files += 1
-            fpath = os.path.join(table_dir, fname)
             try:
                 pq.read_metadata(fpath)
                 pq.read_schema(fpath)
@@ -652,7 +668,7 @@ def check_manifest(report, lake_dir):
         table_dir = os.path.join(lake_dir, table_name)
 
         if os.path.isdir(table_dir):
-            actual_files = {f for f in os.listdir(table_dir) if f.endswith(".parquet")}
+            actual_files = {os.path.relpath(f, table_dir) for f in _table_files(lake_dir, table_name)}
         else:
             actual_files = set()
 
@@ -674,10 +690,10 @@ def check_denormalized_sync(report, lake_dir):
     eprint("\n--- 9. DENORMALIZED COLUMN SYNC ---")
 
     import duckdb
-    entries_path = os.path.join(lake_dir, "entries", "*.parquet")
+    entries_path = _table_glob(lake_dir, "entries")
 
     for child_name in ["features", "xrefs", "comments", "publications"]:
-        child_path = os.path.join(lake_dir, child_name, "*.parquet")
+        child_path = _table_glob(lake_dir, child_name)
         t0 = time.time()
         try:
             result = duckdb.sql(f"""
@@ -866,7 +882,7 @@ def check_schema_types(report, lake_dir):
     for (table_name, col_name), expected in COLUMN_TYPES.items():
         by_table.setdefault(table_name, {})[col_name] = expected
     for table_name, columns in sorted(by_table.items()):
-        path = os.path.join(lake_dir, table_name, "*.parquet")
+        path = _table_glob(lake_dir, table_name)
         actual = {r[0]: r[1] for r in
                   duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()}
         mismatches = [f"{c}: expected {e}, actual {actual.get(c)}"
@@ -988,7 +1004,7 @@ def check_text_value(report, lake_dir):
     report.checks.append("\n--- 15. COMMENT TEXT ---")
     eprint("\n--- 15. COMMENT TEXT ---")
     import duckdb
-    path = os.path.join(lake_dir, "comments", "*.parquet")
+    path = _table_glob(lake_dir, "comments")
     rows = duckdb.sql(f"""
         SELECT comment_type, count(*) AS n, count(text_value) AS with_text
         FROM read_parquet('{path}') GROUP BY 1
@@ -1017,7 +1033,7 @@ def check_reconstruction(report, lake_dir, jsonl_path, n):
     in_list = ",".join("'" + a.replace("'", "''") + "'" for a in originals)
 
     def fetch(table):
-        path = os.path.join(lake_dir, table, "*.parquet")
+        path = _table_glob(lake_dir, table)
         tbl = duckdb.sql(f"SELECT * FROM read_parquet('{path}') WHERE acc IN ({in_list})").arrow().read_all()
         grouped = {}
         for row in tbl.to_pylist():
@@ -1055,8 +1071,8 @@ def check_accession_map(report, lake_dir):
     report.checks.append("\n--- 18. ACCESSION MAP ---")
     eprint("\n--- 18. ACCESSION MAP ---")
     import duckdb
-    amap = os.path.join(lake_dir, "accession_map", "*.parquet")
-    entries = os.path.join(lake_dir, "entries", "*.parquet")
+    amap = _table_glob(lake_dir, "accession_map")
+    entries = _table_glob(lake_dir, "entries")
 
     n_primary, n_secondary, n_dup = duckdb.sql(f"""
         SELECT count(*) FILTER (WHERE is_primary), count(*) FILTER (WHERE NOT is_primary),
@@ -1085,6 +1101,46 @@ def check_accession_map(report, lake_dir):
     """).fetchone()[0]
     report.check("accession_map (reviewed, taxid) match entries for primary rows", mism == 0,
                  f"{mism:,} mismatches")
+
+
+def check_partitions(report, lake_dir):
+    """Hive partitions agree with the stored column they mirror (plan D.3):
+    every row group under review_status=swissprot has reviewed min = max =
+    true (trembl: false), per-partition row counts match the manifest, the
+    two sides sum to the table count, and swissprot files precede trembl
+    files in the manifest's file list."""
+    report.checks.append("\n--- 19. PARTITIONS ---")
+    eprint("\n--- 19. PARTITIONS ---")
+    import duckdb
+    with open(os.path.join(lake_dir, "manifest.json")) as f:
+        manifest = json.load(f)
+    expected_flag = {"swissprot": "true", "trembl": "false"}
+    for table_name, info in manifest["tables"].items():
+        part = info.get("partitioning") or {}
+        keys = part.get("keys") or []
+        if part.get("scheme") != "hive" or not keys:
+            report.check(f"{table_name} manifest declares hive partitioning", False, "missing")
+            continue
+        key = keys[0]
+        derived = key["derived_from"]
+        side_total = 0
+        for side in key["values"]:
+            path = os.path.join(lake_dir, table_name, f"{key['name']}={side}", "*.parquet")
+            bad, rows = duckdb.sql(f"""
+                SELECT count(*) FILTER (WHERE lower(stats_min) != '{expected_flag[side]}'
+                                           OR lower(stats_max) != '{expected_flag[side]}'),
+                       coalesce(sum(row_group_num_rows), 0)
+                FROM parquet_metadata('{path}') WHERE path_in_schema = '{derived}'
+            """).fetchone()
+            report.check(f"{table_name}/{key['name']}={side}: every row group has {derived} = {expected_flag[side]}",
+                         bad == 0, f"{bad} row groups disagree")
+            report.check(f"{table_name}/{key['name']}={side}: rows match manifest",
+                         rows == key["row_counts"].get(side), f"disk {rows} vs manifest {key['row_counts'].get(side)}")
+            side_total += rows
+        report.check(f"{table_name}: partition rows sum to row_count", side_total == info["row_count"],
+                     f"{side_total} vs {info['row_count']}")
+        sides = [f.split("/")[0] for f in info["files"]]
+        report.check(f"{table_name}: swissprot files precede trembl files", sides == sorted(sides), str(sides[:4]))
 
 
 def check_schema_evolution(report, lake_dir, baseline_path):
@@ -1212,6 +1268,7 @@ def main():
     check_text_value(report, args.lake)
     check_reconstruction(report, args.lake, args.jsonl, args.spot_check_n)
     check_accession_map(report, args.lake)
+    check_partitions(report, args.lake)
     if args.schema_baseline:
         check_schema_evolution(report, args.lake, args.schema_baseline)
 

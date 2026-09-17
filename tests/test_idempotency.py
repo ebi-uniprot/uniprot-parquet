@@ -13,6 +13,8 @@ import sys
 import pyarrow.dataset as ds
 import pytest
 
+from conftest import table_files
+
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 
 TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
@@ -99,9 +101,9 @@ def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
     mtimes1 = {}
     for name in TABLE_NAMES:
         table_dir = os.path.join(outdir, name)
-        files = sorted(f for f in os.listdir(table_dir) if f.endswith(".parquet"))
+        files = table_files(outdir, name)
         if files:
-            mtimes1[name] = os.path.getmtime(os.path.join(table_dir, files[0]))
+            mtimes1[name] = os.path.getmtime(files[0])
 
     # Second run with --skip-existing — should skip all tables
     result2 = _run_transform(
@@ -124,9 +126,9 @@ def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
     # File modification times must be the same (files were not rewritten)
     for name in TABLE_NAMES:
         table_dir = os.path.join(outdir, name)
-        files = sorted(f for f in os.listdir(table_dir) if f.endswith(".parquet"))
+        files = table_files(outdir, name)
         if files:
-            mtime2 = os.path.getmtime(os.path.join(table_dir, files[0]))
+            mtime2 = os.path.getmtime(files[0])
             assert mtime2 == mtimes1[name], (
                 f"{name}: file was modified — table was rewritten instead of skipped"
             )
