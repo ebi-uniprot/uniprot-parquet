@@ -452,7 +452,7 @@ The pipeline is **idempotent** — re-running on the same release directory over
 
 **`accession_map` sort spill**: it is the one table with a real sort (`reviewed DESC, acc ASC, primary_acc ASC`; the others arrive pre-sorted from the JSONL). ~250M + secondaries rows of five narrow columns: expect low tens of GB of DuckDB spill for it alone.
 
-**zstd level**: `ZSTD_LEVEL` in `bin/parquet_transform.py` (`--zstd-level` on the command line) is currently 1, the PyArrow default, pending the H.1 sweep on the measurement slice (`benchmarks/bench_zstd.py`); a higher level costs write time once per release and saves bytes on every download and range read.
+**zstd level**: `ZSTD_LEVEL` in `bin/parquet_transform.py` (`--zstd-level` on the command line) is 9, chosen provisionally from a sweep on the stress fixture (`benchmarks/bench_zstd.py`; table in `PLAN_SCHEMA_V2.md` H.1: −7% `entries` and −12% `xrefs` bytes for +6% transform time vs level 1; level 15 costs +25% for three more points). Confirm on the measurement slice with `benchmarks/bench_zstd.py`; the level is recorded in `manifest.json` (`compression`) and in every Parquet footer (`zstd_level`). The file-size target (`--target-file-bytes`, 256 MB) is likewise provisional until `benchmarks/bench_file_size.py` runs on the slice.
 
 **Memory model**: DuckDB gets 75% of process memory by default; the remaining 25% provides headroom for Python, PyArrow, and JSON parsing. DuckDB spills to disk when data exceeds the buffer pool. Configure via `--process_memory` and `--duckdb_pct`.
 

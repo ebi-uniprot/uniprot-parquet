@@ -1159,9 +1159,12 @@ ORDER BY reviewed DESC, acc, primary_acc
 # ─── Table definitions ──────────────────────────────────────────────────
 
 # ─── Writer constants ───────────────────────────────────────────────────
-TARGET_FILE_BYTES = 256 * 1024 * 1024   # per-file roll-over target; plan F.4 measures 512 MB / 1 GB
+TARGET_FILE_BYTES = 256 * 1024 * 1024   # per-file roll-over target. PROVISIONAL: plan F.4 decides between
+                                        # 256 MB / 512 MB / 1 GB on the slice (benchmarks/bench_file_size.py)
 ROW_GROUP_SIZE = 100_000
-ZSTD_LEVEL = 1                          # plan H.1: measured in Step 18
+ZSTD_LEVEL = 9                          # plan H.1. PROVISIONAL: chosen from the stress-fixture sweep
+                                        # (plan H.1 table, stress fixture: -7% entries, -12% xrefs
+                                        # bytes for +6% stage time vs level 1); confirm on the F.1 slice.
 PARTITION_KEY = "review_status"         # plan Part D: Hive directory key ...
 PARTITION_VALUES = {True: "swissprot", False: "trembl"}   # ... derived from the stored `reviewed`
 
@@ -1316,7 +1319,7 @@ def _annotate_schema(schema: pa.Schema, label: str, file_meta: dict[str, str]) -
 def _file_metadata(release) -> dict[str, str]:
     """Key/value metadata written into every Parquet footer (plan H.4/H.6/A7)."""
     return {"uniprot_release": release or "", "schema_version": SCHEMA_VERSION,
-            "license": DATA_LICENSE, "generator": GENERATOR}
+            "license": DATA_LICENSE, "generator": GENERATOR, "zstd_level": str(ZSTD_LEVEL)}
 
 
 def _bloom_kwargs(label: str) -> dict:
@@ -1871,6 +1874,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
 # ─── Main ───────────────────────────────────────────────────────────────
 
 def main():
+    global TARGET_FILE_BYTES, ZSTD_LEVEL
     parser = argparse.ArgumentParser(
         description="Transform UniProtKB JSONL → sorted Parquet tables "
                     "(entries, features, xrefs, comments, publications)"
@@ -1906,7 +1910,31 @@ def main():
              "comments, publications) instead of hand-extracted convenience "
              "columns.  Requires DuckDB ≥1.5 (VARIANT is built-in).",
     )
+    parser.add_argument(
+        "--only", default=None,
+        help="Comma-separated table names to build (default: all). For benchmarks.",
+    )
+    parser.add_argument(
+        "--target-file-bytes", type=int, default=None,
+        help=f"Roll to a new Parquet file at this size (default {TARGET_FILE_BYTES}; plan F.4).",
+    )
+    parser.add_argument(
+        "--zstd-level", type=int, default=None,
+        help=f"zstd compression level for Parquet pages (default {ZSTD_LEVEL}; plan H.1).",
+    )
     args = parser.parse_args()
+
+    if args.target_file_bytes:
+        TARGET_FILE_BYTES = args.target_file_bytes
+    if args.zstd_level is not None:
+        ZSTD_LEVEL = args.zstd_level
+    table_defs = TABLE_DEFS
+    if args.only:
+        wanted = {t.strip() for t in args.only.split(",")}
+        unknown = wanted - {d[0] for d in TABLE_DEFS}
+        if unknown:
+            parser.error(f"--only: unknown table(s) {sorted(unknown)}")
+        table_defs = [d for d in TABLE_DEFS if d[0] in wanted]
 
     jsonl_path = os.path.abspath(args.input)
     if not os.path.exists(jsonl_path):
@@ -1921,6 +1949,8 @@ def main():
     eprint(f"  Input:     {jsonl_path}")
     eprint(f"  Output:    {outdir}")
     eprint(f"  Memory:    {args.memory_limit}")
+    eprint(f"  Writer:    zstd level {ZSTD_LEVEL}, {_human_size(TARGET_FILE_BYTES)} files, "
+           f"{ROW_GROUP_SIZE:,}-row groups" + (f", only {args.only}" if args.only else ""))
     eprint()
 
     # ── Init DuckDB ──
@@ -1936,7 +1966,7 @@ def main():
         # ── Determine which tables to write ──
         skip_set = set()
         if args.skip_existing:
-            for name, _, _, _ in TABLE_DEFS:
+            for name, _, _, _ in table_defs:
                 table_dir = os.path.join(outdir, name)
                 if os.path.isdir(table_dir):
                     existing = _list_table_files(table_dir)
@@ -1944,7 +1974,7 @@ def main():
                         skip_set.add(name)
                         eprint(f"  SKIP {name} (already has {len(existing)} Parquet files, --skip-existing)")
 
-        tables_to_write = {name for name, _, _, _ in TABLE_DEFS} - skip_set
+        tables_to_write = {name for name, _, _, _ in table_defs} - skip_set
 
         # ── Stage JSONL → Parquet (parse JSON once, read Parquet 5× faster) ──
         if tables_to_write:
@@ -1988,7 +2018,7 @@ def main():
         t_total = time.time()
         manifest_tables = {}
 
-        for name, sql_template, sort_order, partition_column in TABLE_DEFS:
+        for name, sql_template, sort_order, partition_column in table_defs:
             eprint(f"\n--- {name.upper()} ---")
             table_dir = os.path.join(outdir, name)
 
@@ -2068,6 +2098,9 @@ def main():
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "tables": manifest_tables,
             "total_rows": sum(t["row_count"] for t in manifest_tables.values()),
+            "compression": {"codec": "zstd", "level": ZSTD_LEVEL},
+            "target_file_bytes": TARGET_FILE_BYTES,
+            "row_group_size": ROW_GROUP_SIZE,
         }
         manifest_path = os.path.join(outdir, "manifest.json")
         with open(manifest_path, "w") as f:
@@ -2106,7 +2139,7 @@ def main():
         eprint("\n" + "=" * 60)
         eprint(f"DONE in {elapsed:.1f}s")
         total_parquet_bytes = 0
-        for name, _, _, _ in TABLE_DEFS:
+        for name, _, _, _ in table_defs:
             table_dir = os.path.join(outdir, name)
             table_bytes = sum(
                 os.path.getsize(os.path.join(table_dir, f))

@@ -33,8 +33,8 @@ Every measurement and spike outcome the plan asks for is recorded here, in one p
 | B size gates (`go_terms`, `pubmed_ids`, `proteome_ids`, B.5) | Step 6 | **Fixture proxy only (stress fixture, 8,416 SP / 5,977 TrEMBL; slice deferred).** `go_terms`: mean `len(go_ids)` 12.95 (SP) / 22.63 (TrEMBL), empty-rate 0.2% / 0.5%; `go_terms` column chunks = 1.44 MB of 12.2 MB `entries` (~12%; `term` 0.75 MB, `id` 0.51 MB, `evidence_type` 0.13 MB, `aspect` 0.05 MB). `pubmed_ids`: share with ≥1 id 0.981 (SP) / 0.62 (TrEMBL), p99 length 45 / 12, max 224 / 15; 0.34 MB. PubMed ids failing `TRY_CAST(… AS BIGINT)`: 0 of 84,029 (stress). `proteome_ids`: 730 (SP) / 309 (TrEMBL) distinct ids, share with none 0.206 / 0.172; 9 KB. `gene_name` 60 KB, `division` 1 KB. B.5: FUNCTION text = 5.5 MB (SP, 8,165 entries) + 2.5 MB (TrEMBL, 2,806 entries) of `text_value` bytes vs 12.2 MB compressed `entries` — far above the ~5% rule on this fixture; SUBCELLULAR LOCATION `text_value` is NULL by design (prose under `note.texts`). `function_text` stays deferred; re-run on the slice. |
 | D.5: per-division counts vs FTP; human-files-to-human-rows byte ratio | Step 6 / Step 3 | **Deferred** with the slice (ratio) and the first full build (division counts vs `taxonomic_divisions/`); see Step 3 item 5 and Step 21 item 5 of the work order. |
 | D.3 spike: does DuckDB prune files through `REPLACE ((review_status = 'swissprot') AS reviewed)`? Option chosen | Step 14 | **Option 1 (EXCLUDE … REPLACE) works and is used.** DuckDB 1.5.5, fixture lake with one file per side, `EXPLAIN ANALYZE SELECT sum(seq_length) …`: q1 (view form, `WHERE reviewed = true`) reads 1 file, q2 (raw `WHERE review_status = 'swissprot'`) reads 1 file, q3 (`hive_partitioning = false`, stored `reviewed`) reads 2, and a view over an explicit file list (F.2.2 form) also reads 1. Note: `count(*)` alone is folded from metadata and prints an empty plan, so the spike must use a non-foldable aggregate. Both view files and the manifest-driven views use `SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed) FROM read_parquet(…, hive_partitioning = true)`; the view schema equals the stored schema. |
-| F.4 table (see F.4) filled; chosen `entries` file-size target; page-index footer delta | Step 18 | ______ |
-| H.1 table (see H.1) filled; chosen zstd level | Step 18 | ______ |
+| F.4 table (see F.4) filled; chosen `entries` file-size target; page-index footer delta | Step 18 | **Deferred to the slice.** `benchmarks/bench_file_size.py` written and smoke-run on the stress fixture (mechanics only; one file per side at every target). Page index footer delta on the fixture: +5.4 KB on 184 KB for 2 files. `write_page_index=True` is on for every table (verified with PyArrow: `has_column_index` and `has_offset_index` are true per column chunk; DuckDB 1.5.5 `parquet_metadata()` does not expose these offsets). Target stays 256 MB, marked provisional. |
+| H.1 table (see H.1) filled; chosen zstd level | Step 18 | **Fixture proxy; slice deferred.** Sweep on the stress fixture (table in H.1): level 9 = −7% `entries`, −12% `xrefs` for +6% stage time; level 15 = −10% / −15% for +25%. `ZSTD_LEVEL = 9` set provisionally and recorded in `manifest.json` `compression` and the footer key `zstd_level`; `--zstd-level` flag added. Re-run `benchmarks/bench_zstd.py` on the slice before the release build. |
 | A11 (Step 10): `g()` limitation — array order is not reproduced | Step 10 | `bin/reconstruct.py::reconstruct_entry` rebuilds every fixture entry (default and stress) and the validator's check 16 passes; comparison is order-independent inside arrays (`deep_sort`) because the child tables carry no position index. Whether to add position columns is the plan owner's call; not done here. |
 | A13: bytes before/after the residual trim on the slice ("after v2" column of F.1) | Step 11 | **Fixture proxy (stress fixture; slice deferred).** Compressed bytes before → after the trim (same input, same code otherwise): `entries` 12.20 → 12.19 MB (proteinDescription is kept whole minus `flag`, per the appendix, so nothing moves); `features` 9.57 → 6.22 MB (−35%); `publications` 17.21 → 8.68 MB (−50%); `xrefs` 13.80 → 13.81 MB and `comments` 12.02 → 12.03 MB (unchanged); lake 64.80 → 52.92 MB (−18%). **Implementation notes:** residual field sets are computed from the discovered schema (everything under the source struct minus the promoted names, `RESIDUALS` in `parquet_transform.py`) and cast to a declared type, so a field UniProt adds lands in the residual and a field the declared type does not list stops the build (`check_declared_types`); fully promoted structs (`sequence`, `entryAudit`, `features.location`, xref fields, the top-level entry keys) are checked by `check_promoted_paths`. Residual sub-fields keep their source names (no `_full` / `citation_extras` renames): `feature_residual` = `{evidences, featureCrossReferences, ligand, ligandPart, alternativeSequence}` — `ligand` and `alternativeSequence` stay whole because 4,275 stress-fixture features carry `alternativeSequence: {}`, which a split could not reproduce; `reference_residual` = `{citation: {address, bookName, editors, institute, locator, patentNumber, publisher}}` (`locator` was missing from the appendix list); `organism_residual` = `{synonyms, evidences}`; `protein_desc_residual` = proteinDescription minus `flag`. `g()` passes on default and stress fixtures; validator check 16 passes. |
 | Phase 3: point-lookup benchmark table; B1 kept on child tables? | Step 20 | ______ |
@@ -757,11 +757,13 @@ Record the result:
 
 | Target | Files (slice) | Files (extrapolated) | Footer bytes | Data bytes | Footer / data | Wall time | Page index Δ footer |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 256 MB | | | | | | | |
-| 512 MB | | | | | | | |
-| 1 GB | | | | | | | |
+| 256 MB | 2 (stress fixture; one per side) | 34,461 | 184 KB (2 files) | 732 KB (cold, 10 range requests) | 0.25 | 6.1 ms | +5.4 KB (184.1 vs 178.7 KB) |
+| 512 MB | — | | | | | | |
+| 1 GB | — | | | | | | |
 
-Chosen target: ______ (reason: ______).
+*(Only the mechanics: on the fixture every target yields one file per side, so the row is not a measurement. `benchmarks/bench_file_size.py --jsonl <slice> --out benchmarks/results/` fills the three rows.)*
+
+Chosen target: **256 MB, provisional** (reason: unchanged pending the slice run; the fixture cannot distinguish the targets).
 
 ## F.5 Retention policy, stated in UniProt's own terms
 
@@ -846,12 +848,14 @@ Six small items, none of which changes a table. Each is what a data engineer or 
 
 | Level | `entries` bytes | `xrefs` bytes | Write time | Read time (F.4 query) |
 | --- | --- | --- | --- | --- |
-| 1 (today) | | | | |
-| 3 | | | | |
-| 9 | | | | |
-| 15 | | | | |
+| 1 (today) | 11.47 MB (1.00×) | 10.29 MB (1.00×) | 10.0 s (1.00×) | 4.06 ms |
+| 3 | 10.90 MB (0.95×) | 9.80 MB (0.95×) | 10.0 s (1.00×) | 3.94 ms |
+| 9 | 10.63 MB (0.93×) | 9.08 MB (0.88×) | 10.6 s (1.06×) | 3.86 ms |
+| 15 | 10.37 MB (0.90×) | 8.78 MB (0.85×) | 12.5 s (1.25×) | 3.98 ms |
 
-Chosen level: ______. Record it in `manifest.json` (`"compression": {"codec": "zstd", "level": N}`) and in the Parquet footer key-value metadata (`AUDIT.md` A7), so a rebuild can reproduce the bytes.
+*(Stress fixture, 2026-09-17, `benchmarks/bench_zstd.py`; "write time" is the whole transform including staging. **Proxy only — re-run on the slice.**)*
+
+Chosen level: **9, provisional** (the highest level whose stage-time cost is small on the proxy; 15 buys three more points for +25%). Confirm or revise from the slice sweep. Record it in `manifest.json` (`"compression": {"codec": "zstd", "level": N}`) and in the Parquet footer key-value metadata (`AUDIT.md` A7), so a rebuild can reproduce the bytes.
 
 ## H.2 Column descriptions in Arrow field metadata
 
