@@ -43,6 +43,7 @@ Checks (in order):
 
   8. MANIFEST CONSISTENCY
      - manifest.json file lists match actual files on disk
+     - every file's size and SHA-256 match manifest file_details
 
   9. DENORMALIZED COLUMN SYNC
      - taxid and reviewed in child tables match entries
@@ -100,6 +101,7 @@ import os
 import sys
 import json
 import random
+import hashlib
 import argparse
 import time
 from datetime import datetime, timezone
@@ -216,8 +218,10 @@ class ValidationReport:
     """Accumulates pass/fail checks and produces a report."""
 
     def __init__(self):
-        self.checks = []
+        self.checks = []          # formatted lines, including section headers
+        self.records = []         # one dict per check, for validation_report.json
         self.failures = 0
+        self.elapsed_s = None
 
     def check(self, name: str, passed: bool, detail: str = ""):
         status = "PASS" if passed else "FAIL"
@@ -227,18 +231,29 @@ class ValidationReport:
         if detail:
             entry += f"  —  {detail}"
         self.checks.append(entry)
+        self.records.append({"name": name, "passed": bool(passed), "detail": detail})
         eprint(entry)
 
     def passed(self) -> bool:
         return self.failures == 0
 
     def summary(self) -> str:
-        total = len(self.checks)
+        total = len(self.records)
         passed = total - self.failures
         return (
             f"{passed}/{total} checks passed, "
             f"{self.failures} failed"
         )
+
+    def to_dict(self) -> dict:
+        """Machine-readable form of the report (validation_report.json, plan F.2.1)."""
+        return {
+            "passed": self.passed(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "summary": self.summary(),
+            "elapsed_s": self.elapsed_s,
+            "checks": list(self.records),
+        }
 
     def full_report(self) -> str:
         lines = [
@@ -678,6 +693,27 @@ def check_manifest(report, lake_dir):
             f"manifest={len(manifest_files)}, disk={len(actual_files)}"
             if manifest_files != actual_files else ""
         )
+
+        # Per-file SHA-256 and size (plan F.2.1): "what we published is what we built".
+        details = table_info.get("file_details") or {}
+        bad = []
+        for rel in sorted(manifest_files & actual_files):
+            d = details.get(rel)
+            path = os.path.join(table_dir, rel)
+            if not d:
+                bad.append(f"{rel}: no file_details")
+                continue
+            if os.path.getsize(path) != d.get("size_bytes"):
+                bad.append(f"{rel}: size")
+                continue
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            if h.hexdigest() != d.get("sha256"):
+                bad.append(f"{rel}: sha256")
+        n = len(manifest_files & actual_files)
+        report.check(f"{table_name}: {n - len(bad)}/{n} file hashes match", not bad, "; ".join(bad[:3]))
 
 
 def check_denormalized_sync(report, lake_dir):
@@ -1279,11 +1315,15 @@ def main():
 
     with open(args.output, "w") as f:
         f.write(report_text + "\n")
+    report.elapsed_s = round(elapsed, 1)
+    json_output = os.path.splitext(args.output)[0] + ".json"
+    with open(json_output, "w") as f:
+        json.dump(report.to_dict(), f, indent=2)
 
     eprint(f"\n{'=' * 70}")
     eprint(f"VERDICT: {'ALL CHECKS PASSED' if report.passed() else 'VALIDATION FAILED'}")
     eprint(f"  {report.summary()}")
-    eprint(f"  Report: {args.output}")
+    eprint(f"  Report: {args.output} (+ {json_output})")
     eprint(f"  Elapsed: {elapsed:.1f}s")
     eprint(f"{'=' * 70}")
 

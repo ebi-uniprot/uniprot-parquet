@@ -282,6 +282,50 @@ class TestManifest:
         assert text.startswith("This directory contains data derived from UniProtKB")
         assert "Creative Commons Attribution 4.0 International" in text
 
+    def test_file_details_match_disk(self, lake_dir):
+        """Every listed file exists with the recorded size, SHA-256 and a taxid range (plan F.2.1)."""
+        import hashlib
+        with open(os.path.join(lake_dir, "manifest.json")) as f:
+            manifest = json.load(f)
+        for table, info in manifest["tables"].items():
+            assert set(info["file_details"]) == set(info["files"]), table
+            assert info["size_bytes"] == sum(d["size_bytes"] for d in info["file_details"].values())
+            for rel, d in info["file_details"].items():
+                path = os.path.join(lake_dir, table, rel)
+                assert os.path.getsize(path) == d["size_bytes"], rel
+                assert d["taxid_min"] is not None and d["taxid_min"] <= d["taxid_max"], rel
+            rel = info["files"][0]
+            with open(os.path.join(lake_dir, table, rel), "rb") as fh:
+                assert hashlib.sha256(fh.read()).hexdigest() == info["file_details"][rel]["sha256"]
+
+    def test_sha256sums_verifies(self, lake_dir):
+        import shutil
+        import subprocess
+        if not shutil.which("sha256sum"):
+            pytest.skip("sha256sum not available")
+        result = subprocess.run(["sha256sum", "-c", "--quiet", "SHA256SUMS.txt"],
+                                cwd=lake_dir, capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        with open(os.path.join(lake_dir, "SHA256SUMS.txt")) as f:
+            names = [line.split("  ", 1)[1].strip() for line in f]
+        assert names[-3:] == ["manifest.json", "datapackage.json", "LICENSE"]
+        assert "SHA256SUMS.txt" not in names
+
+    def test_metalink_parses(self, lake_dir):
+        import xml.etree.ElementTree as ET
+        ns = {"m": "urn:ietf:params:xml:ns:metalink"}
+        with open(os.path.join(lake_dir, "manifest.json")) as f:
+            manifest = json.load(f)
+        n_parquet = sum(len(i["files"]) for i in manifest["tables"].values())
+        root = ET.parse(os.path.join(lake_dir, "RELEASE.metalink")).getroot()
+        files = root.findall("m:file", ns)
+        assert len(files) == n_parquet + 3
+        for fe in files:
+            assert fe.find("m:hash[@type='sha-256']", ns).text and fe.find("m:size", ns).text.isdigit()
+        # table directories hold Parquet only (directory readers choke on sidecars)
+        for table in manifest["tables"]:
+            assert not os.path.exists(os.path.join(lake_dir, table, "RELEASE.metalink"))
+
     def test_manifest_files_match_disk(self, lake_dir):
         with open(os.path.join(lake_dir, "manifest.json")) as f:
             manifest = json.load(f)

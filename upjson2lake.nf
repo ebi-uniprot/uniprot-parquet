@@ -222,6 +222,7 @@ process VALIDATE {
 
     output:
     path "validation_report.txt", emit: report
+    path "validation_report.json", emit: report_json
     val true,                     emit: validated
 
     script:

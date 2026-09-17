@@ -45,6 +45,7 @@ import argparse
 import time
 import json
 import shutil
+import hashlib
 from datetime import datetime, timezone
 
 import duckdb
@@ -1472,6 +1473,85 @@ def _partition_row_counts(table_dir, files):
     return counts
 
 
+def _file_details(table_dir, rel_path):
+    """Size, SHA-256, MD5 and taxid range of one Parquet file (plan F.2.1 /
+    D.5).  One streamed pass while the file is still in page cache."""
+    path = os.path.join(table_dir, rel_path)
+    sha, md5 = hashlib.sha256(), hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            sha.update(chunk)
+            md5.update(chunk)
+    meta = pq.read_metadata(path)
+    mins, maxs = [], []
+    if "taxid" in meta.schema.names:
+        col = meta.schema.names.index("taxid")        # top-level scalar: index is exact
+        for i in range(meta.num_row_groups):
+            stats = meta.row_group(i).column(col).statistics
+            if stats and stats.has_min_max:
+                mins.append(stats.min)
+                maxs.append(stats.max)
+    return {"size_bytes": os.path.getsize(path), "sha256": sha.hexdigest(), "md5": md5.hexdigest(),
+            "taxid_min": min(mins) if mins else None, "taxid_max": max(maxs) if maxs else None}
+
+
+def _hash_file(path):
+    sha, md5 = hashlib.sha256(), hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            sha.update(chunk)
+            md5.update(chunk)
+    return sha.hexdigest(), md5.hexdigest()
+
+
+def _write_checksums(outdir, manifest, extra_files):
+    """lake/SHA256SUMS.txt (sha256sum -c format) and RELEASE.metalink (Metalink 4,
+    RFC 5854) at the lake root (plan F.2.1).
+    ``extra_files`` are lake-root files hashed after the Parquet files."""
+    import xml.etree.ElementTree as ET
+
+    entries = []                                 # (rel path from outdir, size, sha256, md5)
+    for table, info in manifest["tables"].items():
+        for rel in info["files"]:
+            d = info["file_details"][rel]
+            entries.append((f"{table}/{rel}", d["size_bytes"], d["sha256"], d["md5"]))
+    for name in extra_files:
+        path = os.path.join(outdir, name)
+        sha, md5 = _hash_file(path)
+        entries.append((name, os.path.getsize(path), sha, md5))
+
+    sums_path = os.path.join(outdir, "SHA256SUMS.txt")
+    with open(sums_path, "w") as f:
+        for rel, _, sha, _ in entries:
+            f.write(f"{sha}  {rel}\n")
+    eprint(f"  Wrote {sums_path} ({len(entries)} files)")
+
+    def metalink(items, path):
+        ns = "urn:ietf:params:xml:ns:metalink"
+        root = ET.Element("metalink", xmlns=ns)
+        ET.SubElement(root, "published").text = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for rel, size, sha, md5 in items:
+            fe = ET.SubElement(root, "file", name=rel)
+            ET.SubElement(fe, "size").text = str(size)
+            ET.SubElement(fe, "hash", type="sha-256").text = sha
+            ET.SubElement(fe, "hash", type="md5").text = md5
+            ET.SubElement(fe, "url").text = rel
+        ET.indent(root)
+        ET.ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
+
+    # Root only: a per-table RELEASE.metalink would break directory reads in
+    # Polars / PyArrow / pandas, which treat every file under <table>/ as
+    # Parquet (plan D.1 reader table).  Table directories hold Parquet only.
+    metalink(entries, os.path.join(outdir, "RELEASE.metalink"))
+    eprint("  Wrote RELEASE.metalink")
+
+
+def _add_file_details(table_info, table_dir):
+    """Fill file_details (per file) and size_bytes (sum) on a manifest table entry."""
+    table_info["file_details"] = {rel: _file_details(table_dir, rel) for rel in table_info["files"]}
+    table_info["size_bytes"] = sum(d["size_bytes"] for d in table_info["file_details"].values())
+
+
 def _partitioning_block(name, files, table_dir, partition_column):
     """The manifest's per-table partitioning descriptor (plan D.3)."""
     return {
@@ -1732,6 +1812,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
                 ],
             },
             "rowCount": table_info.get("row_count", 0),
+            "bytes": table_info.get("size_bytes"),
             "sortOrder": table_info.get("sort_order", []),
             "partitioning": table_info.get("partitioning"),
         }
@@ -1746,7 +1827,9 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
             "A denormalized, analysis-ready Parquet representation of the complete "
             "UniProtKB database. Five sorted tables (entries, features, xrefs, "
             "comments, publications) preserve all upstream data losslessly while "
-            "providing flattened convenience columns for common query patterns."
+            "providing flattened convenience columns for common query patterns; "
+            "accession_map resolves primary and secondary accessions. "
+            "Per-file SHA-256 hashes are in SHA256SUMS.txt and manifest.json file_details."
         ),
         "homepage": "https://github.com/dlrice/uniprot-parquet",
         "version": SCHEMA_VERSION,
@@ -1932,6 +2015,7 @@ def main():
                     "columns": _schema_to_dict(schema),
                     "column_categories": meta.get("columns", {}),
                 }
+                _add_file_details(manifest_tables[name], table_dir)
             else:
                 # All table SQL is built dynamically to handle optional fields.
                 # schema_paths is the single source of truth — no field is referenced
@@ -1973,6 +2057,7 @@ def main():
                     "columns": _schema_to_dict(arrow_schema) if arrow_schema else [],
                     "column_categories": meta.get("columns", {}),
                 }
+                _add_file_details(manifest_tables[name], table_dir)
 
         # ── Write manifest.json ──
         manifest = {
@@ -2003,6 +2088,9 @@ def main():
         with open(datapackage_path, "w") as f:
             json.dump(datapackage, f, indent=2)
         eprint(f"  Wrote {datapackage_path}")
+
+        # ── SHA256SUMS.txt and RELEASE.metalink (plan F.2.1) ──
+        _write_checksums(outdir, manifest, ["manifest.json", "datapackage.json", "LICENSE"])
 
         # Validate against the Frictionless spec
         report = Package.validate_descriptor(datapackage)

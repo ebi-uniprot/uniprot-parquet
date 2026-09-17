@@ -4,6 +4,7 @@ Runs the full transform pipeline, then runs the validator against the
 resulting lake + source JSONL.  Verifies that all checks pass.
 """
 
+import json
 import os
 import sys
 import subprocess
@@ -48,3 +49,13 @@ def test_validate_passes_on_good_lake(small_jsonl, parquet_lake, tmp_path):
         report = f.read()
     assert "ALL CHECKS PASSED" in report
     assert "[FAIL]" not in report
+
+    # validation_report.json beside the text report (plan F.2.1)
+    json_path = os.path.splitext(report_path)[0] + ".json"
+    assert os.path.exists(json_path)
+    with open(json_path) as f:
+        data = json.load(f)
+    assert data["passed"] is True
+    assert data["checks"] and all(c["passed"] for c in data["checks"])
+    assert any(c["name"].startswith("reconstruction matches JSONL") for c in data["checks"])
+    assert any("file hashes match" in c["name"] for c in data["checks"])
