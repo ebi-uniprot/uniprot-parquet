@@ -7,6 +7,7 @@ so row counts remain correct (no duplication).
 import gzip
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -154,3 +155,21 @@ def test_rebuild_with_fewer_files_removes_stale_ones(small_jsonl, tmp_path):
     assert sorted(os.path.relpath(f, os.path.join(outdir, "entries")) for f in few) == \
         sorted(manifest["tables"]["entries"]["files"])
     assert _get_row_counts(outdir)["entries"] == _expected_entries_from_jsonl(small_jsonl)
+
+
+def test_rebuild_removes_leftover_tmp_files(small_jsonl, tmp_path):
+    """A partial file a killed run left under <partition>/.tmp/ is removed by the
+    next run.  DuckDB's ** glob descends into hidden directories, so a leftover
+    would otherwise be double-counted by every <table>/**/*.parquet reader."""
+    import duckdb
+    outdir = str(tmp_path / "lake")
+    _run_transform(small_jsonl, outdir)
+    entries_dir = os.path.join(outdir, "entries")
+    stale = os.path.join(entries_dir, "review_status=trembl", ".tmp", "entries_00002.parquet")
+    os.makedirs(os.path.dirname(stale))
+    shutil.copy(table_files(outdir, "entries")[-1], stale)
+    n = _expected_entries_from_jsonl(small_jsonl)
+    assert duckdb.sql(f"SELECT count(*) FROM read_parquet('{entries_dir}/**/*.parquet')").fetchone()[0] > n
+    _run_transform(small_jsonl, outdir)
+    assert not os.path.exists(os.path.dirname(stale))
+    assert duckdb.sql(f"SELECT count(*) FROM read_parquet('{entries_dir}/**/*.parquet')").fetchone()[0] == n

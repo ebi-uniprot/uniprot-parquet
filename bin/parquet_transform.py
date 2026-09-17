@@ -1372,7 +1372,10 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
     Atomicity: files are written to ``<partition>/.tmp/`` and moved to their
     final location only after the whole table has been written, so nothing
     is visible under the final directories until the table is complete
-    (--skip-existing relies on this).
+    (--skip-existing relies on this).  ``.tmp/`` is removed on error and any
+    leftover from a killed run is removed before writing: DuckDB's ``**``
+    glob descends into hidden directories, so a stale partial file there
+    would be double-counted by every ``<table>/**/*.parquet`` reader.
 
     Args:
         con: DuckDB connection
@@ -1402,6 +1405,10 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
     def part_dir(side):
         return os.path.join(table_dir, f"{PARTITION_KEY}={side}")
 
+    def remove_tmp_dirs():
+        for side in PARTITION_VALUES.values():
+            shutil.rmtree(os.path.join(part_dir(side), ".tmp"), ignore_errors=True)
+
     def open_writer():
         st["file_num"] += 1
         tmp = os.path.join(part_dir(st["side"]), ".tmp")
@@ -1429,6 +1436,7 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
         if os.path.getsize(st["path"]) >= TARGET_FILE_BYTES:
             close_writer()
 
+    remove_tmp_dirs()                  # leftovers of a killed earlier run
     try:
         for record_batch in reader:
             tbl = pa.Table.from_batches([record_batch])
@@ -1480,14 +1488,13 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
                         os.remove(path)
         for tmp_path, final_path, _ in pending:
             shutil.move(tmp_path, final_path)
-        for side in PARTITION_VALUES.values():
-            tmp = os.path.join(part_dir(side), ".tmp")
-            if os.path.isdir(tmp) and not os.listdir(tmp):
-                os.rmdir(tmp)
+        remove_tmp_dirs()
     except Exception:
-        # On error, close the writer and leave .tmp/ for cleanup by the caller
+        # On error, close the writer and drop the partial files: nothing of
+        # this table is published, and nothing is left for a glob to find.
         if st["writer"] is not None:
             st["writer"].close()
+        remove_tmp_dirs()
         raise
 
     files = [rel for _, _, rel in pending]

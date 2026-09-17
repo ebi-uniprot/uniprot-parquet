@@ -434,8 +434,8 @@ UniProtKB.json.gz
      |         comment text, reconstruction g(f(x)) == x, accession map, partitions
      v
 +------------+   provenance.json (checksums, git commit, row counts),
-| PROVENANCE |   then RELEASE_COMPLETE as the last action
-+------------+
+| PROVENANCE |   then RELEASE_COMPLETE — copied into the release directory by
++------------+   workflow.onComplete, after every publishDir copy has finished
 ```
 
 DuckDB handles the heavy lifting: JSON parsing (with automatic schema inference via `read_json_auto`), SQL transformations (flattening, unnesting), and sorting. It streams Arrow record batches to PyArrow, which writes zstd-compressed Parquet files directly. Memory stays bounded regardless of dataset size.

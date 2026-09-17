@@ -172,15 +172,28 @@ def write_complete_marker(args, lake_manifest):
     schema_version, sha256 of lake/SHA256SUMS.txt, UTC timestamp — one key
     per line.  This runs only after validation passed (the PROVENANCE
     process depends on VALIDATE), so the marker never appears for a failed
-    release."""
+    release.
+
+    The marker is what mirrors trust, so it refuses to describe a lake whose
+    sidecars are missing (transform aborted after the Parquet files, wrong
+    --lake path): no manifest.json / schema_version / SHA256SUMS.txt → exit 1
+    with nothing written."""
     marker = args.complete_marker or os.path.join(
         os.path.dirname(os.path.abspath(args.output)), "RELEASE_COMPLETE")
     sums = os.path.join(args.lake, "SHA256SUMS.txt")
-    sums_sha = hash_file(sums)[1] if os.path.exists(sums) else "missing"
+    missing = []
+    if not lake_manifest:
+        missing.append("manifest.json")
+    elif not lake_manifest.get("schema_version"):
+        missing.append("manifest.json schema_version")
+    if not os.path.exists(sums):
+        missing.append("SHA256SUMS.txt")
+    if missing:
+        sys.exit(f"FATAL: not writing {marker}: {args.lake} lacks {', '.join(missing)}")
     lines = [
         f"release: {args.release}",
-        f"schema_version: {lake_manifest.get('schema_version', 'unknown')}",
-        f"sha256sums_sha256: {sums_sha}",
+        f"schema_version: {lake_manifest['schema_version']}",
+        f"sha256sums_sha256: {hash_file(sums)[1]}",
         f"completed_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
     ]
     with open(marker, "w") as f:

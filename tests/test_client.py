@@ -166,3 +166,26 @@ def test_readme_examples(full_lake, stmt):
     """Every README SQL example runs against the fixture lake (values may not exist; it must not error)."""
     con = up.connect(full_lake)
     con.sql(stmt).fetchall()
+
+
+def test_present_files_remote_probing(monkeypatch):
+    """Remote copies: one probe per partition when its first file is there; a
+    per-file fallback finds a hosted per-organism subset whose first file is
+    missing (files_for_taxid gives e.g. entries_00017.parquet alone)."""
+    base = "https://example.org/lake"
+    rels = [f"review_status=swissprot/entries_{i:05d}.parquet" for i in (1, 2, 3)] + \
+        [f"review_status=trembl/entries_{i:05d}.parquet" for i in (1, 2, 17, 18)]
+    hosted = {f"{base}/entries/review_status=swissprot/entries_{i:05d}.parquet" for i in (1, 2, 3)} | \
+        {f"{base}/entries/review_status=trembl/entries_00017.parquet"}
+    probes = []
+
+    def fake_probe(con, url):
+        probes.append(url)
+        return url in hosted
+
+    monkeypatch.setattr(up, "_remote_readable", fake_probe)
+    present = up._present_files(None, base, "entries", rels)
+    assert present == sorted(hosted, key=lambda u: (("trembl" in u), u))
+    # swissprot: first file present → one probe; trembl: first missing → the other three probed
+    assert len(probes) == 1 + 4
+    assert up._present_files(None, base, "entries", []) == []

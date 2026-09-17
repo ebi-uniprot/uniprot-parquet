@@ -124,13 +124,21 @@ ALL_TABLES = ["entries", "features", "xrefs", "comments", "publications", "acces
 
 def _table_files(lake_dir, table_name):
     """Every Parquet file of a table, recursively (Hive partition dirs), sorted
-    so review_status=swissprot files precede review_status=trembl files."""
-    from glob import glob
-    return sorted(glob(os.path.join(lake_dir, table_name, "**", "*.parquet"), recursive=True))
+    so review_status=swissprot files precede review_status=trembl files.
+
+    os.walk rather than glob: it also descends into hidden directories such
+    as a writer's leftover ``.tmp/``, exactly as DuckDB's ``**`` glob does,
+    so check_manifest sees the same files a raw reader would and fails on
+    any file the manifest does not list."""
+    table_dir = os.path.join(lake_dir, table_name)
+    return sorted(os.path.join(root, f)
+                  for root, _, files in os.walk(table_dir)
+                  for f in files if f.endswith(".parquet"))
 
 
 def _table_glob(lake_dir, table_name):
-    """DuckDB glob for a table: `**` crosses the partition directories."""
+    """DuckDB glob for a table: `**` crosses the partition directories (the
+    form the README recommends, so the validator reads what users read)."""
     return os.path.join(lake_dir, table_name, "**", "*.parquet")
 
 

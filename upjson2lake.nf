@@ -47,6 +47,10 @@ params.expected_count = null      // Expected entry count (from UniProt release 
 // Final output directory: <outdir>/<release>/
 def release_dir = "${params.outdir}/${params.release}"
 
+// Work-dir path of the RELEASE_COMPLETE marker PROVENANCE wrote; copied
+// into release_dir by workflow.onComplete (see there for why).
+def complete_marker = null
+
 // DuckDB memory is computed inside each process script block (not here) so that
 // it reacts to task.memory on retry — when Nextflow doubles the allocation after
 // an OOM, DuckDB's buffer pool scales up with it.
@@ -252,7 +256,13 @@ process PROVENANCE {
     cpus 1
     memory '1 GB'
 
-    publishDir "${release_dir}", mode: 'copy'
+    // Only provenance.json is published here.  RELEASE_COMPLETE must NOT go
+    // through publishDir: publishDir copies run asynchronously, so this tiny
+    // marker would land in release_dir while PARQUET_TRANSFORM's multi-TB
+    // lake/ is still being copied there.  workflow.onComplete copies it
+    // instead — Nextflow waits for every pending publish before running
+    // completion handlers.
+    publishDir "${release_dir}", mode: 'copy', pattern: 'provenance.json'
 
     input:
     path lake
@@ -330,4 +340,16 @@ workflow {
         SORT_JSONL.out.sorted_jsonl,
         VALIDATE.out.validated,
     )
+    PROVENANCE.out.complete.subscribe { complete_marker = it }
+}
+
+// 6. RELEASE_COMPLETE is the last file to reach release_dir (plan H.5).
+//    onComplete runs after every publishDir copy has finished, so a mirror
+//    that sees the marker sees the whole lake/.  Nothing is written for a
+//    failed run (VALIDATE failing means PROVENANCE never ran anyway).
+workflow.onComplete {
+    if (workflow.success && complete_marker) {
+        file(complete_marker).copyTo("${release_dir}/RELEASE_COMPLETE")
+        log.info "RELEASE_COMPLETE written to ${release_dir}"
+    }
 }

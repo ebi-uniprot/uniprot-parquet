@@ -283,22 +283,30 @@ def _present_files(con, base: str, table: str, rels: list[str]) -> list[str]:
     """The table's files that exist in *this* copy of the lake, as full paths.
 
     A copy may hold a whole table, one partition (a Swiss-Prot-only rsync) or
-    a few files (a per-organism download from files_for_taxid): locally every
-    file is checked; remotely one probe per partition directory decides for
-    that directory (a per-file probe would cost one request per file).
+    a few files (a per-organism download from files_for_taxid).  Locally every
+    file is checked.  Remotely the first file of each partition directory is
+    probed: if it is there the whole partition is taken as present (a full or
+    partition-level mirror, one request per partition); if it is not, every
+    other file of that partition is probed individually, so a hosted
+    per-organism subset (entries_00017.parquet alone) is still found at the
+    cost of one request per listed file of that partition.
     """
     if not rels:
         return []
     if not _is_remote(base):
         return [f"{base}/{table}/{rel}" for rel in rels
                 if os.path.exists(os.path.join(base, table, rel))]
-    present, probed = [], {}
+    by_part: dict[str, list[str]] = {}
     for rel in rels:
-        part = rel.rsplit("/", 1)[0] if "/" in rel else ""
-        if part not in probed:
-            probed[part] = _remote_readable(con, f"{base}/{table}/{rel}")
-        if probed[part]:
-            present.append(f"{base}/{table}/{rel}")
+        by_part.setdefault(rel.rsplit("/", 1)[0] if "/" in rel else "", []).append(rel)
+    present = []
+    for part_rels in by_part.values():
+        first, rest = part_rels[0], part_rels[1:]
+        if _remote_readable(con, f"{base}/{table}/{first}"):
+            present.extend(f"{base}/{table}/{rel}" for rel in part_rels)
+        else:
+            present.extend(f"{base}/{table}/{rel}" for rel in rest
+                           if _remote_readable(con, f"{base}/{table}/{rel}"))
     return present
 
 

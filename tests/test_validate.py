@@ -6,6 +6,7 @@ resulting lake + source JSONL.  Verifies that all checks pass.
 
 import json
 import os
+import shutil
 import sys
 import subprocess
 
@@ -61,6 +62,27 @@ def test_validate_passes_on_good_lake(small_jsonl, parquet_lake, tmp_path):
     assert any("file hashes match" in c["name"] for c in data["checks"])
 
 
+def test_validate_fails_on_file_outside_manifest(small_jsonl, parquet_lake, tmp_path):
+    """A Parquet file the manifest does not list — here a writer's leftover under
+    a hidden .tmp/ directory, which DuckDB's ** glob would read — fails validation."""
+    lake = str(tmp_path / "lake")
+    shutil.copytree(parquet_lake["lake_dir"], lake)
+    part = os.path.join(lake, "entries", "review_status=swissprot")
+    src = os.path.join(part, sorted(f for f in os.listdir(part) if f.endswith(".parquet"))[0])
+    os.makedirs(os.path.join(part, ".tmp"))
+    shutil.copy(src, os.path.join(part, ".tmp", "entries_00009.parquet"))
+    report_path = str(tmp_path / "validation_report.txt")
+    result = subprocess.run(
+        [sys.executable, os.path.join(BIN_DIR, "validate_lake.py"), "--lake", lake, "--jsonl", small_jsonl,
+         "--spot-check-n", "10", "-o", report_path],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    with open(os.path.splitext(report_path)[0] + ".json") as f:
+        checks = {c["name"]: c for c in json.load(f)["checks"]}
+    assert checks["entries manifest files match disk"]["passed"] is False
+
+
 def test_release_manifest_writes_complete_marker_last(small_jsonl, parquet_lake, tmp_path):
     """bin/release_manifest.py writes provenance.json, then RELEASE_COMPLETE (plan H.5)."""
     import hashlib
@@ -94,3 +116,23 @@ def test_release_manifest_writes_complete_marker_last(small_jsonl, parquet_lake,
     assert "sha256" in prov["inputs"]["jsonl"] and "md5" in prov["inputs"]["jsonl"]
     assert set(prov["tables"]) >= {"entries", "accession_map"}
     assert prov["tables"]["entries"]["total_size_bytes"] > 0
+
+
+@pytest.mark.parametrize("sidecar", ["manifest.json", "SHA256SUMS.txt"])
+def test_release_manifest_refuses_marker_without_sidecars(small_jsonl, parquet_lake, tmp_path, sidecar):
+    """No RELEASE_COMPLETE for a lake missing manifest.json or SHA256SUMS.txt:
+    the marker is what mirrors trust, so it must not stamp a half-built lake."""
+    lake = str(tmp_path / "lake")
+    shutil.copytree(parquet_lake["lake_dir"], lake)
+    os.remove(os.path.join(lake, sidecar))
+    script = os.path.join(BIN_DIR, "release_manifest.py")
+    out = tmp_path / "provenance.json"
+    marker = tmp_path / "RELEASE_COMPLETE"
+    result = subprocess.run(
+        [sys.executable, script, "--lake", lake, "--input-jsonl", small_jsonl,
+         "--release", "test_2026", "-o", str(out), "--complete-marker", str(marker)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert sidecar in result.stderr
+    assert not marker.exists()
