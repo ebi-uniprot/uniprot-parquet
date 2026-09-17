@@ -80,6 +80,11 @@ def main():
     )
     parser.add_argument("--release", required=True, help="Release label")
     parser.add_argument("-o", "--output", default="provenance.json")
+    parser.add_argument(
+        "--complete-marker", default=None,
+        help="Path of the RELEASE_COMPLETE marker (default: RELEASE_COMPLETE next to -o). "
+             "Written last; mirrors test for it before reading anything else (plan H.5).",
+    )
     args = parser.parse_args()
 
     eprint("Generating release manifest...")
@@ -157,6 +162,30 @@ def main():
     eprint(f"  Saved: {args.output}")
     eprint(f"  Release {args.release}: {manifest['total_rows']:,} total rows "
            f"across {len(manifest.get('tables', {}))} tables")
+
+    # ── RELEASE_COMPLETE: the last action (plan H.5) ──
+    write_complete_marker(args, lake_manifest if os.path.exists(lake_manifest_path) else {})
+
+
+def write_complete_marker(args, lake_manifest):
+    """Write RELEASE_COMPLETE after provenance.json.  Content: release,
+    schema_version, sha256 of lake/SHA256SUMS.txt, UTC timestamp — one key
+    per line.  This runs only after validation passed (the PROVENANCE
+    process depends on VALIDATE), so the marker never appears for a failed
+    release."""
+    marker = args.complete_marker or os.path.join(
+        os.path.dirname(os.path.abspath(args.output)), "RELEASE_COMPLETE")
+    sums = os.path.join(args.lake, "SHA256SUMS.txt")
+    sums_sha = hash_file(sums)[1] if os.path.exists(sums) else "missing"
+    lines = [
+        f"release: {args.release}",
+        f"schema_version: {lake_manifest.get('schema_version', 'unknown')}",
+        f"sha256sums_sha256: {sums_sha}",
+        f"completed_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+    ]
+    with open(marker, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    eprint(f"  Wrote {marker}")
 
 
 if __name__ == "__main__":

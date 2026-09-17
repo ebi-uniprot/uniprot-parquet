@@ -261,6 +261,10 @@ process PROVENANCE {
 
     output:
     path "provenance.json", emit: provenance
+    // RELEASE_COMPLETE is written by release_manifest.py as its last action
+    // (plan H.5).  This process runs only after VALIDATE passed, so the
+    // marker cannot appear for a failed release; mirrors check it first.
+    path "RELEASE_COMPLETE", emit: complete
 
     script:
     """
@@ -270,7 +274,8 @@ process PROVENANCE {
         --lake ${lake} \
         --input-jsonl ${sorted_jsonl} \
         --release ${params.release} \
-        -o provenance.json
+        -o provenance.json \
+        --complete-marker RELEASE_COMPLETE
     """
 }
 

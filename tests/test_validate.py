@@ -59,3 +59,38 @@ def test_validate_passes_on_good_lake(small_jsonl, parquet_lake, tmp_path):
     assert data["checks"] and all(c["passed"] for c in data["checks"])
     assert any(c["name"].startswith("reconstruction matches JSONL") for c in data["checks"])
     assert any("file hashes match" in c["name"] for c in data["checks"])
+
+
+def test_release_manifest_writes_complete_marker_last(small_jsonl, parquet_lake, tmp_path):
+    """bin/release_manifest.py writes provenance.json, then RELEASE_COMPLETE (plan H.5)."""
+    import hashlib
+    import time
+
+    script = os.path.join(BIN_DIR, "release_manifest.py")
+    out = tmp_path / "provenance.json"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = BIN_DIR + ":" + env.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [sys.executable, script, "--lake", parquet_lake["lake_dir"], "--input-jsonl", small_jsonl,
+         "--release", "test_2026", "-o", str(out)],
+        env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    marker = tmp_path / "RELEASE_COMPLETE"
+    assert out.exists() and marker.exists()
+    assert os.path.getmtime(marker) >= os.path.getmtime(out)
+
+    text = marker.read_text()
+    fields = dict(line.split(": ", 1) for line in text.strip().splitlines())
+    assert fields["release"] == "test_2026"
+    with open(os.path.join(parquet_lake["lake_dir"], "manifest.json")) as f:
+        assert fields["schema_version"] == json.load(f)["schema_version"]
+    with open(os.path.join(parquet_lake["lake_dir"], "SHA256SUMS.txt"), "rb") as f:
+        assert fields["sha256sums_sha256"] == hashlib.sha256(f.read()).hexdigest()
+    assert fields["completed_at"].endswith("Z")
+
+    with open(out) as f:
+        prov = json.load(f)
+    assert "sha256" in prov["inputs"]["jsonl"] and "md5" in prov["inputs"]["jsonl"]
+    assert set(prov["tables"]) >= {"entries", "accession_map"}
+    assert prov["tables"]["entries"]["total_size_bytes"] > 0
