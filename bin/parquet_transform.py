@@ -379,6 +379,11 @@ COLUMN_SOURCES: dict[tuple[str, str], str] = {
     ("publications", "citation_id"): "references.citation.id",
     ("publications", "publication_date"): "references.citation.publicationDate",
     ("publications", "reference_residual"): "references",
+    # accession_map
+    ("accession_map", "acc"): "primaryAccession | secondaryAccessions",
+    ("accession_map", "primary_acc"): "primaryAccession",
+    ("accession_map", "reviewed"): "entryType",
+    ("accession_map", "taxid"): "organism.taxonId",
     ("features", "feature_id"): "features.featureId",
     ("features", "original_sequence"): "features.alternativeSequence.originalSequence",
     ("features", "alternative_sequences"): "features.alternativeSequence.alternativeSequences",
@@ -1128,6 +1133,27 @@ ORDER BY reviewed DESC, taxid, acc
 """
 
 
+def _build_accession_map_sql(schema_paths: set[str]) -> str:
+    """One row per primary *and* secondary accession → current primary (plan
+    Part A, B2).  Reads the staged Parquet like the other builders so it works
+    under --skip-existing.  Sorted reviewed DESC first so the Part D writer
+    sees one partition flip, then acc within each side."""
+    has_secondary = "secondaryAccessions" in schema_paths
+    primary = f"""
+    SELECT e.primaryAccession AS acc, e.primaryAccession AS primary_acc, true AS is_primary,
+           {REVIEWED_EXPR} AS reviewed, e.organism.taxonId AS taxid
+    FROM {{read_clause}} e"""
+    secondary = f"""
+    UNION ALL
+    SELECT s AS acc, e.primaryAccession AS primary_acc, false AS is_primary,
+           {REVIEWED_EXPR} AS reviewed, e.organism.taxonId AS taxid
+    FROM {{read_clause}} e, LATERAL unnest(COALESCE(e.secondaryAccessions, [])) AS t(s)""" if has_secondary else ""
+    return f"""
+SELECT acc, primary_acc, is_primary, reviewed, taxid FROM ({primary}{secondary})
+ORDER BY reviewed DESC, acc, primary_acc
+"""
+
+
 # ─── Table definitions ──────────────────────────────────────────────────
 
 TABLE_DEFS = [
@@ -1143,6 +1169,10 @@ TABLE_DEFS = [
     ("xrefs",        None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
     ("comments",     None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
     ("publications", None, ["reviewed DESC", "taxid ASC", "acc ASC"]),
+    # accession_map is acc-sorted within each review side: the lookup table
+    # (plan Part A).  A real sort at production scale (~250M + secondaries rows
+    # of five narrow columns; low tens of GB of spill).
+    ("accession_map", None, ["reviewed DESC", "acc ASC", "primary_acc ASC"]),
 ]
 
 
@@ -1232,6 +1262,15 @@ TABLE_META = {
                 "reference_positions", "reference_comments", "evidences",
             ],
             "nested": ["reference_residual"],
+        },
+    },
+    "accession_map": {
+        "description": "One row per primary or secondary accession, mapping to the current primary accession. The lookup table for point queries and for resolving retired accessions.",
+        "primary_key": ["acc", "primary_acc"],
+        "foreign_keys": {"primary_acc": "entries.acc"},
+        "columns": {
+            "convenience": ["acc", "primary_acc", "is_primary", "reviewed", "taxid"],
+            "nested": [],
         },
     },
 }
@@ -1526,6 +1565,13 @@ COLUMN_DESCRIPTIONS = {
     ("publications", "reference_comments"): "List of reference comment structs (scope, source, etc.).",
     ("publications", "evidences"):    "Evidence records for this reference. May be null.",
     ("publications", "reference_residual"): "Reference fields not in the convenience columns, including citation extras (bookName, editors, publisher, address, institute, patentNumber, locator). bin/reconstruct.py merges it with the convenience columns.",
+
+    # accession_map
+    ("accession_map", "acc"):         "Primary or secondary accession (the lookup key). A secondary accession can map to more than one primary (split entries).",
+    ("accession_map", "primary_acc"): "Current primary accession the key resolves to (FK → entries.acc).",
+    ("accession_map", "is_primary"):  "True when acc == primary_acc.",
+    ("accession_map", "reviewed"):    "True if the primary entry is Swiss-Prot (copied from entries.reviewed).",
+    ("accession_map", "taxid"):       "NCBI taxonomy ID of the primary entry (copied from entries.taxid).",
 }
 
 
@@ -1837,7 +1883,7 @@ def main():
                 # All table SQL is built dynamically to handle optional fields.
                 # schema_paths is the single source of truth — no field is referenced
                 # without first checking that it exists in the staged Parquet schema.
-                if getattr(args, "variant_children", False) and name != "entries":
+                if getattr(args, "variant_children", False) and name not in ("entries", "accession_map"):
                     # VARIANT child tables — no schema_paths needed.
                     _VARIANT_BUILDERS = {
                         "features":     _build_features_variant_sql,
@@ -1854,6 +1900,7 @@ def main():
                         "xrefs":        _build_xrefs_sql,
                         "comments":     _build_comments_sql,
                         "publications": _build_publications_sql,
+                        "accession_map": _build_accession_map_sql,
                     }
                     if sql_template is None:
                         sql_template = _SQL_BUILDERS[name](schema_paths)

@@ -15,7 +15,7 @@ import pytest
 
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 
-TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications"]
+TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
 
 
 def _expected_entries(fixture_path):

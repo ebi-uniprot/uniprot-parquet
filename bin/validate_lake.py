@@ -72,6 +72,12 @@ Checks (in order):
       - Sampled entries rebuilt from the five tables (bin/reconstruct.py)
         equal the source JSONL, order-independent inside arrays
 
+  18. ACCESSION MAP
+      - Primary rows == entries, secondary rows == sum(len(secondary_accs)),
+        no duplicate (acc, primary_acc), every primary_acc exists,
+        (reviewed, taxid) match entries  (17 is reserved for bloom filters,
+        deferred: PyArrow 23 cannot write them)
+
 Usage:
     validate_lake.py \
         --lake /path/to/lake \
@@ -104,6 +110,10 @@ def eprint(*args, **kwargs):
 
 
 # ─── Parquet reading helpers ──────────────────────────────────────────
+
+# Every table in the lake (kept in sync with parquet_transform.TABLE_DEFS).
+ALL_TABLES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
+
 
 def open_table(lake_dir, table_name):
     """Open a Parquet dataset from the lake directory."""
@@ -307,6 +317,7 @@ def check_null_keys(report, lake_dir):
         ("xrefs",      ["acc", "reviewed", "taxid", "database", "id"]),
         ("comments",   ["acc", "reviewed", "taxid", "comment_type"]),
         ("publications", ["acc", "reviewed", "taxid", "citation_type", "reference_number"]),
+        ("accession_map", ["acc", "primary_acc", "is_primary", "reviewed", "taxid"]),
     ]
 
     # Identity columns that must never be empty strings
@@ -394,106 +405,93 @@ def check_referential_integrity(report, lake_dir, entry_count):
             )
 
 
+def _check_sorted(dataset, columns, key_fn):
+    """Streaming sort check for (bool DESC, k2 ASC, k3 ASC) keys.
+
+    ``columns`` names the three key columns (the first a boolean sorted DESC);
+    ``key_fn(*values) -> tuple`` builds the comparable key used at batch
+    boundaries.  Returns (is_sorted, detail)."""
+    is_sorted = True
+    disorder_detail = ""
+    row_offset = 0
+    prev_last = None
+
+    for batch in dataset.to_batches(columns=list(columns)):
+        n = batch.num_rows
+        if n == 0:
+            continue
+
+        flags = batch.column(columns[0])
+        k2 = batch.column(columns[1])
+        k3 = batch.column(columns[2])
+
+        # Check boundary between previous batch and this batch
+        if prev_last is not None:
+            first = (flags[0].as_py(), k2[0].as_py(), k3[0].as_py())
+            if key_fn(*prev_last) > key_fn(*first):
+                is_sorted = False
+                disorder_detail = (
+                    f"disorder at row {row_offset}: "
+                    + ", ".join(f"{c}={a}→{b}" for c, a, b in zip(columns, prev_last, first))
+                )
+                break
+
+        # Vectorised within-batch check
+        if n > 1:
+            f_prev, f_next = flags.slice(0, n - 1), flags.slice(1, n - 1)
+            k2_prev, k2_next = k2.slice(0, n - 1), k2.slice(1, n - 1)
+            k3_prev, k3_next = k3.slice(0, n - 1), k3.slice(1, n - 1)
+
+            f_equal = pc.equal(f_prev, f_next)
+            k2_equal = pc.equal(k2_prev, k2_next)
+
+            f_disorder = pc.and_(pc.invert(f_prev), f_next)          # false → true
+            k2_disorder = pc.and_(f_equal, pc.greater(k2_prev, k2_next))
+            k3_disorder = pc.and_(pc.and_(f_equal, k2_equal), pc.greater(k3_prev, k3_next))
+            any_disorder = pc.or_(pc.or_(f_disorder, k2_disorder), k3_disorder)
+
+            if pc.any(any_disorder).as_py():
+                idx = pc.index(any_disorder, True).as_py()
+                is_sorted = False
+                disorder_detail = (
+                    f"disorder at row {row_offset + idx + 1}: "
+                    + ", ".join(f"{c}={col[idx].as_py()}→{col[idx + 1].as_py()}"
+                                for c, col in zip(columns, (flags, k2, k3)))
+                )
+                break
+
+        prev_last = (flags[n - 1].as_py(), k2[n - 1].as_py(), k3[n - 1].as_py())
+        row_offset += n
+
+    return is_sorted, disorder_detail
+
+
 def check_sort_order(report, lake_dir):
-    """Verify all tables are sorted by (reviewed/reviewed DESC, taxid ASC, acc ASC)."""
+    """Verify every table is sorted by its declared order: (reviewed DESC,
+    taxid ASC, acc ASC) for the five data tables, (reviewed DESC, acc ASC,
+    primary_acc ASC) for accession_map."""
     report.checks.append("\n--- 5. SORT ORDER ---")
     eprint("\n--- 5. SORT ORDER ---")
 
+    three_key = lambda r, t, a: (not r, t, a)  # noqa: E731
     sort_check_tables = [
-        ("entries",    "reviewed"),
-        ("features",   "reviewed"),
-        ("xrefs",      "reviewed"),
-        ("comments",   "reviewed"),
-        ("publications", "reviewed"),
+        ("entries",       ["reviewed", "taxid", "acc"], three_key),
+        ("features",      ["reviewed", "taxid", "acc"], three_key),
+        ("xrefs",         ["reviewed", "taxid", "acc"], three_key),
+        ("comments",      ["reviewed", "taxid", "acc"], three_key),
+        ("publications",  ["reviewed", "taxid", "acc"], three_key),
+        ("accession_map", ["reviewed", "acc", "primary_acc"], lambda r, a, p: (not r, a, p)),
     ]
 
-    for table_name, rev_col in sort_check_tables:
+    for table_name, columns, key_fn in sort_check_tables:
         dataset = open_table(lake_dir, table_name)
-        is_sorted = True
-        disorder_detail = ""
-        row_offset = 0
-        prev_last_reviewed = None
-        prev_last_taxid = None
-        prev_last_acc = None
-
-        for batch in dataset.to_batches(columns=[rev_col, "taxid", "acc"]):
-            n = batch.num_rows
-            if n == 0:
-                continue
-
-            reviewed = batch.column(rev_col)
-            taxids = batch.column("taxid")
-            accs = batch.column("acc")
-
-            # Check boundary between previous batch and this batch
-            if prev_last_reviewed is not None:
-                first_reviewed = reviewed[0].as_py()
-                first_taxid = taxids[0].as_py()
-                first_acc = accs[0].as_py()
-                prev_key = (not prev_last_reviewed, prev_last_taxid, prev_last_acc)
-                curr_key = (not first_reviewed, first_taxid, first_acc)
-                if prev_key > curr_key:
-                    is_sorted = False
-                    disorder_detail = (
-                        f"disorder at row {row_offset}: "
-                        f"{rev_col}={prev_last_reviewed}→{first_reviewed}, "
-                        f"taxid={prev_last_taxid}→{first_taxid}, "
-                        f"acc={prev_last_acc}→{first_acc}"
-                    )
-                    break
-
-            # Vectorised within-batch check
-            if n > 1:
-                rev_prev = reviewed.slice(0, n - 1)
-                rev_next = reviewed.slice(1, n - 1)
-                tax_prev = taxids.slice(0, n - 1)
-                tax_next = taxids.slice(1, n - 1)
-                acc_prev = accs.slice(0, n - 1)
-                acc_next = accs.slice(1, n - 1)
-
-                rev_equal = pc.equal(rev_prev, rev_next)
-                tax_equal = pc.equal(tax_prev, tax_next)
-
-                rev_disorder = pc.and_(
-                    pc.invert(rev_prev),
-                    rev_next,
-                )
-                tax_disorder = pc.and_(
-                    rev_equal,
-                    pc.greater(tax_prev, tax_next),
-                )
-                acc_disorder = pc.and_(
-                    pc.and_(rev_equal, tax_equal),
-                    pc.greater(acc_prev, acc_next),
-                )
-                any_disorder = pc.or_(pc.or_(rev_disorder, tax_disorder), acc_disorder)
-
-                if pc.any(any_disorder).as_py():
-                    idx = pc.index(any_disorder, True).as_py()
-                    r0 = reviewed[idx].as_py()
-                    r1 = reviewed[idx + 1].as_py()
-                    t0 = taxids[idx].as_py()
-                    t1 = taxids[idx + 1].as_py()
-                    a0 = accs[idx].as_py()
-                    a1 = accs[idx + 1].as_py()
-                    is_sorted = False
-                    disorder_detail = (
-                        f"disorder at row {row_offset + idx + 1}: "
-                        f"{rev_col}={r0}→{r1}, taxid={t0}→{t1}, "
-                        f"acc={a0}→{a1}"
-                    )
-                    break
-
-            prev_last_reviewed = reviewed[n - 1].as_py()
-            prev_last_taxid = taxids[n - 1].as_py()
-            prev_last_acc = accs[n - 1].as_py()
-            row_offset += n
-
+        is_sorted, disorder_detail = _check_sorted(dataset, columns, key_fn)
         report.check(
-            f"{table_name} sorted by ({rev_col} DESC, taxid ASC, acc ASC)",
+            f"{table_name} sorted by ({columns[0]} DESC, {columns[1]} ASC, {columns[2]} ASC)",
             is_sorted,
             disorder_detail
         )
+
 
 
 def check_round_trip(report, lake_dir, jsonl_path, n):
@@ -608,7 +606,7 @@ def check_parquet_integrity(report, lake_dir):
     total_files = 0
     corrupt_files = []
 
-    for table_name in ["entries", "features", "xrefs", "comments", "publications"]:
+    for table_name in ALL_TABLES:
         table_dir = os.path.join(lake_dir, table_name)
         if not os.path.isdir(table_dir):
             continue
@@ -648,7 +646,7 @@ def check_manifest(report, lake_dir):
     report.check("manifest.json exists", True)
 
     # Check each table's files match what's on disk
-    for table_name in ["entries", "features", "xrefs", "comments", "publications"]:
+    for table_name in ALL_TABLES:
         table_info = manifest.get("tables", {}).get(table_name, {})
         manifest_files = set(table_info.get("files", []))
         table_dir = os.path.join(lake_dir, table_name)
@@ -1051,6 +1049,44 @@ def check_reconstruction(report, lake_dir, jsonl_path, n):
     )
 
 
+def check_accession_map(report, lake_dir):
+    """The six assertions of plan §5.5 on accession_map (sort order is
+    covered by check_sort_order)."""
+    report.checks.append("\n--- 18. ACCESSION MAP ---")
+    eprint("\n--- 18. ACCESSION MAP ---")
+    import duckdb
+    amap = os.path.join(lake_dir, "accession_map", "*.parquet")
+    entries = os.path.join(lake_dir, "entries", "*.parquet")
+
+    n_primary, n_secondary, n_dup = duckdb.sql(f"""
+        SELECT count(*) FILTER (WHERE is_primary), count(*) FILTER (WHERE NOT is_primary),
+               count(*) - count(DISTINCT (acc, primary_acc))
+        FROM read_parquet('{amap}')
+    """).fetchone()
+    n_entries, n_secs = duckdb.sql(f"""
+        SELECT count(*), coalesce(sum(len(secondary_accs)), 0) FROM read_parquet('{entries}')
+    """).fetchone()
+    report.check("accession_map primary rows == entries rows", n_primary == n_entries,
+                 f"{n_primary:,} vs {n_entries:,}")
+    report.check("accession_map secondary rows == sum(len(entries.secondary_accs))",
+                 n_secondary == n_secs, f"{n_secondary:,} vs {n_secs:,}")
+    report.check("accession_map has no duplicate (acc, primary_acc)", n_dup == 0, f"{n_dup:,} duplicates")
+
+    orphans = duckdb.sql(f"""
+        SELECT count(*) FROM read_parquet('{amap}') m
+        ANTI JOIN read_parquet('{entries}') e ON m.primary_acc = e.acc
+    """).fetchone()[0]
+    report.check("every accession_map.primary_acc exists in entries", orphans == 0, f"{orphans:,} orphans")
+
+    mism = duckdb.sql(f"""
+        SELECT count(*) FILTER (WHERE m.reviewed != e.reviewed OR m.taxid != e.taxid)
+        FROM read_parquet('{amap}') m JOIN read_parquet('{entries}') e ON m.acc = e.acc
+        WHERE m.is_primary
+    """).fetchone()[0]
+    report.check("accession_map (reviewed, taxid) match entries for primary rows", mism == 0,
+                 f"{mism:,} mismatches")
+
+
 def check_schema_evolution(report, lake_dir, baseline_path):
     """
     Detect upstream UniProtKB JSON schema changes by comparing inferred Parquet
@@ -1083,7 +1119,7 @@ def check_schema_evolution(report, lake_dir, baseline_path):
     report.check("schema baseline file exists", True)
 
     # Compare each table's columns
-    for table_name in ["entries", "features", "xrefs", "comments", "publications"]:
+    for table_name in ALL_TABLES:
         if table_name not in baseline:
             eprint(f"  warning: {table_name} not in baseline, skipping")
             continue
@@ -1175,6 +1211,7 @@ def main():
     check_field_completeness(report, args.lake, args.jsonl)
     check_text_value(report, args.lake)
     check_reconstruction(report, args.lake, args.jsonl, args.spot_check_n)
+    check_accession_map(report, args.lake)
     if args.schema_baseline:
         check_schema_evolution(report, args.lake, args.schema_baseline)
 

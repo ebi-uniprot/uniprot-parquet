@@ -13,6 +13,7 @@ Analysis-ready Parquet tables covering the complete UniProtKB dataset — sorted
 | `xrefs`        | One row per cross-reference       | ~5B                   |
 | `comments`     | One row per comment               | ~300M                 |
 | `publications` | One row per citation              | ~500M                 |
+| `accession_map` | One row per primary or secondary accession → current primary | ~250M + secondaries |
 
 All tables are sorted Swiss-Prot first (`reviewed DESC`), then `taxid ASC`, then `acc ASC`. Parquet row-group min/max statistics mean predicate pushdown works automatically — engines skip irrelevant row groups without configuration.
 
@@ -35,7 +36,7 @@ con.sql("SELECT * FROM protein_card('P04637')").show()
 con.sql("SELECT * FROM organism_features(9606, 'Domain')").show()
 ```
 
-The returned object is a standard `duckdb.DuckDBPyConnection`. Five views (`entries`, `features`, `xrefs`, `comments`, `publications`) and seven macros are ready to use immediately.
+The returned object is a standard `duckdb.DuckDBPyConnection`. Six views (`entries`, `features`, `xrefs`, `comments`, `publications`, `accession_map`) and seven macros are ready to use immediately.
 
 For remote access, DuckDB's httpfs reads only the byte ranges it needs — a query touching 3 columns of one organism downloads a fraction of the full dataset.
 
@@ -96,6 +97,20 @@ df = pd.read_parquet("lake/entries/", filters=[("taxid", "==", 9606)])
 import duckdb
 duckdb.sql("SELECT * FROM read_parquet('lake/entries/*.parquet') WHERE taxid = 9606")
 ```
+
+#### Looking up by accession
+
+`accession_map` is the lookup table: one row per primary *and* secondary accession, sorted by `acc` within each review side, with the primary entry's `reviewed` and `taxid`. Resolve the accession there first, then read the target table with the keys it already sorts on — two small row-group reads instead of a scan of the whole `acc` column:
+
+```sql
+-- step 1: resolve (also the only way to follow a retired / secondary accession)
+SELECT primary_acc, reviewed, taxid FROM accession_map WHERE acc = 'P04637';
+-- step 2: pruned by (reviewed, taxid) row-group statistics, then acc
+SELECT * FROM entries  WHERE reviewed = true AND taxid = 9606 AND acc = 'P04637';
+SELECT * FROM features WHERE reviewed = true AND taxid = 9606 AND acc = 'P04637';
+```
+
+The one-step form `SELECT * FROM entries WHERE acc = 'P04637'` also works, but nothing prunes on `acc` alone (every row group's `acc` range spans the alphabet), so it scans the whole column: fine locally on `entries`, slow on the child tables, and over HTTP it costs one range request per row group. Use the two-step form for remote reads and for child tables.
 
 ```r
 # R (arrow)
@@ -231,6 +246,10 @@ Child tables (`features`, `xrefs`, `comments`, `publications`) include denormali
 - `acc`, `reviewed`, `taxid`
 - Flattened: `reference_number`, `citation_type`, `citation_id`, `title`, `authors`, `authoring_group`, `publication_date`, `journal`, `volume`, `first_page`, `last_page`, `submission_database`, `citation_xrefs`, `reference_positions`, `reference_comments`, `evidences`
 - Residual: `reference_residual` (citation extras: bookName, editors, publisher, address, institute, patentNumber, locator)
+
+**accession_map** — one row per primary or secondary accession:
+
+- `acc` (lookup key; a secondary accession can map to more than one primary), `primary_acc` (→ `entries.acc`), `is_primary`, `reviewed`, `taxid` (copied from the primary entry)
 
 </details>
 
@@ -415,6 +434,7 @@ The `VALIDATE` step runs the checks below against the source JSONL as ground tru
 14. **Schema evolution guard** — Parquet schema matches a committed baseline (when `--schema-baseline` is given)
 15. **Comment text** — every text-bearing comment type has a populated `text_value`
 16. **Reconstruction** — sampled entries rebuilt from the five tables by `bin/reconstruct.py` equal the source JSONL (order-independent inside arrays)
+18. **Accession map** — primary rows equal `entries`, secondary rows equal the sum of `secondary_accs`, no duplicate `(acc, primary_acc)`, every `primary_acc` exists, `(reviewed, taxid)` match `entries` (17, bloom filters, is deferred: the pinned PyArrow cannot write them)
 
 ### Testing
 

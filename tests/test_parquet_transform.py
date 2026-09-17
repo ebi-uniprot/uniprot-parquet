@@ -90,6 +90,11 @@ def publications_ds(lake_dir):
     return open_table(lake_dir, "publications")
 
 
+@pytest.fixture(scope="session")
+def accession_map_ds(lake_dir):
+    return open_table(lake_dir, "accession_map")
+
+
 # ─── Row counts ──────────────────────────────────────────────────────
 
 
@@ -144,6 +149,18 @@ class TestRowCounts:
             if s is not None:
                 ref_sum += s
         assert ref_sum == publications_ds.count_rows()
+
+    def test_accession_map_primary_count(self, entries_ds, accession_map_ds):
+        """One is_primary row per entry."""
+        flags = accession_map_ds.to_table(columns=["is_primary"]).column("is_primary")
+        assert pc.sum(flags).as_py() == entries_ds.count_rows()
+
+    def test_accession_map_secondary_count(self, entries_ds, accession_map_ds):
+        """One non-primary row per secondary accession."""
+        n_secs = sum(len(v or []) for v in
+                     entries_ds.to_table(columns=["secondary_accs"]).column("secondary_accs").to_pylist())
+        flags = accession_map_ds.to_table(columns=["is_primary"]).column("is_primary")
+        assert flags.length() - pc.sum(flags).as_py() == n_secs
 
 
 # ─── Manifest ──────────────────────────────────────────────────────
@@ -200,7 +217,7 @@ class TestManifest:
 # ─── Data Package (Frictionless) ──────────────────────────────────────
 
 
-EXPECTED_TABLES = ["entries", "features", "xrefs", "comments", "publications"]
+EXPECTED_TABLES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
 
 
 class TestDataPackage:
@@ -251,6 +268,14 @@ class TestDataPackage:
             fk_fields = {fk["fields"][0] for fk in fks}
             assert "acc" in fk_fields, f"{child} missing acc foreign key"
             assert "taxid" in fk_fields, f"{child} missing taxid foreign key"
+
+    def test_accession_map_fk(self, lake_dir):
+        with open(os.path.join(lake_dir, "datapackage.json")) as f:
+            dp = json.load(f)
+        resource = {r["name"]: r for r in dp["resources"]}["accession_map"]
+        fks = resource["schema"]["foreignKeys"]
+        assert any(fk["fields"] == ["primary_acc"] and fk["reference"]["resource"] == "entries"
+                   and fk["reference"]["fields"] == ["acc"] for fk in fks), fks
 
     def test_datapackage_matches_manifest(self, lake_dir):
         with open(os.path.join(lake_dir, "manifest.json")) as f:
@@ -549,6 +574,12 @@ class TestSortOrder:
         accs = arrow.column("acc").to_pylist()
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
         assert keys == sorted(keys), "Comments not sorted by (reviewed DESC, taxid ASC, acc ASC)"
+
+    def test_accession_map_sorted(self, accession_map_ds):
+        arrow = accession_map_ds.to_table(columns=["reviewed", "acc", "primary_acc"])
+        keys = list(zip((not r for r in arrow.column("reviewed").to_pylist()),
+                        arrow.column("acc").to_pylist(), arrow.column("primary_acc").to_pylist()))
+        assert keys == sorted(keys), "accession_map not sorted by (reviewed DESC, acc ASC, primary_acc ASC)"
 
     def test_publications_sorted_by_reviewed_desc_taxid_asc_acc_asc(self, publications_ds):
         arrow = publications_ds.to_table(columns=["reviewed", "taxid", "acc"])

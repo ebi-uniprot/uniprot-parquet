@@ -18,7 +18,7 @@ Usage (remote — EBI FTP):
     con = connect("https://ftp.ebi.ac.uk/.../2026_01/lake")
 
 That's it. The returned object is a standard duckdb.DuckDBPyConnection
-with five views (entries, features, xrefs, comments, publications)
+with six views (entries, features, xrefs, comments, publications, accession_map)
 and seven macros ready to use.
 
 Requirements: pip install duckdb
@@ -46,6 +46,7 @@ CREATE OR REPLACE VIEW comments   AS SELECT * REPLACE (comment::JSON AS comment)
 -- Named "publications" to match UniProt's entry page terminology.
 -- ("references" is also a reserved word in SQL.)
 CREATE OR REPLACE VIEW publications AS SELECT * FROM read_parquet('{BASE}/publications/*.parquet');
+CREATE OR REPLACE VIEW accession_map AS SELECT * FROM read_parquet('{BASE}/accession_map/*.parquet');
 
 -- Annotation card for a single protein
 CREATE OR REPLACE MACRO protein_card(target_acc) AS TABLE (

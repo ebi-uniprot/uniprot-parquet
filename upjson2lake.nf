@@ -159,7 +159,9 @@ process PARQUET_TRANSFORM {
     cpus 4
     memory params.process_memory
     time '48h'
-    disk '2 TB'          // DuckDB ORDER BY spill + Parquet output
+    disk '2 TB'          // DuckDB ORDER BY spill + Parquet output.  accession_map is the one
+                         // table with a real sort (reviewed DESC, acc): ~250M + secondaries rows
+                         // of five narrow columns, expect low tens of GB of spill for it alone.
 
     publishDir "${release_dir}", mode: 'copy', pattern: 'lake'
 

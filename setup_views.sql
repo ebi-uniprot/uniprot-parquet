@@ -37,6 +37,7 @@ CREATE OR REPLACE VIEW comments   AS SELECT * REPLACE (comment::JSON AS comment)
 -- Named "publications" to match UniProt's entry page terminology.
 -- ("references" is also a reserved word in SQL.)
 CREATE OR REPLACE VIEW publications AS SELECT * FROM read_parquet('${BASE}/publications/*.parquet');
+CREATE OR REPLACE VIEW accession_map AS SELECT * FROM read_parquet('${BASE}/accession_map/*.parquet');
 
 
 -- ── Macros for common query patterns ───────────────────────────────────
