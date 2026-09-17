@@ -68,6 +68,10 @@ Checks (in order):
   15. COMMENT TEXT
       - Every text-bearing comment type has a populated text_value
 
+  16. RECONSTRUCTION
+      - Sampled entries rebuilt from the five tables (bin/reconstruct.py)
+        equal the source JSONL, order-independent inside arrays
+
 Usage:
     validate_lake.py \
         --lake /path/to/lake \
@@ -998,6 +1002,55 @@ def check_text_value(report, lake_dir):
                      f"{with_text:,}/{n:,} rows have text")
 
 
+def check_reconstruction(report, lake_dir, jsonl_path, n):
+    """g(f(x)) == x on a sample: rebuild sampled entries from the five tables
+    with bin/reconstruct.py and compare with the JSONL (plan A11, the release
+    gate for the residual trim A13)."""
+    report.checks.append(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
+    eprint(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
+    import duckdb
+    from reconstruct import reconstruct_entry, entries_match
+
+    sampled = sample_jsonl_entries(jsonl_path, n)
+    originals = {e["primaryAccession"]: e for e in sampled if e.get("primaryAccession")}
+    if not originals:
+        report.check("reconstruction sample non-empty", False, "no entries sampled")
+        return
+    in_list = ",".join("'" + a.replace("'", "''") + "'" for a in originals)
+
+    def fetch(table):
+        path = os.path.join(lake_dir, table, "*.parquet")
+        tbl = duckdb.sql(f"SELECT * FROM read_parquet('{path}') WHERE acc IN ({in_list})").arrow().read_all()
+        grouped = {}
+        for row in tbl.to_pylist():
+            grouped.setdefault(row["acc"], []).append(row)
+        return grouped
+
+    t0 = time.time()
+    rows = {t: fetch(t) for t in ("entries", "features", "xrefs", "comments", "publications")}
+    eprint(f"  Fetched rows for {len(originals)} accessions in {time.time()-t0:.1f}s")
+
+    matched, failures = 0, []
+    for acc, orig in originals.items():
+        entry_rows = rows["entries"].get(acc)
+        if not entry_rows:
+            failures.append(f"{acc}: not in entries")
+            continue
+        rebuilt = reconstruct_entry(entry_rows[0], rows["features"].get(acc, []),
+                                    rows["xrefs"].get(acc, []), rows["comments"].get(acc, []),
+                                    rows["publications"].get(acc, []))
+        ok, diff = entries_match(rebuilt, orig)
+        if ok:
+            matched += 1
+        else:
+            failures.append(f"{acc}: {diff}")
+    report.check(
+        f"reconstruction matches JSONL for {matched}/{len(originals)} sampled entries",
+        not failures,
+        "; ".join(failures[:3]) + (f" (+{len(failures)-3} more)" if len(failures) > 3 else ""),
+    )
+
+
 def check_schema_evolution(report, lake_dir, baseline_path):
     """
     Detect upstream UniProtKB JSON schema changes by comparing inferred Parquet
@@ -1121,6 +1174,7 @@ def main():
     check_schema_types(report, args.lake)
     check_field_completeness(report, args.lake, args.jsonl)
     check_text_value(report, args.lake)
+    check_reconstruction(report, args.lake, args.jsonl, args.spot_check_n)
     if args.schema_baseline:
         check_schema_evolution(report, args.lake, args.schema_baseline)
 

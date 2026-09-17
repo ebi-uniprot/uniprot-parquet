@@ -19,13 +19,13 @@ def _run(args, stdin=None):
 @pytest.fixture(scope="module")
 def sides(small_jsonl):
     """(reviewed accs, unreviewed accs) from the fixture JSONL."""
+    import io
     import zstandard as zstd
     reviewed, unreviewed = set(), set()
     with open(small_jsonl, "rb") as f:
-        text = zstd.ZstdDecompressor().stream_reader(f).read().decode()
-    for line in text.splitlines():
-        e = json.loads(line)
-        (reviewed if "Swiss-Prot" in e["entryType"] else unreviewed).add(e["primaryAccession"])
+        for line in io.TextIOWrapper(zstd.ZstdDecompressor().stream_reader(f), encoding="utf-8"):
+            e = json.loads(line)
+            (reviewed if "Swiss-Prot" in e["entryType"] else unreviewed).add(e["primaryAccession"])
     return reviewed, unreviewed
 
 
@@ -55,13 +55,10 @@ def test_seed_is_deterministic(small_jsonl):
     assert a == b and a != c
 
 
-def test_reads_plain_jsonl_from_stdin(small_jsonl):
-    import zstandard as zstd
-    with open(small_jsonl, "rb") as f:
-        raw = zstd.ZstdDecompressor().stream_reader(f).read()
-    n_lines = raw.count(b"\n")
-    out = _run(["--n", str(n_lines + 10)], stdin=raw)
-    assert len(out.stdout.splitlines()) == n_lines
+def test_reads_plain_jsonl_from_stdin():
+    raw = b"".join(b'{"entryType":"UniProtKB unreviewed (TrEMBL)","i":%d}\n' % i for i in range(500))
+    out = _run(["--n", "510"], stdin=raw)
+    assert len(out.stdout.splitlines()) == 500
     assert b"WARNING" in out.stderr  # fewer lines than --n
 
 

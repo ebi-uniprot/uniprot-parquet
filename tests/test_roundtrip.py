@@ -16,121 +16,19 @@ from collections import defaultdict
 import pyarrow.dataset as ds
 import pytest
 
+from reconstruct import deep_sort, normalize_value  # shared with the validator
+
 
 # ─── Helpers ────────────────────────────────────────────────────────────
 
 
-def load_original_entries(fixture_path):
-    """Load the original JSON entries from the fixture, keyed by accession."""
-    with gzip.open(fixture_path, "rt") as f:
-        data = json.load(f)
-    return {e["primaryAccession"]: e for e in data["results"]}
-
-
-def deep_sort(obj):
-    """Recursively sort lists/dicts so unordered comparison works.
-
-    - dicts: sort by key
-    - lists of dicts: sort by JSON serialization (stable canonical form)
-    - lists of primitives: sort by value
-    - everything else: return as-is
-    """
-    if isinstance(obj, dict):
-        return {k: deep_sort(v) for k, v in sorted(obj.items())}
-    if isinstance(obj, list):
-        sorted_items = [deep_sort(item) for item in obj]
-        try:
-            return sorted(sorted_items, key=lambda x: json.dumps(x, sort_keys=True, default=str))
-        except TypeError:
-            return sorted_items
-    return obj
-
-
-def normalize_value(val):
-    """Normalize values for comparison (handle Arrow/Parquet type differences)."""
-    if val is None:
-        return None
-    if isinstance(val, dict):
-        # Remove None values from dicts (Parquet may add nullable fields)
-        return {k: normalize_value(v) for k, v in val.items() if v is not None}
-    if isinstance(val, list):
-        return [normalize_value(v) for v in val]
-    if isinstance(val, (int, float)):
-        return val
-    return str(val)
-
-
-def open_table(lake_dir, name):
-    return ds.dataset(os.path.join(lake_dir, name), format="parquet")
+from conftest import load_original_entries, open_table  # noqa: F401
 
 
 # ─── Fixtures ───────────────────────────────────────────────────────────
-
-
-@pytest.fixture(scope="module")
-def originals(fixture_json_gz):
-    """Original JSON entries keyed by accession."""
-    return load_original_entries(fixture_json_gz)
-
-
-@pytest.fixture(scope="module")
-def lake(parquet_lake):
-    return parquet_lake["lake_dir"]
-
-
-@pytest.fixture(scope="module")
-def lake_entries(lake):
-    """All entries from the Parquet lake, keyed by accession."""
-    table = open_table(lake, "entries").to_table()
-    result = {}
-    for i in range(table.num_rows):
-        row = {col: table.column(col)[i].as_py() for col in table.column_names}
-        result[row["acc"]] = row
-    return result
-
-
-@pytest.fixture(scope="module")
-def lake_features(lake):
-    """Features grouped by accession."""
-    table = open_table(lake, "features").to_table()
-    grouped = defaultdict(list)
-    for i in range(table.num_rows):
-        row = {col: table.column(col)[i].as_py() for col in table.column_names}
-        grouped[row["acc"]].append(row)
-    return dict(grouped)
-
-
-@pytest.fixture(scope="module")
-def lake_xrefs(lake):
-    """Cross-references grouped by accession."""
-    table = open_table(lake, "xrefs").to_table()
-    grouped = defaultdict(list)
-    for i in range(table.num_rows):
-        row = {col: table.column(col)[i].as_py() for col in table.column_names}
-        grouped[row["acc"]].append(row)
-    return dict(grouped)
-
-
-@pytest.fixture(scope="module")
-def lake_comments(lake):
-    """Comments grouped by accession."""
-    table = open_table(lake, "comments").to_table()
-    grouped = defaultdict(list)
-    for i in range(table.num_rows):
-        row = {col: table.column(col)[i].as_py() for col in table.column_names}
-        grouped[row["acc"]].append(row)
-    return dict(grouped)
-
-
-@pytest.fixture(scope="module")
-def lake_publications(lake):
-    """Publications grouped by accession."""
-    table = open_table(lake, "publications").to_table()
-    grouped = defaultdict(list)
-    for i in range(table.num_rows):
-        row = {col: table.column(col)[i].as_py() for col in table.column_names}
-        grouped[row["acc"]].append(row)
-    return dict(grouped)
+# originals, lake, lake_entries, lake_features, lake_xrefs, lake_comments and
+# lake_publications are session fixtures in conftest.py (shared with
+# tests/test_reconstruct.py so the row dicts are built once).
 
 
 # ─── Tests: Completeness ───────────────────────────────────────────────

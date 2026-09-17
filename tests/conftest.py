@@ -124,3 +124,67 @@ def small_lake(tmp_path_factory):
     outdir = str(out_dir / "lake")
     run_transform(jsonl_path, outdir, release="small_2026")
     return {"lake_dir": outdir, "jsonl": jsonl_path}
+
+
+# ─── Round-trip fixtures (shared by test_roundtrip.py and test_reconstruct.py) ──
+# Module scope, not session: the row dicts are several GB on the stress
+# fixture and must be released at module teardown so the later validator
+# subprocess (test_validate.py) has memory to run.
+
+
+def load_original_entries(fixture_path):
+    """Load the original JSON entries from the fixture, keyed by accession."""
+    with gzip.open(fixture_path, "rt") as f:
+        data = json.load(f)
+    return {e["primaryAccession"]: e for e in data["results"]}
+
+
+def open_table(lake_dir, name):
+    import pyarrow.dataset as ds
+    return ds.dataset(os.path.join(lake_dir, name), format="parquet")
+
+
+def _rows_by_acc(lake_dir, name):
+    """All rows of a child table as dicts, grouped by accession."""
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for row in open_table(lake_dir, name).to_table().to_pylist():
+        grouped[row["acc"]].append(row)
+    return dict(grouped)
+
+
+@pytest.fixture(scope="module")
+def originals(fixture_json_gz):
+    """Original JSON entries keyed by accession."""
+    return load_original_entries(fixture_json_gz)
+
+
+@pytest.fixture(scope="module")
+def lake(parquet_lake):
+    return parquet_lake["lake_dir"]
+
+
+@pytest.fixture(scope="module")
+def lake_entries(lake):
+    """All entries from the Parquet lake, keyed by accession."""
+    return {row["acc"]: row for row in open_table(lake, "entries").to_table().to_pylist()}
+
+
+@pytest.fixture(scope="module")
+def lake_features(lake):
+    return _rows_by_acc(lake, "features")
+
+
+@pytest.fixture(scope="module")
+def lake_xrefs(lake):
+    return _rows_by_acc(lake, "xrefs")
+
+
+@pytest.fixture(scope="module")
+def lake_comments(lake):
+    return _rows_by_acc(lake, "comments")
+
+
+@pytest.fixture(scope="module")
+def lake_publications(lake):
+    return _rows_by_acc(lake, "publications")

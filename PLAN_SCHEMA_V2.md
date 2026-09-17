@@ -35,6 +35,7 @@ Every measurement and spike outcome the plan asks for is recorded here, in one p
 | D.3 spike: does DuckDB prune files through `REPLACE ((review_status = 'swissprot') AS reviewed)`? Option chosen | Step 14 | ______ |
 | F.4 table (see F.4) filled; chosen `entries` file-size target; page-index footer delta | Step 18 | ______ |
 | H.1 table (see H.1) filled; chosen zstd level | Step 18 | ______ |
+| A11 (Step 10): `g()` limitation — array order is not reproduced | Step 10 | `bin/reconstruct.py::reconstruct_entry` rebuilds every fixture entry (default and stress) and the validator's check 16 passes; comparison is order-independent inside arrays (`deep_sort`) because the child tables carry no position index. Whether to add position columns is the plan owner's call; not done here. |
 | A13: bytes before/after the residual trim on the slice ("after v2" column of F.1) | Step 11 | ______ |
 | Phase 3: point-lookup benchmark table; B1 kept on child tables? | Step 20 | ______ |
 | C.3: HTTP request count for the default-column organism query before/after the reorder | Step 20 | ______ |

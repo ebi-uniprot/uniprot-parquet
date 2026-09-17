@@ -414,6 +414,7 @@ The `VALIDATE` step runs the checks below against the source JSONL as ground tru
 13. **Field completeness** — every top-level JSON field is captured in `entries` or a child table
 14. **Schema evolution guard** — Parquet schema matches a committed baseline (when `--schema-baseline` is given)
 15. **Comment text** — every text-bearing comment type has a populated `text_value`
+16. **Reconstruction** — sampled entries rebuilt from the five tables by `bin/reconstruct.py` equal the source JSONL (order-independent inside arrays)
 
 ### Testing
 
