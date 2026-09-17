@@ -32,7 +32,9 @@
 // All tables sorted by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
 // for query locality via Parquet row group statistics.
 
-nextflow.enable.dsl = 2
+// Written in the Nextflow strict syntax (the default parser since 26.04):
+// only declarations at script level, so the release directory is a function
+// and the completion handler is an onComplete: section of the entry workflow.
 
 /* ── PARAMS ────────────────────────────────────────────────────────── */
 params.inputfile      = "${projectDir}/tests/fixtures/small.json.gz"
@@ -44,12 +46,21 @@ params.notify_email   = null      // Email for SLURM failure notifications (null
 params.duckdb_temp    = null      // DuckDB spill directory (null = use $TMPDIR or /tmp)
 params.expected_count = null      // Expected entry count (from UniProt release stats, null = skip)
 
-// Final output directory: <outdir>/<release>/
-def release_dir = "${params.outdir}/${params.release}"
+// Final output directory: <outdir>/<release>/.  Process directives cannot
+// call script functions, so every publishDir spells the same path out.
+def release_dir() {
+    "${params.outdir}/${params.release}"
+}
 
-// Work-dir path of the RELEASE_COMPLETE marker PROVENANCE wrote; copied
-// into release_dir by workflow.onComplete (see there for why).
-def complete_marker = null
+// RELEASE_COMPLETE is staged under this name inside release_dir and renamed
+// by the workflow's onComplete section once every publishDir copy is done.
+def pending_marker() {
+    "${release_dir()}/.RELEASE_COMPLETE.pending"
+}
+
+def banner_line(String s) {
+    "║  ${s.padRight(55)}║"
+}
 
 // DuckDB memory is computed inside each process script block (not here) so that
 // it reacts to task.memory on retry — when Nextflow doubles the allocation after
@@ -117,7 +128,7 @@ process SORT_JSONL {
     time '24h'
     disk '1 TB'          // DuckDB spill space for ORDER BY
 
-    publishDir "${release_dir}", mode: 'copy'
+    publishDir "${params.outdir}/${params.release}", mode: 'copy'
 
     input:
     path jsonl
@@ -167,7 +178,7 @@ process PARQUET_TRANSFORM {
                          // table with a real sort (reviewed DESC, acc): ~250M + secondaries rows
                          // of five narrow columns, expect low tens of GB of spill for it alone.
 
-    publishDir "${release_dir}", mode: 'copy', pattern: 'lake'
+    publishDir "${params.outdir}/${params.release}", mode: 'copy', pattern: 'lake'
 
     input:
     path sorted_jsonl
@@ -218,7 +229,7 @@ process VALIDATE {
     memory params.process_memory
     time '4h'
 
-    publishDir "${release_dir}", mode: 'copy'
+    publishDir "${params.outdir}/${params.release}", mode: 'copy'
 
     input:
     path lake
@@ -256,13 +267,14 @@ process PROVENANCE {
     cpus 1
     memory '1 GB'
 
-    // Only provenance.json is published here.  RELEASE_COMPLETE must NOT go
-    // through publishDir: publishDir copies run asynchronously, so this tiny
-    // marker would land in release_dir while PARQUET_TRANSFORM's multi-TB
-    // lake/ is still being copied there.  workflow.onComplete copies it
-    // instead — Nextflow waits for every pending publish before running
-    // completion handlers.
-    publishDir "${release_dir}", mode: 'copy', pattern: 'provenance.json'
+    // RELEASE_COMPLETE must not appear under its final name through
+    // publishDir: publishDir copies run asynchronously, so this tiny marker
+    // would land in release_dir while PARQUET_TRANSFORM's multi-TB lake/ is
+    // still being copied there.  It is published as a hidden .pending file
+    // and renamed by the workflow's onComplete section, which Nextflow runs
+    // only after every pending publish has finished.
+    publishDir "${params.outdir}/${params.release}", mode: 'copy',
+        saveAs: { name -> name == 'RELEASE_COMPLETE' ? '.RELEASE_COMPLETE.pending' : name }
 
     input:
     path lake
@@ -292,20 +304,19 @@ process PROVENANCE {
 
 /* ── WORKFLOW ─────────────────────────────────────────────────────── */
 workflow {
-    def W = 57
-    def bar = '═' * W
-    def line = { String s -> "║  ${s.padRight(W - 2)}║" }
+    main:
+    def bar = '═' * 57
     log.info """
     ╔${bar}╗
-    ${line('UniProtKB → Parquet Data Lake')}
-    ${line("Release: ${params.release}")}
+    ${banner_line('UniProtKB → Parquet Data Lake')}
+    ${banner_line("Release: ${params.release}")}
     ╚${bar}╝
     Input:      ${params.inputfile}
-    Output:     ${release_dir}
+    Output:     ${release_dir()}
     DuckDB mem: ${params.duckdb_pct}% of task.memory (scales on retry)
     DuckDB tmp: ${params.duckdb_temp ?: '(default: \$TMPDIR or /tmp)'}
     Expected:   ${params.expected_count ?: '(not set — post-hoc verification only)'}
-    ${'─' * (W + 2)}
+    ${'─' * 59}
     """.stripIndent()
 
     // Validate inputs
@@ -314,7 +325,7 @@ workflow {
     }
 
     // 1. Stream input → single zstd-compressed JSONL
-    input_ch = Channel.fromPath(params.inputfile)
+    def input_ch = Channel.fromPath(params.inputfile)
     STREAM_JSONL(input_ch)
 
     // 2. Sort JSONL by reviewed DESC, taxid ASC, acc ASC
@@ -340,16 +351,20 @@ workflow {
         SORT_JSONL.out.sorted_jsonl,
         VALIDATE.out.validated,
     )
-    PROVENANCE.out.complete.subscribe { complete_marker = it }
-}
 
-// 6. RELEASE_COMPLETE is the last file to reach release_dir (plan H.5).
-//    onComplete runs after every publishDir copy has finished, so a mirror
-//    that sees the marker sees the whole lake/.  Nothing is written for a
-//    failed run (VALIDATE failing means PROVENANCE never ran anyway).
-workflow.onComplete {
-    if (workflow.success && complete_marker) {
-        file(complete_marker).copyTo("${release_dir}/RELEASE_COMPLETE")
-        log.info "RELEASE_COMPLETE written to ${release_dir}"
+    // 6. RELEASE_COMPLETE is the last file to reach release_dir (plan H.5).
+    //    onComplete runs after every publishDir copy has finished, so a
+    //    mirror that sees the marker sees the whole lake/.  The rename is
+    //    atomic within the directory; a failed run leaves no marker (and no
+    //    .pending file either — VALIDATE failing means PROVENANCE never ran,
+    //    and anything staged by an earlier attempt is removed).
+    onComplete:
+    def pending = file(pending_marker())
+    if (workflow.success && pending.exists()) {
+        pending.moveTo("${release_dir()}/RELEASE_COMPLETE")
+        log.info "RELEASE_COMPLETE written to ${release_dir()}"
+    }
+    else if (pending.exists()) {
+        pending.delete()
     }
 }

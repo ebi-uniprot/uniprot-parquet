@@ -334,7 +334,7 @@ Or with pip (core dependencies only):
 pip install duckdb pyarrow orjson ijson zstandard pytest frictionless
 ```
 
-Nextflow ≥ 26.04 defaults to the strict DSL syntax and rejects the pipeline's top-level `def`; run it with `NXF_SYNTAX_PARSER=v1` (Nextflow 25.x runs it as is). If `INSTALL httpfs` cannot reach `extensions.duckdb.org`, the same extension is on PyPI as `duckdb-extension-httpfs`.
+`upjson2lake.nf` is written in Nextflow's strict syntax and requires Nextflow ≥ 26.04 (`nextflowVersion` in `nextflow.config`). If `INSTALL httpfs` cannot reach `extensions.duckdb.org`, the same extension is on PyPI as `duckdb-extension-httpfs`.
 
 ### Demo
 
@@ -434,8 +434,8 @@ UniProtKB.json.gz
      |         comment text, reconstruction g(f(x)) == x, accession map, partitions
      v
 +------------+   provenance.json (checksums, git commit, row counts),
-| PROVENANCE |   then RELEASE_COMPLETE — copied into the release directory by
-+------------+   workflow.onComplete, after every publishDir copy has finished
+| PROVENANCE |   then RELEASE_COMPLETE — renamed into place by the workflow's
++------------+   onComplete section, after every publishDir copy has finished
 ```
 
 DuckDB handles the heavy lifting: JSON parsing (with automatic schema inference via `read_json_auto`), SQL transformations (flattening, unnesting), and sorting. It streams Arrow record batches to PyArrow, which writes zstd-compressed Parquet files directly. Memory stays bounded regardless of dataset size.

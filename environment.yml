@@ -4,7 +4,7 @@ channels:
   - bioconda
 dependencies:
   - openjdk=21                        # Required for Nextflow (LTS, supported through 2029)
-  - nextflow>=25.10                   # Pipeline orchestration
+  - nextflow>=26.04                   # Pipeline orchestration (strict-syntax pipeline)
   - python>=3.14
   - pigz                              # Parallel gzip decompression
   - zstd                              # Zstandard compression for intermediate JSONL
