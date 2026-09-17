@@ -4,6 +4,8 @@
 
 Analysis-ready Parquet tables covering the complete UniProtKB dataset — sorted, denormalized, and queryable from any language that reads Parquet.
 
+Six tables (`entries`, `features`, `xrefs`, `comments`, `publications`, `accession_map`), each Hive-partitioned by `review_status=swissprot|trembl`, with flattened convenience columns for everyday queries and residual structs that keep the release lossless (`bin/reconstruct.py` rebuilds the original JSON; the validator proves it on every release). Schema version 1.0.0 — see `SCHEMA.md` for every column, type, source path and the versioning policy.
+
 ## Tables
 
 | Table          | Grain                             | Rows (full UniProtKB) |
@@ -332,6 +334,8 @@ Or with pip (core dependencies only):
 pip install duckdb pyarrow orjson ijson zstandard pytest frictionless
 ```
 
+Nextflow ≥ 26.04 defaults to the strict DSL syntax and rejects the pipeline's top-level `def`; run it with `NXF_SYNTAX_PARSER=v1` (Nextflow 25.x runs it as is). If `INSTALL httpfs` cannot reach `extensions.duckdb.org`, the same extension is on PyPI as `duckdb-extension-httpfs`.
+
 ### Demo
 
 Downloads ~5,000 proteins (reviewed + unreviewed) from five model organisms (Human, Mouse, Fruit fly, Arabidopsis, Yeast) and builds a complete lake:
@@ -513,10 +517,10 @@ python tests/fetch_fixtures.py --scale stress --force  # re-fetch stress
 
 - **Orchestration**: Nextflow (DSL2, SLURM support)
 - **Compute**: DuckDB (JSON parsing via `read_json_auto`, SQL transforms, out-of-core sorting)
-- **Storage**: Parquet (zstd compression, sorted by `reviewed DESC`, `taxid ASC`, `acc ASC`)
-- **Streaming**: PyArrow (bounded-memory Arrow record batch → Parquet writing)
-- **Manifest**: `manifest.json` — file list, schemas, sort orders, semantic metadata
-- **Schema**: Inferred from data via DuckDB `read_json_auto` — no committed schema file
+- **Storage**: Parquet (zstd level 9, page index, sorted by `reviewed DESC`, `taxid ASC`, `acc ASC`, Hive-partitioned by `review_status`)
+- **Streaming**: PyArrow (bounded-memory Arrow record batch → Parquet writing; column descriptions and source paths in the Arrow field metadata)
+- **Manifest**: `manifest.json` — file list with sizes / SHA-256 / taxid ranges, schemas, sort orders, partitioning, semantic metadata; `SHA256SUMS.txt` and `RELEASE.metalink` beside it
+- **Schema**: Inferred from data via DuckDB `read_json_auto`; optional columns and residual structs are cast to declared types (`COLUMN_TYPES`) so a build's schema does not depend on its input; `SCHEMA.md` is generated from a build by `bin/gen_schema_md.py`
 - **FAIR metadata**: `datapackage.json` — [Frictionless Data Package](https://specs.frictionlessdata.io/data-package/) descriptor with Arrow types, nullability, semantic descriptions, keys, and licensing
 
 ---
