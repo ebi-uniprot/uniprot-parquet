@@ -16,7 +16,7 @@ from collections import defaultdict
 import pyarrow.dataset as ds
 import pytest
 
-from reconstruct import deep_sort, normalize_value  # shared with the validator
+from reconstruct import deep_sort, normalize_value, _feature, _reference  # shared with the validator
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────
@@ -170,43 +170,25 @@ class TestEntryFields:
 
 
 class TestNestedStructs:
-    """The full nested structures stored in the entries table must match originals."""
+    """Residual / full nested columns (plan A13). The four struct-equality tests
+    that compared organism / proteinDescription / genes / keywords directly are
+    gone: tests/test_reconstruct.py is the lossless proof."""
 
-    def test_organism_struct_preserved(self, originals, lake_entries):
+    def test_genes_full_and_keywords_full_preserved(self, originals, lake_entries):
         for acc, orig in originals.items():
             lake = lake_entries[acc]
-            orig_org = normalize_value(orig["organism"])
-            lake_org = normalize_value(lake["organism"])
-            assert deep_sort(orig_org) == deep_sort(lake_org), (
-                f"{acc}: organism struct mismatch"
-            )
+            for src, col in (("genes", "genes_full"), ("keywords", "keywords_full")):
+                assert deep_sort(normalize_value(orig.get(src) or [])) == \
+                    deep_sort(normalize_value(lake.get(col) or [])), f"{acc}: {col} mismatch"
 
-    def test_protein_desc_struct_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
+    def test_residuals_hold_only_leftovers(self, originals, lake_entries):
+        """Residual structs never carry a promoted field."""
+        for acc in list(originals)[:200]:
             lake = lake_entries[acc]
-            orig_pd = normalize_value(orig.get("proteinDescription"))
-            lake_pd = normalize_value(lake.get("protein_desc"))
-            assert deep_sort(orig_pd) == deep_sort(lake_pd), (
-                f"{acc}: proteinDescription struct mismatch"
-            )
-
-    def test_genes_struct_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            orig_genes = normalize_value(orig.get("genes") or [])
-            lake_genes = normalize_value(lake.get("genes") or [])
-            assert deep_sort(orig_genes) == deep_sort(lake_genes), (
-                f"{acc}: genes struct mismatch"
-            )
-
-    def test_keywords_struct_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            orig_kw = normalize_value(orig.get("keywords") or [])
-            lake_kw = normalize_value(lake.get("keywords") or [])
-            assert deep_sort(orig_kw) == deep_sort(lake_kw), (
-                f"{acc}: keywords struct mismatch"
-            )
+            org = lake.get("organism_residual") or {}
+            assert not {"taxonId", "scientificName", "commonName", "lineage"} & set(org)
+            pdr = lake.get("protein_desc_residual") or {}
+            assert "flag" not in pdr
 
     def test_extra_attributes_preserved(self, originals, lake_entries):
         for acc, orig in originals.items():
@@ -268,13 +250,13 @@ class TestFeatureContent:
             orig_features = orig.get("features") or []
             lake_rows = lake_features.get(acc, [])
 
-            # Compare the preserved 'feature' structs (order-independent)
+            # Rebuild each feature from convenience columns + residual (order-independent)
             orig_set = {
                 json.dumps(deep_sort(normalize_value(f)), sort_keys=True, default=str)
                 for f in orig_features
             }
             lake_set = {
-                json.dumps(deep_sort(normalize_value(row["feature"])), sort_keys=True, default=str)
+                json.dumps(deep_sort(normalize_value(_feature(row))), sort_keys=True, default=str)
                 for row in lake_rows
             }
             missing = orig_set - lake_set
@@ -353,13 +335,13 @@ class TestPublicationContent:
             orig_refs = orig.get("references") or []
             lake_rows = lake_publications.get(acc, [])
 
-            # Compare the preserved 'reference' structs (order-independent)
+            # Rebuild each reference from convenience columns + residual (order-independent)
             orig_set = {
                 json.dumps(deep_sort(normalize_value(r)), sort_keys=True, default=str)
                 for r in orig_refs
             }
             lake_set = {
-                json.dumps(deep_sort(normalize_value(row["reference"])), sort_keys=True, default=str)
+                json.dumps(deep_sort(normalize_value(_reference(row))), sort_keys=True, default=str)
                 for row in lake_rows
             }
             missing = orig_set - lake_set

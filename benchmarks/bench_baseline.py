@@ -170,13 +170,13 @@ QUERY_SUITE = [
         "name": "nested_organism_access",
         "description": "Access nested organism struct directly",
         "table": "entries",
-        "sql": "SELECT acc, organism.taxonId, organism.scientificName FROM entries WHERE organism.taxonId = 9606",
+        "sql": "SELECT acc, taxid, organism_name, organism_residual.synonyms FROM entries WHERE taxid = 9606",
     },
     {
         "name": "nested_protein_desc_access",
         "description": "Access nested proteinDescription struct",
         "table": "entries",
-        "sql": "SELECT acc, protein_desc.recommendedName.fullName.value FROM entries WHERE protein_desc IS NOT NULL LIMIT 50",
+        "sql": "SELECT acc, protein_desc_residual.recommendedName.fullName.value FROM entries WHERE protein_desc_residual IS NOT NULL LIMIT 50",
     },
 
     # ── Comment / publication queries ──
@@ -402,48 +402,11 @@ def analyze_schema_complexity(lake_path, repo_root):
     """Measure schema complexity: column counts, convenience vs nested, LOC."""
     results = {}
 
-    # Column classification
-    convenience_columns = {
-        "entries": [
-            "acc", "id", "reviewed", "secondary_accs", "taxid", "organism_name",
-            "organism_common", "lineage", "gene_names", "gene_synonyms",
-            "protein_name", "alt_protein_names", "protein_flag", "ec_numbers",
-            "protein_existence", "annotation_score", "sequence", "seq_length",
-            "seq_mass", "seq_md5", "seq_crc64", "go_ids", "xref_dbs",
-            "keyword_ids", "keyword_names", "first_public", "last_modified",
-            "last_seq_modified", "entry_version", "seq_version", "feature_count",
-            "xref_count", "comment_count", "reference_count", "uniparc_id",
-            "entry_type", "extra_attributes",
-        ],
-        "features": [
-            "acc", "from_reviewed", "taxid", "organism_name", "seq_length",
-            "type", "start_pos", "end_pos", "start_modifier", "end_modifier",
-            "description", "feature_id", "evidence_codes", "original_sequence",
-            "alternative_sequences", "ligand_name", "ligand_id", "ligand_label",
-            "ligand_note",
-        ],
-        "xrefs": [
-            "acc", "from_reviewed", "taxid", "database", "id", "properties",
-            "isoform_id", "evidences",
-        ],
-        "comments": [
-            "acc", "from_reviewed", "taxid", "comment_type", "text_value",
-        ],
-        "publications": [
-            "acc", "from_reviewed", "taxid", "reference_number", "citation_type",
-            "citation_id", "title", "authors", "authoring_group", "publication_date",
-            "journal", "volume", "first_page", "last_page", "submission_database",
-            "citation_xrefs", "reference_positions", "reference_comments", "evidences",
-        ],
-    }
-
-    nested_columns = {
-        "entries": ["organism", "protein_desc", "genes", "keywords", "organism_hosts", "gene_locations"],
-        "features": ["feature"],
-        "xrefs": [],
-        "comments": ["comment"],
-        "publications": ["reference"],
-    }
+    # Column classification comes from the transform's own metadata so the
+    # benchmark cannot drift from the schema (plan A13 renamed the nested layer).
+    from parquet_transform import TABLE_META
+    convenience_columns = {t: m["columns"]["convenience"] for t, m in TABLE_META.items()}
+    nested_columns = {t: m["columns"]["nested"] for t, m in TABLE_META.items()}
 
     table_metrics = {}
     for table in ["entries", "features", "xrefs", "comments", "publications"]:

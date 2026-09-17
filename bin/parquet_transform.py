@@ -282,6 +282,15 @@ COLUMN_TYPES: dict[tuple[str, str], str] = {
     ("publications", "reference_positions"): "VARCHAR[]",
     ("publications", "reference_comments"): 'STRUCT("value" VARCHAR, "type" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[]',
     ("publications", "evidences"): 'STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[]',
+    # Residual structs (plan A13): "everything else" buckets, so their declared
+    # type is the union seen on the stress fixture.  A full build whose input
+    # has a sub-field these do not list stops at check_declared_types(); extend
+    # the type there (DuckDB DESCRIBE output, verbatim) and rebuild.
+    ('entries', 'organism_residual'): 'STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], synonyms VARCHAR[])',
+    ('entries', 'protein_desc_residual'): 'STRUCT(allergenName STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[]), alternativeNames STRUCT(fullName STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[]), shortNames STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[], ecNumbers STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[])[], cdAntigenNames STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[], contains STRUCT(recommendedName STRUCT(fullName STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[]), shortNames STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[], ecNumbers STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[]), alternativeNames STRUCT(fullName STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[]), shortNames STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[], ecNumbers STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[])[], allergenName STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR))[], includes STRUCT(recommendedName STRUCT(fullName STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR), ecNumbers STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[], shortNames STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[]), alternativeNames STRUCT(fullName STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[]), shortNames STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[], ecNumbers STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[])[])[], innNames STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[], recommendedName STRUCT(fullName STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[]), shortNames STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[], ecNumbers STRUCT("value" VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[])[]), submissionNames STRUCT(fullName STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR), ecNumbers STRUCT(evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[])[])',
+    ('features', 'location_sequence'): 'VARCHAR',
+    ('features', 'feature_residual'): 'STRUCT(alternativeSequence STRUCT(originalSequence VARCHAR, alternativeSequences VARCHAR[]), evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], featureCrossReferences STRUCT("database" VARCHAR, id VARCHAR)[], ligand STRUCT("name" VARCHAR, id VARCHAR, "label" VARCHAR, note VARCHAR), ligandPart STRUCT("name" VARCHAR, id VARCHAR, note VARCHAR))',
+    ('publications', 'reference_residual'): 'STRUCT(citation STRUCT(address VARCHAR, bookName VARCHAR, editors VARCHAR[], institute VARCHAR, locator VARCHAR, patentNumber VARCHAR, publisher VARCHAR))',
 }
 
 
@@ -326,10 +335,11 @@ COLUMN_SOURCES: dict[tuple[str, str], str] = {
     ("entries", "uniparc_id"): "extraAttributes.uniParcId",
     ("entries", "entry_type"): "entryType",
     ("entries", "extra_attributes"): "extraAttributes",
-    ("entries", "organism"): "organism",
-    ("entries", "protein_desc"): "proteinDescription",
-    ("entries", "genes"): "genes",
-    ("entries", "keywords"): "keywords",
+    ("entries", "keyword_categories"): "keywords.category",
+    ("entries", "organism_residual"): "organism",
+    ("entries", "protein_desc_residual"): "proteinDescription",
+    ("entries", "genes_full"): "genes",
+    ("entries", "keywords_full"): "keywords",
     ("entries", "organism_hosts"): "organismHosts",
     ("entries", "gene_locations"): "geneLocations",
     # features
@@ -345,7 +355,8 @@ COLUMN_SOURCES: dict[tuple[str, str], str] = {
     ("features", "end_modifier"): "features.location.end.modifier",
     ("features", "description"): "features.description",
     ("features", "evidence_codes"): "features.evidences.evidenceCode",
-    ("features", "feature"): "features",
+    ("features", "location_sequence"): "features.location.sequence",
+    ("features", "feature_residual"): "features",
     # xrefs
     ("xrefs", "acc"): "primaryAccession",
     ("xrefs", "reviewed"): "entryType",
@@ -367,7 +378,7 @@ COLUMN_SOURCES: dict[tuple[str, str], str] = {
     ("publications", "citation_type"): "references.citation.citationType",
     ("publications", "citation_id"): "references.citation.id",
     ("publications", "publication_date"): "references.citation.publicationDate",
-    ("publications", "reference"): "references",
+    ("publications", "reference_residual"): "references",
     ("features", "feature_id"): "features.featureId",
     ("features", "original_sequence"): "features.alternativeSequence.originalSequence",
     ("features", "alternative_sequences"): "features.alternativeSequence.alternativeSequences",
@@ -415,6 +426,99 @@ def _typed(table: str, column: str, expr: str, schema_paths: set[str]) -> str:
     return f"CAST({expr} AS {COLUMN_TYPES[(table, column)]})"
 
 
+# ─── Residual structs (plan A13, DEDUPLICATION_PROPOSAL.md appendix) ─────
+# A residual holds every sub-field of a source struct that no convenience
+# column already carries.  The kept field set is computed from the discovered
+# schema (everything under the prefix minus PROMOTED), so a field UniProt adds
+# lands in the residual instead of being dropped.  A struct whose fields are
+# only *partly* promoted stays whole in the residual ("never split an array or
+# struct across layers"): features.alternativeSequence can be {} in the source,
+# which a split could not reproduce.
+#
+# (table, column): (source prefix, promoted child names)
+RESIDUALS: dict[tuple[str, str], tuple[str, frozenset[str]]] = {
+    ("entries", "organism_residual"):
+        ("organism", frozenset({"taxonId", "scientificName", "commonName", "lineage"})),
+    ("entries", "protein_desc_residual"):
+        ("proteinDescription", frozenset({"flag"})),
+    ("features", "feature_residual"):
+        ("features", frozenset({"type", "location", "description", "featureId"})),
+    ("publications", "reference_residual"):
+        ("references", frozenset({"referenceNumber", "referencePositions",
+                                  "referenceComments", "evidences", "citation"})),
+    # nested residual inside reference_residual.citation
+    ("publications", "reference_residual.citation"):
+        ("references.citation", frozenset({"citationType", "id", "title", "authors",
+                                           "authoringGroup", "publicationDate", "journal",
+                                           "volume", "firstPage", "lastPage",
+                                           "submissionDatabase", "citationCrossReferences"})),
+}
+
+# Structs whose every child is promoted into convenience columns and which
+# therefore have no residual.  A child not listed here fails the build
+# (check_promoted_paths): losslessness by construction, not by hope.
+PROMOTED_WHOLE: dict[str, frozenset[str]] = {
+    "": frozenset({"entryType", "primaryAccession", "secondaryAccessions", "uniProtkbId",
+                   "entryAudit", "annotationScore", "organism", "organismHosts",
+                   "proteinExistence", "proteinDescription", "genes", "geneLocations",
+                   "keywords", "comments", "features", "references",
+                   "uniProtKBCrossReferences", "sequence", "extraAttributes"}),
+    "entryAudit": frozenset({"firstPublicDate", "lastAnnotationUpdateDate",
+                             "lastSequenceUpdateDate", "entryVersion", "sequenceVersion"}),
+    "sequence": frozenset({"value", "length", "molWeight", "md5", "crc64"}),
+    "features.location": frozenset({"start", "end", "sequence"}),
+    "features.location.start": frozenset({"value", "modifier"}),
+    "features.location.end": frozenset({"value", "modifier"}),
+    "uniProtKBCrossReferences": frozenset({"database", "id", "properties", "isoformId", "evidences"}),
+}
+
+
+def _children(prefix: str, schema_paths: set[str]) -> set[str]:
+    """Direct child field names under a dotted prefix ('' = top level)."""
+    if prefix == "":
+        return {p for p in schema_paths if "." not in p}
+    head = prefix + "."
+    return {p[len(head):] for p in schema_paths if p.startswith(head) and "." not in p[len(head):]}
+
+
+def _residual_fields(table: str, column: str, schema_paths: set[str]) -> list[str]:
+    prefix, promoted = RESIDUALS[(table, column)]
+    return sorted(_children(prefix, schema_paths) - promoted)
+
+
+def _residual_sql(table: str, column: str, base: str, schema_paths: set[str],
+                  nested: dict[str, str] | None = None) -> str:
+    """struct_pack(...) of the residual fields of ``base`` (a SQL struct
+    expression), cast to the declared type; a typed NULL when nothing is left.
+    ``nested`` maps a promoted child name to a SQL expression for its own
+    residual (used for references.citation)."""
+    fields = _residual_fields(table, column, schema_paths)
+    parts = [f'"{f}" := {base}."{f}"' for f in fields]
+    for name, expr in (nested or {}).items():
+        if expr is not None:
+            parts.append(f'"{name}" := {expr}')
+    if not parts:
+        return _null(table, column)
+    inner = "struct_pack(" + ", ".join(parts) + ")"
+    if "." in column:                      # nested residual: type comes from the parent
+        return inner
+    return f"CAST({inner} AS {COLUMN_TYPES[(table, column)]})"
+
+
+def check_promoted_paths(schema_paths: set[str]) -> None:
+    """Abort the build if a fully promoted struct (PROMOTED_WHOLE) has a child
+    no convenience column carries.  The fix is to promote the field or move
+    the struct into a residual; never to skip the check."""
+    problems = []
+    for prefix, known in PROMOTED_WHOLE.items():
+        extra = sorted(_children(prefix, schema_paths) - known)
+        if extra:
+            problems.append(f"{prefix or '<top level>'}: {extra}")
+    if problems:
+        raise RuntimeError("Input has fields no column carries; extend the schema:\n  "
+                           + "\n  ".join(problems))
+
+
 def _declared_type_paths(con, type_str: str, prefix: str) -> set[str]:
     """Dotted sub-paths covered by a DuckDB type string, discover_schema_paths style."""
     paths: set[str] = set()
@@ -438,11 +542,24 @@ def check_declared_types(con, schema_paths: set[str]) -> None:
     type, never to skip the check."""
     problems = []
     for key, type_str in COLUMN_TYPES.items():
-        src = COLUMN_SOURCES.get(key)      # derived columns have no single source
-        if src is None or src not in schema_paths:
-            continue
-        covered = _declared_type_paths(con, type_str, src)
-        actual = {p for p in schema_paths if p.startswith(src + ".")}
+        if key in RESIDUALS:
+            src, promoted = RESIDUALS[key]
+            if src not in schema_paths:
+                continue
+            covered = _declared_type_paths(con, type_str, src)
+            actual = {p for p in schema_paths if p.startswith(src + ".")
+                      and p[len(src) + 1:].split(".")[0] not in promoted}
+            # a nested residual (e.g. reference_residual.citation) re-admits its own leftovers
+            for (t, c), (nsrc, npromoted) in RESIDUALS.items():
+                if t == key[0] and c.startswith(key[1] + ".") and nsrc.startswith(src + "."):
+                    actual |= {p for p in schema_paths if p.startswith(nsrc + ".")
+                               and p[len(nsrc) + 1:].split(".")[0] not in npromoted}
+        else:
+            src = COLUMN_SOURCES.get(key)      # derived columns have no single source
+            if src is None or src not in schema_paths:
+                continue
+            covered = _declared_type_paths(con, type_str, src)
+            actual = {p for p in schema_paths if p.startswith(src + ".")}
         extra = sorted(actual - covered)
         if extra:
             problems.append(f"{key[0]}.{key[1]} (source {src}): input has {extra} "
@@ -522,6 +639,11 @@ def _build_entries_sql(schema_paths: set[str]) -> str:
         protein_name_parts.append(f"e.proteinDescription.{_submitted_name_field}[1].fullName.value")
     protein_name_parts.append("(list_extract(COALESCE(e.proteinDescription.alternativeNames, []), 1)).fullName.value")
     protein_name_expr = "COALESCE(" + ", ".join(protein_name_parts) + ")"
+
+    # Residual structs (plan A13): what the convenience columns do not carry.
+    organism_residual = _residual_sql("entries", "organism_residual", "e.organism", schema_paths)
+    protein_desc_residual = _residual_sql("entries", "protein_desc_residual",
+                                          "e.proteinDescription", schema_paths)
 
     # go_terms (plan B.1): GO xrefs carry properties GoTerm ('F:ATP binding')
     # and GoEvidenceType ('IEA:InterPro').  aspect/term are NULL, never '',
@@ -640,6 +762,10 @@ SELECT
         COALESCE(e.keywords, []),
         x -> x.name
     )                                               AS keyword_names,
+    list_transform(
+        COALESCE(e.keywords, []),
+        x -> x.category
+    )                                               AS keyword_categories,
 
     -- Versioning
     CAST(e.entryAudit.firstPublicDate AS DATE)      AS first_public,
@@ -661,12 +787,13 @@ SELECT
     -- Extra attributes (countByCommentType, countByFeatureType, uniParcId)
     e.extraAttributes                               AS extra_attributes,
 
-    -- Full nested structures (preserved for power users)
+    -- Residual / full nested structures (plan A13): residuals hold only what
+    -- the convenience columns do not; bin/reconstruct.py rebuilds the JSON.
     -- features, xrefs, comments, and publications are in their own tables
-    e.organism                                      AS organism,
-    e.proteinDescription                            AS protein_desc,
-    e.genes                                         AS genes,
-    e.keywords                                      AS keywords,
+    {organism_residual}                             AS organism_residual,
+    {protein_desc_residual}                         AS protein_desc_residual,
+    e.genes                                         AS genes_full,
+    e.keywords                                      AS keywords_full,
     {organism_hosts}                                 AS organism_hosts,
     {gene_locations}                                 AS gene_locations
 
@@ -703,6 +830,8 @@ def _build_features_sql(schema_paths: set[str]) -> str:
     ligand_id = _typed("features", "ligand_id", "unnest.ligand.id", schema_paths)
     ligand_label = _typed("features", "ligand_label", "unnest.ligand.label", schema_paths)
     ligand_note = _typed("features", "ligand_note", "unnest.ligand.note", schema_paths)
+    location_sequence = _typed("features", "location_sequence", "unnest.location.sequence", schema_paths)
+    feature_residual = _residual_sql("features", "feature_residual", "unnest", schema_paths)
 
     return f"""
 SELECT
@@ -722,6 +851,7 @@ SELECT
     {feature_id}                                    AS feature_id,
 
     {evidence_codes}                                AS evidence_codes,
+    {location_sequence}                             AS location_sequence,
 
     {original_seq}                                  AS original_sequence,
     {alt_seqs}                                      AS alternative_sequences,
@@ -731,8 +861,10 @@ SELECT
     {ligand_label}                                  AS ligand_label,
     {ligand_note}                                   AS ligand_note,
 
-    -- Full original nested struct (lossless round-trip)
-    unnest                                          AS feature
+    -- Residual (plan A13): evidences, featureCrossReferences, ligand, ligandPart,
+    -- alternativeSequence and anything UniProt adds; bin/reconstruct.py merges
+    -- it with the convenience columns above.
+    {feature_residual}                              AS feature_residual
 
 FROM (
     SELECT
@@ -868,6 +1000,12 @@ def _build_publications_sql(schema_paths: set[str]) -> str:
     ref_positions = _typed("publications", "reference_positions", "unnest.referencePositions", schema_paths)
     ref_comments = _typed("publications", "reference_comments", "unnest.referenceComments", schema_paths)
     ref_evidences = _typed("publications", "evidences", "unnest.evidences", schema_paths)
+    citation_residual = (
+        _residual_sql("publications", "reference_residual.citation", "unnest.citation", schema_paths)
+        if _residual_fields("publications", "reference_residual.citation", schema_paths) else None
+    )
+    reference_residual = _residual_sql("publications", "reference_residual", "unnest", schema_paths,
+                                       nested={"citation": citation_residual})
 
     return f"""
 SELECT
@@ -894,7 +1032,7 @@ SELECT
     {ref_evidences}                                  AS evidences,
 
     -- Full original nested struct (lossless round-trip)
-    unnest                                          AS reference
+    {reference_residual}                            AS reference_residual
 
 FROM (
     SELECT
@@ -1029,13 +1167,14 @@ TABLE_META = {
                 "gene_synonyms", "alt_protein_names", "protein_flag", "ec_numbers",
                 "protein_existence", "annotation_score", "seq_mass", "seq_md5", "seq_crc64",
                 "go_ids", "go_terms", "xref_dbs", "proteome_ids", "keyword_ids", "keyword_names",
+                "keyword_categories",
                 "first_public", "last_modified", "last_seq_modified",
                 "entry_version", "seq_version",
                 "feature_count", "xref_count", "comment_count", "reference_count", "pubmed_ids",
                 "uniparc_id", "entry_type", "extra_attributes",
             ],
             "nested": [
-                "organism", "protein_desc", "genes", "keywords",
+                "organism_residual", "protein_desc_residual", "genes_full", "keywords_full",
                 "organism_hosts", "gene_locations",
             ],
         },
@@ -1048,11 +1187,11 @@ TABLE_META = {
             "convenience": [
                 "acc", "reviewed", "taxid", "organism_name", "seq_length",
                 "type", "start_pos", "end_pos", "start_modifier", "end_modifier",
-                "description", "feature_id", "evidence_codes",
+                "description", "feature_id", "evidence_codes", "location_sequence",
                 "original_sequence", "alternative_sequences",
                 "ligand_name", "ligand_id", "ligand_label", "ligand_note",
             ],
-            "nested": ["feature"],
+            "nested": ["feature_residual"],
         },
     },
     "xrefs": {
@@ -1092,7 +1231,7 @@ TABLE_META = {
                 "submission_database", "citation_xrefs",
                 "reference_positions", "reference_comments", "evidences",
             ],
-            "nested": ["reference"],
+            "nested": ["reference_residual"],
         },
     },
 }
@@ -1304,6 +1443,7 @@ COLUMN_DESCRIPTIONS = {
     ("entries", "proteome_ids"):       "Distinct UniProt proteome ids (UP…) from cross-references, sorted.",
     ("entries", "keyword_ids"):        "UniProt keyword IDs (e.g. KW-0181).",
     ("entries", "keyword_names"):      "UniProt keyword names (e.g. 'Complete proteome').",
+    ("entries", "keyword_categories"): "Keyword categories aligned with keyword_ids (e.g. Molecular function, Biological process).",
     ("entries", "first_public"):       "Date the entry was first made public in UniProtKB.",
     ("entries", "last_modified"):      "Date of the last annotation update.",
     ("entries", "last_seq_modified"):  "Date of the last sequence update.",
@@ -1317,10 +1457,10 @@ COLUMN_DESCRIPTIONS = {
     ("entries", "uniparc_id"):         "UniParc identifier (UPI) linking to the sequence archive.",
     ("entries", "entry_type"):         "Raw entryType string (e.g. 'UniProtKB reviewed (Swiss-Prot)'). Lossless.",
     ("entries", "extra_attributes"):   "Nested struct with countByCommentType, countByFeatureType, uniParcId.",
-    ("entries", "organism"):           "Full nested organism struct from the original JSON (lossless).",
-    ("entries", "protein_desc"):       "Full nested proteinDescription struct (lossless).",
-    ("entries", "genes"):              "Full nested genes array (lossless). Contains all gene naming blocks.",
-    ("entries", "keywords"):           "Full nested keywords array (lossless).",
+    ("entries", "organism_residual"): "Organism fields not in the convenience columns (synonyms, evidences); merge with taxid, organism_name, organism_common, lineage to rebuild organism.",
+    ("entries", "protein_desc_residual"): "proteinDescription minus flag (kept whole: recommendedName, alternativeNames, submissionNames, contains, includes, ...); protein_name / alt_protein_names / ec_numbers are projections of it.",
+    ("entries", "genes_full"): "Full genes array (geneName, synonyms, orfNames, orderedLocusNames with evidences); gene_names / gene_synonyms are projections of it.",
+    ("entries", "keywords_full"): "Full keywords array (id, name, category, evidences); keyword_ids / keyword_names / keyword_categories are projections of it.",
     ("entries", "organism_hosts"):     "Full nested organismHosts array (for viruses — host organisms). May be null.",
     ("entries", "gene_locations"):     "Full nested geneLocations array (mitochondrial, plastid, etc.). May be null.",
 
@@ -1338,13 +1478,14 @@ COLUMN_DESCRIPTIONS = {
     ("features", "description"):       "Free-text description of the feature annotation.",
     ("features", "feature_id"):        "UniProt feature identifier (e.g. PRO_0000001234). May be null.",
     ("features", "evidence_codes"):    "List of evidence codes (e.g. ECO:0000269) supporting this feature.",
+    ("features", "location_sequence"): "Sequence the feature location refers to (isoform or alternative sequence), when not the canonical one.",
     ("features", "original_sequence"): "Original amino acids before the variant/mutation. Null for non-variant features.",
     ("features", "alternative_sequences"): "List of alternative amino acid sequences for variant features.",
     ("features", "ligand_name"):       "Name of the bound ligand (for Binding site features). May be null.",
     ("features", "ligand_id"):         "ChEBI or other identifier for the ligand. May be null.",
     ("features", "ligand_label"):      "Label distinguishing multiple ligands in the same entry. May be null.",
     ("features", "ligand_note"):       "Additional note about the ligand binding. May be null.",
-    ("features", "feature"):           "Full nested feature struct from the original JSON (lossless).",
+    ("features", "feature_residual"): "Feature fields not in the convenience columns: evidences (full), featureCrossReferences, ligand, ligandPart, alternativeSequence. bin/reconstruct.py merges it with the convenience columns.",
 
     # ── xrefs ──
     ("xrefs", "acc"):                  "Parent entry's primary accession. Foreign key → entries.acc.",
@@ -1384,7 +1525,7 @@ COLUMN_DESCRIPTIONS = {
     ("publications", "reference_positions"): "List of reference position strings (e.g. 'NUCLEOTIDE SEQUENCE').",
     ("publications", "reference_comments"): "List of reference comment structs (scope, source, etc.).",
     ("publications", "evidences"):    "Evidence records for this reference. May be null.",
-    ("publications", "reference"):    "Full nested reference struct from the original JSON (lossless).",
+    ("publications", "reference_residual"): "Reference fields not in the convenience columns, including citation extras (bookName, editors, publisher, address, institute, patentNumber, locator). bin/reconstruct.py merges it with the convenience columns.",
 }
 
 
@@ -1644,6 +1785,7 @@ def main():
                 sys.exit(1)
             # Refuse to build if a declared type would drop a nested field (plan G.2).
             check_declared_types(con, schema_paths)
+            check_promoted_paths(schema_paths)
         else:
             schema_paths = set()
 

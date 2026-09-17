@@ -188,7 +188,7 @@ zstd -dc sorted.jsonl.zst | head -10 | jq '.primaryAccession, .organism.scientif
 
 ### Schema design
 
-The lake adopts a **denormalized-first + full nested** design. Each table has two layers: flattened convenience columns (e.g. `gene_names`, `protein_name`, `go_ids`) that cover 90% of use cases with simple SQL, and full nested structures (e.g. `genes`, `protein_desc`, `comment`, `feature`, `reference`) that preserve all upstream data for lossless JSONL reconstruction.
+The lake adopts a **denormalized-first + residual** design. Each table has two layers: flattened convenience columns (e.g. `gene_names`, `protein_name`, `go_ids`) that cover 90% of use cases with simple SQL, and residual / full nested columns (`organism_residual`, `protein_desc_residual`, `genes_full`, `keywords_full`, `feature_residual`, `comment`, `reference_residual`) that hold everything the convenience columns do not. Residual structs hold only what the convenience columns do not; `bin/reconstruct.py` rebuilds the original JSON from both, and the validator proves it on every release (check 16).
 
 No UniProtKB data is discarded. Users needing isoforms, GO aspects, EC numbers from alternative names, multi-paragraph comments, or evidence codes can always query the nested columns. Parquet's columnar storage means queries touching 5 of 40+ columns only read those 5 from disk.
 
@@ -207,13 +207,13 @@ Child tables (`features`, `xrefs`, `comments`, `publications`) include denormali
 - Versioning: `first_public`, `last_modified`, `last_seq_modified`, `entry_version`, `seq_version`
 - Counts: `feature_count`, `xref_count`, `comment_count`, `reference_count`, `pubmed_ids` (distinct, numerically sorted, stored as strings), `uniparc_id`
 - Lossless: `extra_attributes` (countByCommentType, countByFeatureType)
-- Full nested: `organism`, `protein_desc`, `genes`, `keywords`, `organism_hosts`, `gene_locations`
+- Residual: `organism_residual` (synonyms, evidences), `protein_desc_residual` (proteinDescription minus `flag`, kept whole), `genes_full`, `keywords_full`, `organism_hosts`, `gene_locations`; `keyword_categories` is a projection of `keywords_full`
 
 **features** — one row per positional annotation:
 
 - `acc`, `reviewed`, `taxid`, `organism_name`, `seq_length`
 - Flattened: `type`, `start_pos`, `end_pos`, `start_modifier`, `end_modifier`, `description`, `feature_id`, `evidence_codes`, `original_sequence`, `alternative_sequences`, `ligand_name`, `ligand_id`, `ligand_label`, `ligand_note`
-- Full nested: `feature` (preserves evidences with source/id, featureCrossReferences, ligandPart)
+- Residual: `feature_residual` (evidences with source/id, featureCrossReferences, ligand, ligandPart, alternativeSequence); `location_sequence` is promoted
 
 **xrefs** — one row per cross-reference:
 
@@ -230,7 +230,7 @@ Child tables (`features`, `xrefs`, `comments`, `publications`) include denormali
 
 - `acc`, `reviewed`, `taxid`
 - Flattened: `reference_number`, `citation_type`, `citation_id`, `title`, `authors`, `authoring_group`, `publication_date`, `journal`, `volume`, `first_page`, `last_page`, `submission_database`, `citation_xrefs`, `reference_positions`, `reference_comments`, `evidences`
-- Full nested: `reference` (preserves complete citation structure)
+- Residual: `reference_residual` (citation extras: bookName, editors, publisher, address, institute, patentNumber, locator)
 
 </details>
 

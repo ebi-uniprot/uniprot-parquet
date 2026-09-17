@@ -294,6 +294,8 @@ class TestSchema:
             "feature_count", "xref_count", "comment_count", "reference_count",
             "entry_type", "extra_attributes",
             "gene_name", "go_terms", "proteome_ids", "pubmed_ids", "division",
+            "keyword_categories", "organism_residual", "protein_desc_residual",
+            "genes_full", "keywords_full",
         }
         missing = required - names
         assert not missing, f"Missing columns: {missing}"
@@ -331,7 +333,7 @@ class TestSchema:
         names = set(features_ds.schema.names)
         required = {
             "acc", "reviewed", "taxid", "organism_name", "seq_length",
-            "type", "start_pos", "end_pos", "description", "feature",
+            "type", "start_pos", "end_pos", "description", "feature_residual", "location_sequence",
         }
         missing = required - names
         assert not missing, f"Missing columns: {missing}"
@@ -359,7 +361,7 @@ class TestSchema:
         required = {
             "acc", "reviewed", "taxid", "citation_type", "citation_id",
             "title", "authors", "publication_date",
-            "reference_number", "evidences", "reference",
+            "reference_number", "evidences", "reference_residual",
         }
         missing = required - names
         assert not missing, f"Missing columns: {missing}"
@@ -483,20 +485,20 @@ class TestDataIntegrity:
         arrow = entries_ds.to_table(columns=["extra_attributes"])
         assert arrow.column("extra_attributes").null_count < arrow.num_rows
 
-    def test_features_have_feature_struct(self, features_ds):
-        """The feature column preserves the full original nested structure."""
-        arrow = features_ds.to_table(columns=["feature"])
-        assert arrow.column("feature").null_count == 0
+    def test_features_have_residual_column(self, features_ds):
+        """feature_residual exists (it may be all-NULL for simple entries)."""
+        assert "feature_residual" in features_ds.schema.names
+        assert str(features_ds.schema.field("feature_residual").type).startswith("struct<")
 
     def test_publications_have_reference_number(self, publications_ds):
         """reference_number preserves the ordinal position from the original JSON."""
         arrow = publications_ds.to_table(columns=["reference_number"])
         assert arrow.column("reference_number").null_count == 0
 
-    def test_publications_have_reference_struct(self, publications_ds):
-        """The reference column preserves the full original nested structure."""
-        arrow = publications_ds.to_table(columns=["reference"])
-        assert arrow.column("reference").null_count == 0
+    def test_publications_have_residual_column(self, publications_ds):
+        """reference_residual exists (it may be all-NULL for simple entries)."""
+        assert "reference_residual" in publications_ds.schema.names
+        assert str(publications_ds.schema.field("reference_residual").type).startswith("struct<")
 
     def test_comments_have_comment_struct(self, comments_ds):
         """The comment column preserves the full original nested structure."""

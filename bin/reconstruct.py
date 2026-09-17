@@ -84,6 +84,77 @@ def _date(v):
     return None if v is None else str(v)
 
 
+def _compact(d: dict) -> dict:
+    """Drop None-valued keys."""
+    return {k: v for k, v in d.items() if v is not None}
+
+
+def _residual(v) -> dict:
+    """A residual struct as a dict of its non-None fields ({} when NULL)."""
+    return {k: x for k, x in (v or {}).items() if x is not None}
+
+
+def _organism(e: dict) -> dict:
+    return _compact({
+        "taxonId": e.get("taxid"),
+        "scientificName": e.get("organism_name"),
+        "commonName": e.get("organism_common"),
+        "lineage": e.get("lineage"),
+        **_residual(e.get("organism_residual")),
+    })
+
+
+def _protein_description(e: dict):
+    """proteinDescription is kept whole in the residual except ``flag``
+    (protein_name / alt_protein_names / ec_numbers are projections)."""
+    return _compact({"flag": e.get("protein_flag"), **_residual(e.get("protein_desc_residual"))})
+
+
+def _feature(r: dict) -> dict:
+    location = {
+        "start": _compact({"value": r.get("start_pos"), "modifier": r.get("start_modifier")}),
+        "end": _compact({"value": r.get("end_pos"), "modifier": r.get("end_modifier")}),
+        "sequence": r.get("location_sequence"),
+    }
+    # evidence_codes, original_sequence, alternative_sequences and ligand_* are
+    # projections of the residual's evidences / alternativeSequence / ligand;
+    # they are never read here (no positional zipping).
+    return _compact({
+        "type": r.get("type"),
+        "location": _compact(location),
+        "description": r.get("description"),
+        "featureId": r.get("feature_id"),
+        **_residual(r.get("feature_residual")),
+    })
+
+
+def _reference(r: dict) -> dict:
+    residual = _residual(r.get("reference_residual"))
+    citation = _compact({
+        "citationType": r.get("citation_type"),
+        "id": r.get("citation_id"),
+        "title": r.get("title"),
+        "authors": r.get("authors"),
+        "authoringGroup": r.get("authoring_group"),
+        "publicationDate": r.get("publication_date"),
+        "journal": r.get("journal"),
+        "volume": r.get("volume"),
+        "firstPage": r.get("first_page"),
+        "lastPage": r.get("last_page"),
+        "submissionDatabase": r.get("submission_database"),
+        "citationCrossReferences": r.get("citation_xrefs"),
+        **_residual(residual.pop("citation", None)),
+    })
+    return _compact({
+        "referenceNumber": r.get("reference_number"),
+        "citation": citation,
+        "referencePositions": r.get("reference_positions"),
+        "referenceComments": r.get("reference_comments"),
+        "evidences": r.get("evidences"),
+        **residual,
+    })
+
+
 def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
                       publication_rows=()) -> dict:
     """Rebuild the UniProtKB JSON entry from lake rows.
@@ -91,7 +162,10 @@ def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
     ``entry_row`` is one ``entries`` row as ``{column: python value}``; the
     other arguments are lists of child rows for the same accession (any
     order).  Keys whose value is None are dropped, as are None-valued fields
-    inside structs (``normalize_value``).
+    inside structs (``normalize_value``).  Convenience columns that are pure
+    projections of a residual field (evidence_codes, ligand_*, gene_names,
+    keyword_ids, ...) are never read: the residual or full struct is the
+    source of truth, so nothing is zipped positionally.
     """
     e = entry_row
     out = {
@@ -107,13 +181,13 @@ def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
             "sequenceVersion": e.get("seq_version"),
         },
         "annotationScore": e.get("annotation_score"),
-        "organism": e.get("organism"),
+        "organism": _organism(e),
         "organismHosts": e.get("organism_hosts"),
         "proteinExistence": e.get("protein_existence"),
-        "proteinDescription": e.get("protein_desc"),
-        "genes": e.get("genes"),
+        "proteinDescription": _protein_description(e),
+        "genes": e.get("genes_full"),
         "geneLocations": e.get("gene_locations"),
-        "keywords": e.get("keywords"),
+        "keywords": e.get("keywords_full"),
         "sequence": {
             "value": e.get("sequence"),
             "length": e.get("seq_length"),
@@ -124,7 +198,7 @@ def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
         "extraAttributes": e.get("extra_attributes"),
     }
     if feature_rows:
-        out["features"] = [r["feature"] for r in feature_rows]
+        out["features"] = [_feature(r) for r in feature_rows]
     if xref_rows:
         out["uniProtKBCrossReferences"] = [
             {"database": r["database"], "id": r["id"], "properties": r.get("properties"),
@@ -137,7 +211,7 @@ def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
             for r in comment_rows
         ]
     if publication_rows:
-        out["references"] = [r["reference"] for r in publication_rows]
+        out["references"] = [_reference(r) for r in publication_rows]
     return normalize_value({k: v for k, v in out.items() if v is not None})
 
 
