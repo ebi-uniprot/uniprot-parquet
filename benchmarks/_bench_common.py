@@ -84,6 +84,7 @@ class _CountingHandler(http.server.SimpleHTTPRequestHandler):
     ranges) that counts requests and bytes served."""
     stats = {"requests": 0, "bytes": 0}
     lock = threading.Lock()
+    protocol_version = "HTTP/1.1"      # keep-alive: DuckDB reuses one connection per file
 
     def log_message(self, *a):
         pass

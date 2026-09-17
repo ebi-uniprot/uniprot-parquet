@@ -1140,7 +1140,9 @@ def check_accession_map(report, lake_dir):
 
 
 def check_partitions(report, lake_dir):
-    """Hive partitions agree with the stored column they mirror (plan D.3):
+    """Hive partitions agree with the stored column they mirror (plan D.3).
+    Uses stats_min_value / stats_max_value: DuckDB's stats_min / stats_max are
+    the legacy Parquet fields, which PyArrow omits for string columns.
     every row group under review_status=swissprot has reviewed min = max =
     true (trembl: false), per-partition row counts match the manifest, the
     two sides sum to the table count, and swissprot files precede trembl
@@ -1163,8 +1165,8 @@ def check_partitions(report, lake_dir):
         for side in key["values"]:
             path = os.path.join(lake_dir, table_name, f"{key['name']}={side}", "*.parquet")
             bad, rows = duckdb.sql(f"""
-                SELECT count(*) FILTER (WHERE lower(stats_min) != '{expected_flag[side]}'
-                                           OR lower(stats_max) != '{expected_flag[side]}'),
+                SELECT count(*) FILTER (WHERE lower(stats_min_value) != '{expected_flag[side]}'
+                                           OR lower(stats_max_value) != '{expected_flag[side]}'),
                        coalesce(sum(row_group_num_rows), 0)
                 FROM parquet_metadata('{path}') WHERE path_in_schema = '{derived}'
             """).fetchone()

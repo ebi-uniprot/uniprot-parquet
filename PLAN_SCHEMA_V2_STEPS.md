@@ -180,7 +180,7 @@ python -m pytest tests/ -q
    ```
    Bytes per entry per side = table bytes attributable to that side ÷ entries on that side. Because the slice's files are not yet single-sided, attribute row groups to a side by `min(reviewed) = max(reviewed)` per row group (`parquet_metadata` `stats_min`/`stats_max` on the `reviewed` / `from_reviewed` column); mixed row groups are at most one per table, ignore them. Extrapolate to 248M entries at the current Swiss-Prot/TrEMBL ratio (~570k / ~248M).
 4. Footer bytes for `entries`: `sum(pq.read_metadata(f).serialized_size for f in files)`.
-5. Also record now, for D.5's revisit condition: bytes of the `entries` files that contain any `taxid = 9606` row group (from `parquet_metadata` `stats_min <= 9606 <= stats_max` on `taxid`) versus the compressed bytes of the human row groups alone. The ratio goes in the Results log D.5 row.
+5. Also record now, for D.5's revisit condition: bytes of the `entries` files that contain any `taxid = 9606` row group (from `parquet_metadata` `stats_min_value <= 9606 <= stats_max_value` on `taxid`) versus the compressed bytes of the human row groups alone. The ratio goes in the Results log D.5 row.
 6. Run the plan's Phase 0.3 query on the slice and record the ratio.
 
 **Done when** the F.1 table in the plan is filled, `AUDIT.md` §6.1 cites it, and the Results-log rows for F.1, 0.3 and the D.5 ratio are filled.
