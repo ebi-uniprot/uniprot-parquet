@@ -1466,7 +1466,19 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
                    f"({elapsed:.0f}s, {total_rows / elapsed if elapsed else 0:,.0f} rows/s)")
 
         close_writer()
-        for tmp_path, final_path, _ in pending:            # all-or-nothing publish
+        # All-or-nothing publish.  First drop Parquet files a previous run left
+        # under the partition directories that this run did not produce (a
+        # rebuild with a larger file target or a different zstd level writes
+        # fewer files); glob readers would otherwise see duplicated rows.
+        new_finals = {final for _, final, _ in pending}
+        for side in PARTITION_VALUES.values():
+            d = part_dir(side)
+            if os.path.isdir(d):
+                for name in os.listdir(d):
+                    path = os.path.join(d, name)
+                    if name.endswith(".parquet") and path not in new_finals:
+                        os.remove(path)
+        for tmp_path, final_path, _ in pending:
             shutil.move(tmp_path, final_path)
         for side in PARTITION_VALUES.values():
             tmp = os.path.join(part_dir(side), ".tmp")
@@ -1722,6 +1734,12 @@ COLUMN_DESCRIPTIONS = {
     ("publications", "evidences"):    "Evidence records for this reference. May be null.",
     ("publications", "reference_residual"): "Reference fields not in the convenience columns, including citation extras (bookName, editors, publisher, address, institute, patentNumber, locator). bin/reconstruct.py merges it with the convenience columns.",
 
+    # --variant-children builds (benchmarks/VARIANT_EVALUATION.md): one VARIANT column
+    ("features", "data"):     "Whole feature as a DuckDB VARIANT (--variant-children builds only).",
+    ("xrefs", "data"):        "Whole cross-reference as a DuckDB VARIANT (--variant-children builds only).",
+    ("comments", "data"):     "Whole comment as a DuckDB VARIANT (--variant-children builds only).",
+    ("publications", "data"): "Whole reference as a DuckDB VARIANT (--variant-children builds only).",
+
     # accession_map
     ("accession_map", "acc"):         "Primary or secondary accession (the lookup key). A secondary accession can map to more than one primary (split entries).",
     ("accession_map", "primary_acc"): "Current primary accession the key resolves to (FK → entries.acc).",
@@ -1930,7 +1948,9 @@ def main():
         "--variant-children", action="store_true",
         help="Use DuckDB VARIANT columns on child tables (features, xrefs, "
              "comments, publications) instead of hand-extracted convenience "
-             "columns.  Requires DuckDB ≥1.5 (VARIANT is built-in).",
+             "columns.  Evaluation only (benchmarks/VARIANT_EVALUATION.md); "
+             "requires DuckDB ≥1.5 and a PyArrow that can write VARIANT "
+             "(PyArrow 23 cannot: 'Unsupported Arrow type VARIANT').",
     )
     parser.add_argument(
         "--only", default=None,

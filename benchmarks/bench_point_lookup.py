@@ -122,10 +122,11 @@ def run_workloads(con, lake, base, accessions, label, stats=None):
             preds = " OR ".join(f"(reviewed = {str(r).lower()} AND taxid = {t} AND acc = {q(a)})" for r, t, a in keys)
             two = f"SELECT {cols} FROM read_parquet({src[table]}, hive_partitioning = true) WHERE {preds}" if keys else single
             for form, sql in (("single", single), ("two_step", two)):
+                con.sql(sql).fetchall()                  # warm-up, outside the counted window
                 if stats is not None:
                     stats["requests"] = 0
                     stats["bytes"] = 0
-                timing = time_query(con, sql, warmup=1, runs=5)
+                timing = time_query(con, sql, warmup=0, runs=5)
                 row = {"n": n, "table": table, "form": form, **timing}
                 if stats is not None:
                     row["requests_per_run"] = round(stats["requests"] / 5)
@@ -144,11 +145,12 @@ def run_workloads(con, lake, base, accessions, label, stats=None):
     # C.3: default seven columns for one organism
     taxid = con.sql(f"SELECT taxid FROM read_parquet({src['entries']}, hive_partitioning = true) "
                     f"WHERE acc = {q(accessions[0])}").fetchone()[0]
+    sql = f"SELECT {DEFAULT7} FROM read_parquet({src['entries']}, hive_partitioning = true) WHERE taxid = {taxid}"
+    con.sql(sql).fetchall()                              # warm-up, outside the counted window
     if stats is not None:
         stats["requests"] = 0
         stats["bytes"] = 0
-    sql = f"SELECT {DEFAULT7} FROM read_parquet({src['entries']}, hive_partitioning = true) WHERE taxid = {taxid}"
-    timing = time_query(con, sql, warmup=1, runs=3)
+    timing = time_query(con, sql, warmup=0, runs=3)
     c3 = {"taxid": taxid, **timing}
     if stats is not None:
         c3["requests_per_run"] = round(stats["requests"] / 3)

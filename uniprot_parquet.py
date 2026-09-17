@@ -247,8 +247,8 @@ def connect(
             con.sql(_view_sql(table, f"'{base}/{table}/*/*.parquet'"))
     else:
         for table, info in m.get("tables", {}).items():
-            files = [f"{base}/{table}/{rel}" for rel in info.get("files", [])]
-            if not files or not _table_present(con, table, files):
+            files = _present_files(con, base, table, info.get("files", []))
+            if not files:
                 con.sql(_missing_view_sql(table, [c["name"] for c in info.get("columns", [])]))
                 continue
             file_list = "[" + ", ".join(f"'{f}'" for f in files) + "]"
@@ -268,31 +268,56 @@ def _is_remote(base: str) -> bool:
 
 def _read_manifest(base: str) -> dict | None:
     """manifest.json from a local dir, http(s) URL or s3 URI; None if unreachable."""
+    return _read_json(base, "manifest.json")
+
+
+def _remote_readable(con, url: str) -> bool:
+    try:
+        con.sql(f"SELECT 1 FROM read_parquet('{url}') LIMIT 0")
+        return True
+    except (duckdb.IOException, duckdb.HTTPException, duckdb.Error):
+        return False
+
+
+def _present_files(con, base: str, table: str, rels: list[str]) -> list[str]:
+    """The table's files that exist in *this* copy of the lake, as full paths.
+
+    A copy may hold a whole table, one partition (a Swiss-Prot-only rsync) or
+    a few files (a per-organism download from files_for_taxid): locally every
+    file is checked; remotely one probe per partition directory decides for
+    that directory (a per-file probe would cost one request per file).
+    """
+    if not rels:
+        return []
+    if not _is_remote(base):
+        return [f"{base}/{table}/{rel}" for rel in rels
+                if os.path.exists(os.path.join(base, table, rel))]
+    present, probed = [], {}
+    for rel in rels:
+        part = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        if part not in probed:
+            probed[part] = _remote_readable(con, f"{base}/{table}/{rel}")
+        if probed[part]:
+            present.append(f"{base}/{table}/{rel}")
+    return present
+
+
+def _read_json(base: str, name: str) -> dict | None:
+    """A JSON sidecar (manifest.json, datapackage.json) from a local dir,
+    http(s) URL or s3 URI; None if unreachable or invalid."""
     try:
         if base.startswith(("http://", "https://")):
             import urllib.request
-            with urllib.request.urlopen(f"{base}/manifest.json", timeout=30) as r:
+            with urllib.request.urlopen(f"{base}/{name}", timeout=30) as r:
                 return json.loads(r.read())
         if base.startswith("s3://"):
             con = duckdb.connect()
             con.sql("INSTALL httpfs; LOAD httpfs;")
-            return json.loads(con.sql(f"SELECT content FROM read_text('{base}/manifest.json')").fetchone()[0])
-        with open(os.path.join(base, "manifest.json")) as f:
+            return json.loads(con.sql(f"SELECT content FROM read_text('{base}/{name}')").fetchone()[0])
+        with open(os.path.join(base, name)) as f:
             return json.load(f)
     except Exception:
         return None
-
-
-def _table_present(con, table: str, files: list[str]) -> bool:
-    """Is the table's first file readable from this lake copy?"""
-    first = files[0]
-    if not _is_remote(first):
-        return os.path.exists(first)
-    try:
-        con.sql(f"SELECT 1 FROM read_parquet('{first}') LIMIT 0")
-        return True
-    except (duckdb.IOException, duckdb.HTTPException, duckdb.Error):
-        return False
 
 
 def manifest(lake_path: str) -> dict:
@@ -333,13 +358,15 @@ def manifest(lake_path: str) -> dict:
 
 
 def tables(lake_path: str) -> dict[str, dict]:
-    """Return {table_name: {"row_count": n, "present": bool}} from the manifest.
+    """Return {table_name: {"row_count", "present", "files_present", "files_total"}}.
 
-    ``present`` says whether the table's files are in *this* copy of the lake
-    (a partial download may hold entries/ and accession_map/ only).
+    ``present`` says whether any of the table's files are in *this* copy of
+    the lake (a partial download may hold entries/ and accession_map/ only, or
+    only the review_status=swissprot partitions); ``files_present`` vs
+    ``files_total`` shows a partial table.
 
     >>> tables("/data/uniprot/2026_01/lake")
-    {'entries': {'row_count': 248799253, 'present': True}, 'features': {...}, ...}
+    {'entries': {'row_count': 248799253, 'present': True, 'files_present': 1200, 'files_total': 1200}, ...}
     """
     base = lake_path.rstrip("/")
     m = manifest(base)
@@ -348,9 +375,10 @@ def tables(lake_path: str) -> dict[str, dict]:
         con.sql("INSTALL httpfs; LOAD httpfs;")
     out = {}
     for name, info in m.get("tables", {}).items():
-        files = [f"{base}/{name}/{rel}" for rel in info.get("files", [])]
-        out[name] = {"row_count": info["row_count"],
-                     "present": bool(files) and _table_present(con, name, files)}
+        rels = info.get("files", [])
+        present = _present_files(con, base, name, rels)
+        out[name] = {"row_count": info["row_count"], "present": bool(present),
+                     "files_present": len(present), "files_total": len(rels)}
     return out
 
 
@@ -463,13 +491,8 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
 
 
 def _load_datapackage(lake_path: str) -> dict | None:
-    """Load datapackage.json if it exists, else return None."""
-    dp_path = os.path.join(lake_path, "datapackage.json")
-    try:
-        with open(dp_path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+    """Load datapackage.json (local, http(s) or s3) if it exists, else None."""
+    return _read_json(lake_path.rstrip("/"), "datapackage.json")
 
 
 def datapackage(lake_path: str) -> dict:

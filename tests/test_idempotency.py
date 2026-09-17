@@ -20,6 +20,12 @@ BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
 
 
+def _expected_entries_from_jsonl(jsonl_path):
+    import zstandard as zstd
+    with open(jsonl_path, "rb") as f:
+        return zstd.ZstdDecompressor().stream_reader(f).read().count(b"\n")
+
+
 def _expected_entries(fixture_path):
     """Derive expected entry count from the fixture."""
     with gzip.open(fixture_path, "rt") as f:
@@ -132,3 +138,19 @@ def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
             assert mtime2 == mtimes1[name], (
                 f"{name}: file was modified — table was rewritten instead of skipped"
             )
+
+
+def test_rebuild_with_fewer_files_removes_stale_ones(small_jsonl, tmp_path):
+    """A rebuild that writes fewer files per partition deletes the previous run's extras."""
+    outdir = str(tmp_path / "lake")
+    _run_transform(small_jsonl, outdir, extra_args=["--target-file-bytes", "200000"])
+    many = table_files(outdir, "entries")
+    assert len(many) > 2, "expected several small files per partition"
+    _run_transform(small_jsonl, outdir)                  # default target: one file per partition
+    few = table_files(outdir, "entries")
+    assert len(few) == 2, few
+    with open(os.path.join(outdir, "manifest.json")) as f:
+        manifest = json.load(f)
+    assert sorted(os.path.relpath(f, os.path.join(outdir, "entries")) for f in few) == \
+        sorted(manifest["tables"]["entries"]["files"])
+    assert _get_row_counts(outdir)["entries"] == _expected_entries_from_jsonl(small_jsonl)

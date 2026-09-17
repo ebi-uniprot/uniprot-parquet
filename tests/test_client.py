@@ -65,6 +65,40 @@ def test_connect_entries_only(full_lake, fixture_acc, tmp_path):
     assert t["features"]["row_count"] == m["tables"]["features"]["row_count"]
 
 
+def test_connect_swissprot_only_copy(full_lake, tmp_path):
+    """A review_status=swissprot-only rsync (all tables, one partition each) works."""
+    lake = str(tmp_path / "sp")
+    m = up.manifest(full_lake)
+    for name, info in m["tables"].items():
+        for rel in info["files"]:
+            if rel.startswith("review_status=swissprot/"):
+                os.makedirs(os.path.dirname(os.path.join(lake, name, rel)), exist_ok=True)
+                shutil.copy(os.path.join(full_lake, name, rel), os.path.join(lake, name, rel))
+    for f in ("manifest.json", "datapackage.json"):
+        shutil.copy(os.path.join(full_lake, f), os.path.join(lake, f))
+    con = up.connect(lake)
+    sp = m["tables"]["entries"]["partitioning"]["keys"][0]["row_counts"]["swissprot"]
+    assert con.sql("SELECT count(*) FROM entries").fetchone()[0] == sp
+    assert con.sql("SELECT count(*) FROM entries WHERE NOT reviewed").fetchone()[0] == 0
+    assert con.sql("SELECT count(*) FROM features").fetchone()[0] > 0
+    t = up.tables(lake)["entries"]
+    assert t["present"] and t["files_present"] < t["files_total"]
+
+
+def test_connect_files_for_taxid_copy(full_lake, fixture_acc, tmp_path):
+    """A per-organism download (files_for_taxid) of entries + accession_map works."""
+    lake = str(tmp_path / "taxid")
+    files = up.files_for_taxid(full_lake, fixture_acc["taxid"]) + \
+        up.files_for_taxid(full_lake, fixture_acc["taxid"], table="accession_map")
+    for rel in files:
+        os.makedirs(os.path.dirname(os.path.join(lake, rel)), exist_ok=True)
+        shutil.copy(os.path.join(full_lake, rel), os.path.join(lake, rel))
+    for f in ("manifest.json", "datapackage.json"):
+        shutil.copy(os.path.join(full_lake, f), os.path.join(lake, f))
+    con = up.connect(lake)
+    assert con.sql(f"SELECT count(*) FROM entries WHERE taxid = {fixture_acc['taxid']}").fetchone()[0] > 0
+
+
 def test_connect_without_manifest(full_lake, tmp_path):
     lake = str(tmp_path / "nomanifest")
     shutil.copytree(full_lake, lake)
