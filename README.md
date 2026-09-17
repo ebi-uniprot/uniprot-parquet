@@ -30,6 +30,39 @@ lake/
 
 ---
 
+## Download
+
+Sizes are filled in from the F.1 measurement slice of `PLAN_SCHEMA_V2.md` once it has been built; until then no size is quoted here. The client works on any of the three Parquet subsets; a Swiss-Prot-only copy simply has one partition per table.
+
+| What | Contents | Size |
+| --- | --- | --- |
+| **`entries` tier** (recommended starting point) | `lake/entries/` + `accession_map/` + the metadata files; answers ~94% of measured API demand: accession, organism, gene, names, sequence, GO ids and terms, keywords, PubMed ids, proteomes | _measured on the F.1 slice; pending_ |
+| **Swiss-Prot only, all tables** | `review_status=swissprot/` of every table | _pending_ |
+| **Full lake** | every table, both sides | _pending_ |
+| **`sorted.jsonl.zst`** | optional; the same data in a language-neutral format, beside `lake/` | _pending_ |
+
+```bash
+# entries tier (recommended starting point)
+rsync -av --include='entries/***' --include='accession_map/***' --include='*.json' \
+      --include='SHA256SUMS.txt' --include='RELEASE.metalink' --include='LICENSE' --exclude='*' \
+      rsync://<host>/<release>/lake/ ./lake/
+grep -E '  (entries|accession_map)/' lake/SHA256SUMS.txt | (cd lake && sha256sum -c --quiet)
+# Swiss-Prot only, all tables (one directory per table)
+rsync -avm --include='*/' --include='review_status=swissprot/***' --include='*.json' \
+      --include='SHA256SUMS.txt' --include='RELEASE.metalink' --include='LICENSE' --exclude='*' \
+      rsync://<host>/<release>/lake/ ./lake/
+# full lake
+rsync -av rsync://<host>/<release>/lake/ ./lake/
+```
+
+(Substitute the canonical URL once it is chosen; use `wget -r` equivalents if the host does not expose rsync. `curl --metalink RELEASE.metalink` works as on the rest of the UniProt FTP.)
+
+`connect()` works on any of these copies; querying a table you did not download fails with a message naming the directory to fetch. A release directory is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors should check it first.
+
+If you do not want to download at all, `connect("https://<host>/<release>/lake")` reads over HTTP with DuckDB's httpfs, fetching only the byte ranges a query needs. The honest caveat: a point lookup by accession alone reads every row group's `acc` column (one range request per row group, thousands on the full lake), so remote lookups should go through `accession_map` first — see "Looking up by accession".
+
+---
+
 ## Using the lake
 
 ### Python (one-liner)
@@ -202,7 +235,7 @@ con.sql("SELECT reviewed, count(*) as n FROM entries GROUP BY reviewed").show()
 
 ### Metadata
 
-`manifest.json` inside the lake directory lists every Parquet file, its schema, row count, sort order, and semantic metadata (table descriptions, primary keys, foreign keys, column categories). Tools and LLM agents can read this to discover the data and generate correct joins without scanning files.
+`manifest.json` inside the lake directory lists every Parquet file, its schema, row count, sort order, partitioning, and semantic metadata (table descriptions, primary keys, foreign keys, column categories). Each table's `size_bytes` and per-file `file_details` (size, SHA-256, MD5, `taxid_min`/`taxid_max`) are there too; `SHA256SUMS.txt` (`sha256sum -c` format) covers the whole lake and `RELEASE.metalink` (Metalink 4) lists the same files for `curl --metalink`. Tools and LLM agents can read the manifest to discover the data and generate correct joins without scanning files. The `VALIDATE` step's report is published beside the lake as `validation_report.txt` and, as data, `validation_report.json`.
 
 `LICENSE` inside the lake directory carries the CC BY 4.0 text with a header naming UniProtKB as the source, so a copied directory keeps its terms. **Citing:** `CITATION.cff` at the repository root holds the pipeline entry and the UniProt Consortium's current paper as `preferred-citation`.
 
@@ -387,23 +420,23 @@ UniProtKB.json.gz
        |  (pre-sorted input makes DuckDB ORDER BY nearly free)
        v
 +--------------------+   DuckDB + PyArrow
-| PARQUET_TRANSFORM  |──> lake/ + manifest.json + datapackage.json
-+--------+-----------+   (JSONL staged to Parquet once, then 5 fast reads)
-         |
+| PARQUET_TRANSFORM  |──> lake/ (6 Hive-partitioned tables) + manifest.json,
++--------+-----------+   datapackage.json, LICENSE, SHA256SUMS.txt, RELEASE.metalink
+         |               (JSONL staged to Parquet once, then 6 fast reads)
          v
-+----------+   12 checks: completeness, uniqueness, null keys,
-| VALIDATE |   referential integrity, sort order, round-trip,
-+----+-----+   Parquet integrity, manifest, denorm sync, seq, coords, types
-     |
++----------+   validation_report.{txt,json}: completeness, uniqueness, null keys,
+| VALIDATE |   referential integrity, sort order, round-trip, Parquet integrity,
++----+-----+   manifest + hashes, denorm sync, seq, coords, types, field completeness,
+     |         comment text, reconstruction g(f(x)) == x, accession map, partitions
      v
-+------------+   Checksums, git commit, row counts
-| PROVENANCE |
++------------+   provenance.json (checksums, git commit, row counts),
+| PROVENANCE |   then RELEASE_COMPLETE as the last action
 +------------+
 ```
 
 DuckDB handles the heavy lifting: JSON parsing (with automatic schema inference via `read_json_auto`), SQL transformations (flattening, unnesting), and sorting. It streams Arrow record batches to PyArrow, which writes zstd-compressed Parquet files directly. Memory stays bounded regardless of dataset size.
 
-There is no committed schema file — the data is a JSON dump from production, so whatever schema it has is what we use. DuckDB infers types directly from the data at the start of each pipeline run with `sample_size=-1` (full-file scan) to ensure rare nested struct fields are never silently dropped. Each release is a full rebuild. Optional fields that may not appear in all datasets (e.g. `organismHosts` in virus-only entries) are handled gracefully with NULL substitution via schema-driven SQL generation.
+There is no committed schema file — the data is a JSON dump from production, so whatever schema it has is what we use. DuckDB infers types directly from the data at the start of each pipeline run with `sample_size=-1` (full-file scan) to ensure rare nested struct fields are never silently dropped. Each release is a full rebuild. Optional fields that may not appear in all datasets (e.g. `organismHosts` in virus-only entries) get a typed NULL, and structs are cast to their declared shape, so the schema of a build does not depend on which optional fields its input contained; a build stops if the input carries a nested field no column would keep (`check_declared_types` / `check_promoted_paths`).
 
 The pipeline is **idempotent** — re-running on the same release directory overwrites the Parquet files. With `--skip-existing`, partially completed runs resume from where they left off.
 
@@ -416,6 +449,10 @@ The pipeline is **idempotent** — re-running on the same release directory over
 **Resume**: All runs use `-resume` by default. If a SLURM job is killed (wall time, preemption), re-submitting picks up from the last completed process.
 
 **Integrity verification**: `STREAM_JSONL` writes a sidecar entry count and verifies the compressed output line count matches. When `--expected_count` is set, it also asserts against the known count from UniProt release statistics.
+
+**`accession_map` sort spill**: it is the one table with a real sort (`reviewed DESC, acc ASC, primary_acc ASC`; the others arrive pre-sorted from the JSONL). ~250M + secondaries rows of five narrow columns: expect low tens of GB of DuckDB spill for it alone.
+
+**zstd level**: `ZSTD_LEVEL` in `bin/parquet_transform.py` (`--zstd-level` on the command line) is currently 1, the PyArrow default, pending the H.1 sweep on the measurement slice (`benchmarks/bench_zstd.py`); a higher level costs write time once per release and saves bytes on every download and range read.
 
 **Memory model**: DuckDB gets 75% of process memory by default; the remaining 25% provides headroom for Python, PyArrow, and JSON parsing. DuckDB spills to disk when data exceeds the buffer pool. Configure via `--process_memory` and `--duckdb_pct`.
 
@@ -440,7 +477,7 @@ The `VALIDATE` step runs the checks below against the source JSONL as ground tru
 5. **Sort order** — all tables sorted by `(reviewed DESC, taxid ASC, acc ASC)`
 6. **Round-trip spot check** — 1000 reservoir-sampled entries verified field-by-field against JSONL
 7. **Parquet file integrity** — every `.parquet` file in the lake is readable
-8. **Manifest consistency** — `manifest.json` file list matches actual files on disk
+8. **Manifest consistency** — `manifest.json` file list matches actual files on disk; every file's size and SHA-256 match `file_details`
 9. **Denormalized column sync** — `taxid` and `reviewed` in child tables match entries (DuckDB join)
 10. **Sequence integrity** — `len(sequence) == seq_length` for every entry; no zero-length sequences
 11. **Feature coordinate boundaries** — `start_pos <= end_pos` where both are non-null
@@ -448,8 +485,9 @@ The `VALIDATE` step runs the checks below against the source JSONL as ground tru
 13. **Field completeness** — every top-level JSON field is captured in `entries` or a child table
 14. **Schema evolution guard** — Parquet schema matches a committed baseline (when `--schema-baseline` is given)
 15. **Comment text** — every text-bearing comment type has a populated `text_value`
-16. **Reconstruction** — sampled entries rebuilt from the five tables by `bin/reconstruct.py` equal the source JSONL (order-independent inside arrays)
+16. **Reconstruction** — sampled entries rebuilt from the five data tables by `bin/reconstruct.py` equal the source JSONL (order-independent inside arrays)
 18. **Accession map** — primary rows equal `entries`, secondary rows equal the sum of `secondary_accs`, no duplicate `(acc, primary_acc)`, every `primary_acc` exists, `(reviewed, taxid)` match `entries` (17, bloom filters, is deferred: the pinned PyArrow cannot write them)
+19. **Partitions** — `review_status=swissprot|trembl` directories agree with the stored `reviewed` column (row-group statistics), per-partition row counts match the manifest and sum to `row_count`, Swiss-Prot files first
 
 ### Testing
 
@@ -457,14 +495,14 @@ The `VALIDATE` step runs the checks below against the source JSONL as ground tru
 # Default suite (~4K diverse entries, auto-fetched on first run)
 python -m pytest tests/ -v
 
-# Stress suite (~15K entries from 30+ targeted queries)
+# Stress suite (~15K entries from 30+ targeted queries; needs ~8 GB RAM)
 python tests/fetch_fixtures.py --scale stress   # one-time fetch, ~60 MB
 python -m pytest tests/ -v --stress
 ```
 
 The default fixture is fetched automatically on first `pytest` run if not already present. It pulls ~4,000 entries from UniProtKB via targeted REST API queries (viruses, fragments, isoforms, bacteria, fungi, multiple TrEMBL organisms, etc.) and always includes the top 100 most heavily annotated Swiss-Prot and TrEMBL entries, discovered by sampling candidate pools from well-studied organisms and ranking by total annotation count (features + xrefs + comments + references). The Swiss-Prot champion is P0DTD1 (SARS-CoV-2 replicase, ~6,300 annotations); the TrEMBL champion is typically a titin ortholog (~570 annotations). These stress-test every child table at maximum annotation volume.
 
-The `--stress` flag swaps in a ~15K-entry dataset assembled from 30+ queries spanning archaea, toxins, allergens, pharmaceuticals, long/short sequences, and TrEMBL from 10+ organisms. Both suites run the same 89 tests — row counts, column schemas, data integrity, sort order, manifest consistency, data package validation, idempotency, `--skip-existing` resume, full roundtrip equivalence, and the production validator across all five tables. To re-fetch fixtures (e.g. after a UniProtKB release), pass `--force`:
+The `--stress` flag swaps in a ~15K-entry dataset assembled from 30+ queries spanning archaea, toxins, allergens, pharmaceuticals, long/short sequences, and TrEMBL from 10+ organisms. Both suites run the same tests — row counts, column schemas, typed fallbacks, partitions, data integrity, sort order, manifest consistency and checksums, data package validation, idempotency, `--skip-existing` resume, full round-trip equivalence and reconstruction (`g(f(x)) == x`), the client on full and partial lakes, every README example, and the production validator across all six tables. To re-fetch fixtures (e.g. after a UniProtKB release), pass `--force`:
 
 ```bash
 python tests/fetch_fixtures.py --force                # re-fetch default

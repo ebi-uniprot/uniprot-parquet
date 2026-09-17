@@ -109,15 +109,20 @@ README = os.path.join(os.path.dirname(__file__), "..", "README.md")
 
 
 def _readme_sql_examples():
-    """SQL statements from README fenced ```sql blocks that reference only the views/macros."""
+    """SQL from the README: every statement in a ```sql block and every
+    con.sql(...) call in a ```python block that queries the views / macros."""
     with open(README) as f:
         text = f.read()
-    blocks = re.findall(r"```sql\n(.*?)```", text, re.S)
     stmts = []
-    for block in blocks:
+    for block in re.findall(r"```sql\n(.*?)```", text, re.S):
         for stmt in up._split_sql(block):
             body = "\n".join(l for l in stmt.splitlines() if not l.strip().startswith("--")).strip()
-            if body.upper().startswith("SELECT") and "${BASE}" not in body and "{BASE}" not in body:
+            if body.upper().startswith("SELECT") and "BASE}" not in body:
+                stmts.append(body)
+    for block in re.findall(r"```python\n(.*?)```", text, re.S):
+        for m in re.finditer(r'con\.sql\((?:"""(.*?)"""|"(.*?)")\)', block, re.S):
+            body = (m.group(1) or m.group(2)).strip()
+            if body.upper().startswith("SELECT") and "read_parquet" not in body:
                 stmts.append(body)
     return stmts
 
