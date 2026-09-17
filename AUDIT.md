@@ -42,7 +42,7 @@ These block downstream work. Resolve in this order.
 | **O1** | Transition window for latest-only | (a) zero overlap; (b) `latest` + `previous` symlinks, ~1 release overlap; (c) keep N releases | (b) — minimal cost, handles "mid-paper" case | A5 |
 | **O2** | Canonical EBI URL | `ftp.ebi.ac.uk/pub/databases/uniprot/parquet/latest/lake` (recommended) vs alternatives | Decide with UniProt FTP team | A3, A15, docs |
 | **O3** | Naming convention | (a) freeze current (`reviewed`/`acc`/`taxid`); (b) rename to survey consensus (`is_reviewed`/`acc_id` etc.) | (a) — rename breaks every user; document current names in SCHEMA.md | A14 |
-| **O4** | Top-N organisms to partition `xrefs`/`features` by | 0 (no partitioning); top-20 model organisms; top-50; all | top-20 + `_other` partition (covers ~80% of query volume) | S7 |
+| **O4** | **Closed 2026-09-16 by `PLAN_SCHEMA_V2.md` D.5:** no organism partition level; `entries.division` column plus per-file `taxid_min`/`taxid_max` in the manifest and `uniprot_parquet.files_for_taxid()` instead. — Top-N organisms to partition `xrefs`/`features` by | 0 (no partitioning); top-20 model organisms; top-50; all | top-20 + `_other` partition (covers ~80% of query volume) | S7 |
 | **O5** | Comment column representation | (a) keep VARCHAR JSON; (b) tag as JSON `logical_type`; (c) typed STRUCT per comment_type | (b) immediately, (c) post-user-survey | S2 |
 | **O6** | User survey before v1 lock-in | Ship survey alongside v0 / wait for organic feedback / never | Ship survey — this is the highest-leverage action available | A4 |
 
@@ -66,11 +66,11 @@ These block downstream work. Resolve in this order.
 
 | ID | Change | Location | Effort | Why |
 |---|---|---|---|---|
-| **S1** | Add `gene_name` (singular, = `gene_names[1]`) as real column on `entries` | `parquet_transform.py:_build_entries_sql` | hours | Both client views already do this transform (`uniprot_parquet.py:42`, `setup_views.sql:33`). Non-DuckDB users (Polars/pandas/PySpark) currently have to know the trick. |
+| **S1** | **Shipped 2026-09-16** (`PLAN_SCHEMA_V2_STEPS.md` Step 6). — Add `gene_name` (singular, = `gene_names[1]`) as real column on `entries` | `parquet_transform.py:_build_entries_sql` | hours | Both client views already do this transform (`uniprot_parquet.py:42`, `setup_views.sql:33`). Non-DuckDB users (Polars/pandas/PySpark) currently have to know the trick. |
 | **S2** | Tag `comments.comment` Parquet field with `logical_type=JSON` | `parquet_transform.py:562` + Arrow schema metadata | 1 day | Stored as VARCHAR; engines that recognize JSON logical type (Spark 3.5+, recent DuckDB) auto-cast. Removes the `comment::JSON` hack in views. |
 | **S3** | First-class `isoforms` table | New table builder in `parquet_transform.py`, new view in `setup_views.sql`/`uniprot_parquet.py` | 2-3 days | Isoforms currently buried inside `comments` of type `ALTERNATIVE_PRODUCTS`. The `unnest_isoforms()` macro (`uniprot_parquet.py:107-129`) is an admission the schema is wrong. Proteomics/mass-spec users need this constantly. Columns: `acc`, `isoform_id`, `name`, `sequence_status`, `variant_sequence_ids`. |
 | **S4** | Verify whether `features` is already in `start_pos` order within an `acc` | One-time measurement | hours | UniProt JSON emits features in source order, usually start_pos. If true (likely), document as guaranteed and users skip `ORDER BY start_pos`. README's claim that this is unsorted may be wrong. |
-| **S5** | Reverse-accession lookup table (`accession_map`: `secondary` → `primary`) | New table builder | 1 day | `secondary_accs` is `list[string]` on entries — finding current primary for legacy accession requires `list_contains` over 250M rows. New table is <1 GB and saves every legacy-data user a full scan. |
+| **S5** | **Shipped 2026-09-17** as the `accession_map` table (Step 13). — Reverse-accession lookup table (`accession_map`: `secondary` → `primary`) | New table builder | 1 day | `secondary_accs` is `list[string]` on entries — finding current primary for legacy accession requires `list_contains` over 250M rows. New table is <1 GB and saves every legacy-data user a full scan. |
 | **S6** | Add `annotation_quality :: tinyint` and `is_high_confidence :: bool` to `entries` | `parquet_transform.py:_build_entries_sql` | hours | `annotation_score` is a double (currently 1-5 integer). Tinyint compresses much better. Boolean (`>= 4`) matches the most common filter pattern. |
 | **S7** | Sequence hash *verification*, not just propagation | `validate_lake.py` new `check_sequence_hashes()` | 1 day | `seq_md5`/`seq_crc64` are written from upstream (`parquet_transform.py:350-351`) but never re-verified. Cheap streaming check. Catches upstream-data corruption. (Also = Q-H3.) |
 
@@ -81,7 +81,7 @@ These block downstream work. Resolve in this order.
 | **S8** | Partition `xrefs` and `features` Hive-style by top-N organisms (`taxid=9606/...`) + `_other` | Need O4 decision on N; need to confirm the query-pattern assumption | O4 + user survey |
 | **S9** | Rethink `xrefs.properties` (currently opaque `list[struct{key,value}]`) | Three options: per-database sub-tables / typed convenience columns for top DBs / keep generic + publish schema doc. Need to know which databases users actually filter on. | User survey |
 | **S10** | Rename booleans to `is_*` prefix universally | Current naming consistent + already in production demo. Rename breaks every user. | O3 |
-| **S11** | First-class `proteomes` table or `proteome_id` column | UniProt reference proteomes are first-class concept; can be approximated via `taxid + reviewed` but not exactly. Worth doing if users actually want it. | User survey |
+| **S11** | **Shipped 2026-09-16** as `entries.proteome_ids` (Step 6); a `proteomes` table stays pending the user survey. — First-class `proteomes` table or `proteome_id` column | UniProt reference proteomes are first-class concept; can be approximated via `taxid + reviewed` but not exactly. Worth doing if users actually want it. | User survey |
 | **S12** | Per-fragment `comment_texts :: list[struct{value, evidence_codes}]` instead of newline-concatenated `text_value` | Current `text_value` (`parquet_transform.py:539-545`) drops per-text evidence and is lossy. Affects users who care about evidence (per surveys, this is a UniProt differentiator). | Wait for S2 outcome and user survey |
 
 ### 4.4 The meta-finding: no user research
@@ -213,7 +213,7 @@ If hypothetically retaining all releases: ~7-8 TB/year, ~70-80 TB/decade. **D1 (
 
 | ID | Action | Resolves | Effort | Depends on |
 |---|---|---|---|---|
-| **A5** | Atomic publish-swap: build into `releases/<rel>/`, compute per-file `SHA256SUMS.txt`, fsync + atomic-rename manifests, flip `latest` (and `previous`) symlinks, prune. | Q-C1, Q-C3 | 2-3 days | A1 |
+| **A5** | **Partly done 2026-09-17:** `SHA256SUMS.txt`, `RELEASE.metalink` and `RELEASE_COMPLETE` are produced by the pipeline (Steps 15, 19); the swap itself remains. — Atomic publish-swap: build into `releases/<rel>/`, compute per-file `SHA256SUMS.txt`, fsync + atomic-rename manifests, flip `latest` (and `previous`) symlinks, prune. | Q-C1, Q-C3 | 2-3 days | A1 |
 | **A6** | De-personalize `datapackage.json` via `pipeline_config.yaml` driving `homepage`/`contributors`/`licenses`/`sources`. Separate `pipeline_version` from `uniprotRelease`. | Q-H1 | hours | — |
 | **A7** | Provenance + Parquet footer metadata: record Python/DuckDB/PyArrow/zstd versions, hostname, per-stage duration, embedded validator outcome. Embed `uniprot_release`/`schema_version`/`extraction_date`/`pipeline_commit` + 10-protein golden set in Parquet `key_value_metadata` (per survey: `BIOINFORMATICS_PARQUET_SURVEY.md:629-647`). | Q-H4 | 1-2 days | — |
 | **A8** | Extend round-trip validator to nested fields. Reuse `tests/test_roundtrip.py:30-60` helpers (`deep_sort`, `normalize_value`) in `validate_lake.py:509-554`. Same n=1000 reservoir; deep-compare all nested struct columns. | Q-C4 | 1 day | — |
@@ -224,15 +224,15 @@ If hypothetically retaining all releases: ~7-8 TB/year, ~70-80 TB/decade. **D1 (
 
 | ID | Action | Resolves | Effort | Depends on |
 |---|---|---|---|---|
-| **A11** | DEDUPLICATION_PROPOSAL Phase 1: build `g()` reconstruction in `tests/`, round-trip test as CI gate, full-scale release-candidate validator. No schema change. | D3 | 1-2 weeks | A8 |
+| **A11** | **Done 2026-09-17** (`bin/reconstruct.py`, `tests/test_reconstruct.py`, validator check 16; Step 10). — DEDUPLICATION_PROPOSAL Phase 1: build `g()` reconstruction in `tests/`, round-trip test as CI gate, full-scale release-candidate validator. No schema change. | D3 | 1-2 weeks | A8 |
 | **A12** | Measure on representative slice: human reviewed+unreviewed (~210K) + 1M random TrEMBL sample. Publish actual per-entry/per-row sizes in this document (§6.1). | §6 uncertainty | hours of compute + 1 day analysis | — |
-| **A13** | DEDUPLICATION_PROPOSAL Phase 2: residual trim per `DEDUPLICATION_PROPOSAL.md:368-694`. Single-release flip. | D3 | 1-2 weeks | A11, A12 |
-| **A14** | Four-doc bundle (per survey recommendation, `SURVEY_COMPARISON_GUIDE.md:114-138`): | — | 1-2 weeks | A3, O3 |
+| **A13** | **Done 2026-09-17** (Step 11; ships before the first public release, no flip). **Rule (plan F.3):** no plan adds a column to `features`, `xrefs`, `comments` or `publications` ahead of this trim — now moot for the launch schema, kept for later plans. — DEDUPLICATION_PROPOSAL Phase 2: residual trim per `DEDUPLICATION_PROPOSAL.md:368-694`. Single-release flip. | D3 | 1-2 weeks | A11, A12 |
+| **A14** | **Partly done 2026-09-17:** `SCHEMA.md` is generated by `bin/gen_schema_md.py` (Step 9/21). — Four-doc bundle (per survey recommendation, `SURVEY_COMPARISON_GUIDE.md:114-138`): | — | 1-2 weeks | A3, O3 |
 | | • `SCHEMA.md` — column → source JSON path mapping (auto-generate from `parquet_transform.py:978-1085` `COLUMN_DESCRIPTIONS`) | | | |
 | | • `EXAMPLES.md` — Spark, DuckDB, Polars, pandas, R | | | |
 | | • `EXTRACTION_REPORT.md` — auto-generated from `validation_report.json` per release | | | |
 | | • `VERSION_HISTORY.md` — auto-generated from A10 drift diffs per release | | | |
-| **A15** | Client tests (`tests/test_client.py`): every README example query, every helper (`connect`, `manifest`, `schema`, `tables`, `datapackage`), the `_split_sql` helper, and httpfs auto-install path. | Q-M10, Q-M7 | 2-3 days | — |
+| **A15** | **Done 2026-09-17** (`tests/test_client.py`, Step 16; httpfs auto-install is exercised by the `--serve` benchmark, not the suite). — Client tests (`tests/test_client.py`): every README example query, every helper (`connect`, `manifest`, `schema`, `tables`, `datapackage`), the `_split_sql` helper, and httpfs auto-install path. | Q-M10, Q-M7 | 2-3 days | — |
 
 ### No-regrets schema improvements (parallelizable with Tier 3)
 
@@ -254,7 +254,7 @@ If hypothetically retaining all releases: ~7-8 TB/year, ~70-80 TB/decade. **D1 (
 | **A18** | Per-acc count consistency check in validator (`validate_lake.py`). DuckDB join with `WHERE entries.feature_count != fc.cnt LIMIT 10`. | Q-H6 | hours |
 | **A19** | SQL hygiene: parameterize where possible; apply `_sql_escape` consistently to all `.format()`/`.replace()` interpolations; reject shell-metacharacter in `--release`; switch `validate_lake.py:544` IN-list to `con.register("sample_accs", arrow_table)` + join. | Q-H8, Q-M3 | 1 day |
 | **A20** | Generate `lake/profile.json` per release: null rate, distinct count, p50/p99 per column via `pyarrow.compute`. | Q-M5 | 2 days |
-| **A21** | Emit `validation_report.json` alongside `.txt`. Per-check `{name, status, duration_seconds, message}`. Embed in `provenance.json`. Feeds A14's `EXTRACTION_REPORT.md`. | Q-M6 | 1 day |
+| **A21** | **Done 2026-09-17** (`validation_report.json`, Step 15; not yet embedded in `provenance.json`). — Emit `validation_report.json` alongside `.txt`. Per-check `{name, status, duration_seconds, message}`. Embed in `provenance.json`. Feeds A14's `EXTRACTION_REPORT.md`. | Q-M6 | 1 day |
 | **A22** | Add OOM-retry directives to local Nextflow profile, or document explicitly that local mode has no safety net. | Q-M9 | hours |
 | **A23** | Generate `setup_views.sql` from `uniprot_parquet.py` `_SETUP_SQL` at build time so they can't drift. | Q-L10 | hours |
 | **A24** | Repo hygiene: untrack `.vscode/`, `__pycache__/`, `.DS_Store`, `benchmarks/results/*.json`, `lake/reports/`. Resolve format-string mismatch (Q-L6). Lazy-import `frictionless` (Q-L7). | Q-L1–L10 | 1 day |

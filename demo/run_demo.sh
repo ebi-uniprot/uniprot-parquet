@@ -128,6 +128,6 @@ echo ""
 cat <<EOF
 import duckdb
 con = duckdb.connect()
-con.sql("SELECT * FROM read_parquet('$(pwd)/$RELEASE_DIR/lake/entries/*.parquet') LIMIT 5").show()
+con.sql("SELECT * FROM read_parquet('$(pwd)/$RELEASE_DIR/lake/entries/**/*.parquet') LIMIT 5").show()
 EOF
 echo ""

@@ -261,6 +261,7 @@ def init_duckdb(memory_limit: str, threads: int | None,
 COLUMN_TYPES: dict[tuple[str, str], str] = {
     ("entries", "organism_hosts"): "STRUCT(scientificName VARCHAR, commonName VARCHAR, taxonId BIGINT, synonyms VARCHAR[])[]",
     ("entries", "go_terms"): "STRUCT(id VARCHAR, aspect VARCHAR, term VARCHAR, evidence_type VARCHAR)[]",
+    ("entries", "extra_attributes"): "STRUCT(countByCommentType MAP(VARCHAR, BIGINT), countByFeatureType MAP(VARCHAR, BIGINT), uniParcId VARCHAR)",
     ("entries", "gene_locations"): 'STRUCT(geneEncodingType VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[]',
     ("features", "feature_id"): "VARCHAR",
     ("features", "original_sequence"): "VARCHAR",
@@ -533,6 +534,8 @@ def _declared_type_paths(con, type_str: str, prefix: str) -> set[str]:
     def _walk(t, pre):
         if t.id == "list":
             _walk(t.children[0][1], pre)
+        elif t.id == "map":
+            paths.add(pre + ".*")          # a MAP admits any key: wildcard
         elif t.id == "struct":
             for name, child in t.children:
                 path = f"{pre}.{name}"
@@ -567,7 +570,8 @@ def check_declared_types(con, schema_paths: set[str]) -> None:
                 continue
             covered = _declared_type_paths(con, type_str, src)
             actual = {p for p in schema_paths if p.startswith(src + ".")}
-        extra = sorted(actual - covered)
+        wildcards = [w[:-1] for w in covered if w.endswith(".*")]
+        extra = sorted(p for p in actual - covered if not any(p.startswith(w) for w in wildcards))
         if extra:
             problems.append(f"{key[0]}.{key[1]} (source {src}): input has {extra} "
                             f"but COLUMN_TYPES declares {type_str}")
@@ -651,6 +655,21 @@ def _build_entries_sql(schema_paths: set[str]) -> str:
     organism_residual = _residual_sql("entries", "organism_residual", "e.organism", schema_paths)
     protein_desc_residual = _residual_sql("entries", "protein_desc_residual",
                                           "e.proteinDescription", schema_paths)
+
+    # extra_attributes: input-independent shape (see the SELECT comment).
+    def _count_map(field):
+        if not has(f"extraAttributes.{field}"):
+            return "NULL::MAP(VARCHAR, BIGINT)"
+        return (f"map_from_entries(list_filter(map_entries("
+                f"e.extraAttributes.{field}::MAP(VARCHAR, BIGINT)), x -> x.value IS NOT NULL))")
+    extra_attributes = (
+        "CAST(struct_pack("
+        f"countByCommentType := {_count_map('countByCommentType')}, "
+        f"countByFeatureType := {_count_map('countByFeatureType')}, "
+        + ("uniParcId := e.extraAttributes.uniParcId" if has("extraAttributes.uniParcId")
+           else "uniParcId := NULL::VARCHAR")
+        + f") AS {COLUMN_TYPES[('entries', 'extra_attributes')]})"
+    ) if has("extraAttributes") else _null("entries", "extra_attributes")
 
     # go_terms (plan B.1): GO xrefs carry properties GoTerm ('F:ATP binding')
     # and GoEvidenceType ('IEA:InterPro').  aspect/term are NULL, never '',
@@ -791,8 +810,11 @@ SELECT
 
     -- Entry type (lossless round-trip — the boolean 'reviewed' loses the exact string)
     e.entryType                                     AS entry_type,
-    -- Extra attributes (countByCommentType, countByFeatureType, uniParcId)
-    e.extraAttributes                               AS extra_attributes,
+    -- Extra attributes (countByCommentType, countByFeatureType, uniParcId).
+    -- The two count objects are MAP(VARCHAR, BIGINT) whatever DuckDB inferred
+    -- (a STRUCT with one field per type seen, or a MAP past its map-inference
+    -- threshold), so the column type does not depend on the input (plan G.2).
+    {extra_attributes}                              AS extra_attributes,
 
     -- Residual / full nested structures (plan A13): residuals hold only what
     -- the convenience columns do not; bin/reconstruct.py rebuilds the JSON.

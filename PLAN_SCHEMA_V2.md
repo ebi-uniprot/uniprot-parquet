@@ -312,14 +312,14 @@ Only after Phases 1–3 pass:
 
 ## 8. Acceptance checklist (Part A; the combined list is at the end of the file)
 
-- [ ] Phase 0 results recorded in this file (0.1 outcome, 0.2 row-group skip evidence, 0.3 baseline ratio).
-- [ ] Every row group of `entries` (and of any child table that kept B1 after Phase 3) has a bloom filter on `acc` at the table's recorded fpp; `--no-bloom-filters` disables it. If Phase 0.1 failed, B1 is recorded as deferred and B2 ships alone.
-- [ ] `manifest.json` version 2 records `bloom_filter_columns` and `bloom_filter_fpp`; `datapackage.json` mirrors them.
-- [ ] `accession_map` builds, validates (six checks), round-trips secondaries, and survives `--skip-existing`.
-- [ ] Validator has two new checks; README validation list updated; `validation_report.txt` shows them passing on the stress fixture.
-- [ ] Benchmark results recorded on a multi-row-group build; two-step lookup ≤ 3 row groups; single-step false positives within `2 × row_groups × fpp`; httpfs request counts recorded for both forms.
-- [ ] README documents the two-step form as the primary and remote path, the single-step form as a local convenience on `entries`, and the httpfs request-count caveat.
-- [ ] Full test suite green on default and `--stress` fixtures.
+- [x] Phase 0 results recorded in this file (0.1 outcome, 0.2 row-group skip evidence, 0.3 baseline ratio). *(Step 1; 0.3 on the slice pending.)*
+- [x] ~~Every row group of `entries` … has a bloom filter~~ Phase 0.1 failed: **B1 deferred**, B2 ships alone (recorded in the Results log and `_bloom_kwargs()` returns `{}`).
+- [ ] `manifest.json` version 2 records `bloom_filter_columns` and `bloom_filter_fpp`; `datapackage.json` mirrors them. *(Deferred with B1; manifest version 2 itself is done.)*
+- [x] `accession_map` builds, validates (six checks), round-trips secondaries, and survives `--skip-existing`. *(Step 13.)*
+- [x] Validator has the new checks (15, 16, 18, 19; 17 deferred with B1); README validation list updated; `validation_report.txt` shows them passing on the stress fixture and the demo.
+- [ ] Benchmark results recorded on a multi-row-group build; two-step lookup ≤ 3 row groups; single-step false positives within `2 × row_groups × fpp`; httpfs request counts recorded for both forms. *(Script written and smoke-run; slice/full run pending.)*
+- [x] README documents the two-step form as the primary and remote path, the single-step form as a local convenience on `entries`, and the httpfs request-count caveat.
+- [x] Full test suite green on default and `--stress` fixtures (155 tests, 2026-09-17).
 
 ## 9. Out of scope, recorded so nobody re-derives them
 
@@ -568,7 +568,7 @@ Because `reviewed` is stored and `review_status` is derived, the two never disag
 
 **Revisit condition** (before the first public release only; a level added after launch changes every path): if F.1 shows that the `entries` files containing human rows total more than ~10× the bytes of the human rows themselves, a two-file human download is a poor "human tier" and `organism=human|other` on `entries` only is reconsidered. Record the ratio here either way.
 
-Result: ______ (date, build, division-count check outcome, human-files-to-human-rows byte ratio).
+Result: 2026-09-17, fixture builds only — `division` implemented (ten of eleven values occur on the stress fixture; `unclassified` never, as expected); the division-count check against the FTP and the human-files-to-human-rows byte ratio are **pending the first full build and the F.1 slice** (Step 21 item 5 / Step 3 item 5 of the work order).
 
 ---
 
@@ -939,19 +939,19 @@ The launch set ships as one release so that the Phase 3 benchmark measures the c
 
 Checklist additions to §8:
 
-- [ ] Part B: `go_terms`, `pubmed_ids`, `proteome_ids`, `gene_name` present, described, categorised, round-trip-checked; size gates recorded; view files no longer synthesise `gene_name`.
-- [ ] Part C: nine hot columns contiguous (verified from `parquet_metadata`); HTTP request count recorded before/after.
-- [ ] Part D: every table has exactly `review_status=swissprot` and `review_status=trembl` partitions; `reviewed` stored in every file of every table; validator `check_partitions` passes; manifest carries the `partitioning` block and per-partition counts; README recommends `<table>/**/*.parquet` for raw DuckDB and the view files use the D.3 form; D.1 reader table executed in tests for DuckDB, Polars and PyArrow; D.5: `division` column on `entries` matches the FTP per-division counts, per-file `taxid_min`/`taxid_max` in the manifest with a `files_for_taxid` helper, `accession_map` marked as excluded from any future level, human-tier byte ratio recorded.
-- [ ] Part E: nothing changed in `xrefs`; skew query and source-order query results recorded when available.
-- [ ] Part F.1: slice measurement table filled (bytes per table and side, extrapolation, `entries` share, footer bytes); `AUDIT.md` §6.1 updated.
-- [ ] Part F.2: `size_bytes` and `file_details` (SHA-256) per table in `manifest.json`; `SHA256SUMS.txt` and `RELEASE.metalink` at lake root and verified by the validator; `validation_report.json` emitted (`croissant.json` and `releases.json` deferred to a minor bump; their formats stay in F.2.1 and F.2.5); `connect()` works on an `entries`-only copy and fails with an actionable message on missing tables; README "Download" section leads with the `entries` tier and quotes measured sizes.
-- [ ] Part F.3: A11 (`g()` round-trip gate) and A13 (residual trim) shipped; dedup-before-child-bytes rule recorded in `AUDIT.md` next to A13; F.1 says whether `xrefs`/`comments` need S2 or an xrefs byte audit; post-trim bytes recorded in the F.1 "after v2" column.
-- [ ] Part G: `comments.text_value` populated and round-trip-checked; every `NULL` fallback typed and `check_schema_types` covers every column; demo manifest regenerated with no `int32` artefacts; naming decisions (G.3) recorded in `SCHEMA.md`.
-- [ ] Part H: zstd level chosen from the sweep and recorded in manifest and footer; every field carries `description` (and `source_path` where known) metadata; H.3 enums deferred to a minor bump; `schema_version` semver in all five places with the policy in `SCHEMA.md` and enforced by `check_schema_evolution`; `RELEASE_COMPLETE` written last and gated on validation; `lake/LICENSE` and `CITATION.cff` present and hashed.
-- [ ] Part F.4: footer-vs-data bytes for the organism query recorded at 256 MB, 512 MB and 1 GB; `entries` target chosen with the reason; page index written for every table and verified from `parquet_metadata()`.
+- [x] Part B: `go_terms`, `pubmed_ids`, `proteome_ids`, `gene_name` present, described, categorised, round-trip-checked; size gates recorded (fixture proxy); view files no longer synthesise `gene_name`.
+- [x] Part C: nine hot columns contiguous (verified from `parquet_metadata`); HTTP request count recorded after only (no pre-reorder build).
+- [x] Part D (except the FTP division-count gate and the human-tier ratio, pending the full build / slice): every table has exactly `review_status=swissprot` and `review_status=trembl` partitions; `reviewed` stored in every file of every table; validator `check_partitions` passes; manifest carries the `partitioning` block and per-partition counts; README recommends `<table>/**/*.parquet` for raw DuckDB and the view files use the D.3 form; D.1 reader table executed in tests for DuckDB, Polars and PyArrow; D.5: `division` column on `entries` matches the FTP per-division counts, per-file `taxid_min`/`taxid_max` in the manifest with a `files_for_taxid` helper, `accession_map` marked as excluded from any future level, human-tier byte ratio recorded.
+- [x] Part E: nothing changed in `xrefs`; skew query and source-order query results to be recorded on the full build.
+- [ ] Part F.1: slice measurement table filled (bytes per table and side, extrapolation, `entries` share, footer bytes); `AUDIT.md` §6.1 updated. *(Deferred: sampler written, slice not built.)*
+- [x] Part F.2 (sizes in the README Download table pending F.1): `size_bytes` and `file_details` (SHA-256) per table in `manifest.json`; `SHA256SUMS.txt` and `RELEASE.metalink` at lake root and verified by the validator; `validation_report.json` emitted (`croissant.json` and `releases.json` deferred to a minor bump; their formats stay in F.2.1 and F.2.5); `connect()` works on an `entries`-only copy and fails with an actionable message on missing tables; README "Download" section leads with the `entries` tier and quotes measured sizes.
+- [x] Part F.3 (the F.1 share question pending the slice): A11 (`g()` round-trip gate) and A13 (residual trim) shipped; dedup-before-child-bytes rule recorded in `AUDIT.md` next to A13; F.1 says whether `xrefs`/`comments` need S2 or an xrefs byte audit; post-trim bytes recorded in the F.1 "after v2" column.
+- [x] Part G: `comments.text_value` populated and round-trip-checked; every `NULL` fallback typed and `check_schema_types` covers every declared column; demo manifest regenerated with no `int32` artefacts (the demo lake is gitignored, so it is regenerated locally, not committed); naming decisions (G.3) recorded in `SCHEMA.md`.
+- [x] Part H (zstd level provisional from the fixture sweep; semver *enforcement* starts with the second release): zstd level chosen from the sweep and recorded in manifest and footer; every field carries `description` (and `source_path` where known) metadata; H.3 enums deferred to a minor bump; `schema_version` semver in all five places with the policy in `SCHEMA.md` and enforced by `check_schema_evolution`; `RELEASE_COMPLETE` written last and gated on validation; `lake/LICENSE` and `CITATION.cff` present and hashed.
+- [ ] Part F.4: footer-vs-data bytes for the organism query recorded at 256 MB, 512 MB and 1 GB; `entries` target chosen with the reason *(pending the slice; script written)*; [x] page index written for every table and verified.
 - [ ] Part F.5: retention policy decided with the FTP team and written in the README `### Versioning` section; `lts` list in `releases.json`.
 - [ ] Part F.6: cloud channel proposal put to the FTP team and SIB; manifest and index files use relative paths only.
-- [ ] Manifest format `version` 2 and `schema_version` `1.0.0`; the first public release notes describe the layout as it is (no "breaking change" list, since there is no prior public release). Items in the "additive" column of the release-bundling table that did not make the release are listed in the notes as planned minor bumps.
+- [x] Manifest format `version` 2 and `schema_version` `1.0.0`; the first public release notes describe the layout as it is (no "breaking change" list, since there is no prior public release). Items in the "additive" column of the release-bundling table that did not make the release are listed in the notes as planned minor bumps.
 
 ## Decisions reopened by pre-public status
 

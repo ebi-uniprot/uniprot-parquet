@@ -44,6 +44,10 @@ def normalize_value(val):
     if isinstance(val, dict):
         return {k: normalize_value(v) for k, v in val.items() if v is not None}
     if isinstance(val, list):
+        # A Parquet MAP comes back from PyArrow as a list of (key, value)
+        # tuples (JSON arrays never yield tuples): rebuild the JSON object.
+        if val and all(isinstance(x, tuple) and len(x) == 2 for x in val):
+            return {k: normalize_value(v) for k, v in val if v is not None}
         return [normalize_value(v) for v in val]
     if isinstance(val, (int, float)):
         return val
