@@ -1,8 +1,15 @@
 -- UniProtKB Parquet Data Lake — DuckDB Setup Views
 --
--- Creates virtual views over the five lake tables so downstream queries
--- can use plain table names (entries, features, xrefs, comments, publications)
--- without repeating read_parquet() globs.
+-- Creates virtual views over the six lake tables so downstream queries
+-- can use plain table names (entries, features, xrefs, comments, publications,
+-- accession_map) without repeating read_parquet() globs.
+--
+-- Requires all six tables: DuckDB binds a view at creation, so a glob that
+-- matches no files fails here.  For an entries-only copy of the lake use
+-- uniprot_parquet.connect() (which reads manifest.json and stubs the missing
+-- tables) or create only the views you have.  Globs also need a listable
+-- filesystem; over plain HTTP use uniprot_parquet.connect(), which builds
+-- the views from the manifest's explicit file lists.
 --
 -- Usage (local lake):
 --

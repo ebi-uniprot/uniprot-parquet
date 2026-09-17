@@ -32,36 +32,54 @@ import os
 import duckdb
 
 
-# ── Setup SQL (embedded so this file is entirely self-contained) ────────
-# Views create clean table names over read_parquet() globs.
-# Macros provide parameterised shortcuts for common query patterns.
-# {BASE} is replaced at runtime with the actual lake path.
+# ── Views ───────────────────────────────────────────────────────────────
+# Every table is Hive-partitioned as <table>/review_status=swissprot|trembl/
+# (plan Part D).  Views read the files with hive_partitioning = true and
+# REPLACE the stored `reviewed` column with (review_status = 'swissprot'): the
+# two are equal by construction (validator check 19), and deriving `reviewed`
+# from the path lets DuckDB prune whole files on `WHERE reviewed = true`
+# before opening any TrEMBL footer (verified with EXPLAIN ANALYZE, D.3 spike,
+# 2026-09-17: 1 file read vs 2 without the partition key).  `review_status`
+# itself is EXCLUDEd so the view schema equals the stored schema.
+#
+# connect() builds each view over the explicit file list from manifest.json
+# (plan F.2.2) so a partial copy of the lake (e.g. entries/ only) works and a
+# plain HTTP server needs no directory listing; the glob form below is the
+# fallback when the manifest cannot be read.
+TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
 
-_SETUP_SQL = """\
--- Base views
--- Every table is Hive-partitioned as <table>/review_status=swissprot|trembl/
--- (plan Part D).  The views read '<table>/*/*.parquet' with hive_partitioning
--- = true and REPLACE the stored `reviewed` column with (review_status =
--- 'swissprot'): the two are equal by construction (validator check 19), and
--- deriving `reviewed` from the path lets DuckDB prune whole files on
--- `WHERE reviewed = true` before opening any TrEMBL footer (verified with
--- EXPLAIN ANALYZE, D.3 spike, 2026-09-17: 1 file read vs 2 without the
--- partition key).  `review_status` itself is EXCLUDEd so the view schema
--- equals the stored schema.
-CREATE OR REPLACE VIEW entries AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
-    FROM read_parquet('{BASE}/entries/*/*.parquet', hive_partitioning = true);
-CREATE OR REPLACE VIEW features AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
-    FROM read_parquet('{BASE}/features/*/*.parquet', hive_partitioning = true);
-CREATE OR REPLACE VIEW xrefs AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
-    FROM read_parquet('{BASE}/xrefs/*/*.parquet', hive_partitioning = true);
-CREATE OR REPLACE VIEW comments AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed, comment::JSON AS comment)
-    FROM read_parquet('{BASE}/comments/*/*.parquet', hive_partitioning = true);
--- Named "publications" to match UniProt's entry page terminology.
--- ("references" is also a reserved word in SQL.)
-CREATE OR REPLACE VIEW publications AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
-    FROM read_parquet('{BASE}/publications/*/*.parquet', hive_partitioning = true);
-CREATE OR REPLACE VIEW accession_map AS SELECT * EXCLUDE (review_status) REPLACE ((review_status = 'swissprot') AS reviewed)
-    FROM read_parquet('{BASE}/accession_map/*/*.parquet', hive_partitioning = true);
+_VIEW_REPLACE = {
+    # comments: the stored VARCHAR JSON is exposed as JSON so -> / ->> work
+    "comments": "(review_status = 'swissprot') AS reviewed, comment::JSON AS comment",
+}
+
+
+def _view_sql(table: str, source: str) -> str:
+    """CREATE VIEW over a read_parquet source (a glob or an explicit file list)."""
+    replace = _VIEW_REPLACE.get(table, "(review_status = 'swissprot') AS reviewed")
+    return (f"CREATE OR REPLACE VIEW {table} AS SELECT * EXCLUDE (review_status) REPLACE ({replace})\n"
+            f"    FROM read_parquet({source}, hive_partitioning = true)")
+
+
+def _missing_view_sql(table: str, columns: list[str]) -> str:
+    """A stub view that fails loudly at query time when a table is not in this
+    lake copy.  It keeps the table's real column names (from manifest.json)
+    so the macros that join it still bind at creation; selecting from it
+    raises the message."""
+    msg = (f"table \"{table}\" is not in this lake copy; download lake/{table}/ "
+           f"(see README \"Download\")")
+    # error() both as every column and as the filter: the optimiser folds a
+    # NULL column away (a filtered query would silently return nothing) and a
+    # bare count(*) never touches a column, so both are needed to raise always.
+    cols = ", ".join(f"error('{msg}')::VARCHAR AS \"{c}\"" for c in columns) or f"error('{msg}') AS _"
+    return f"CREATE OR REPLACE VIEW {table} AS SELECT {cols} WHERE error('{msg}')"
+
+
+# ── Macros (embedded so this file is entirely self-contained) ───────────
+# Macros are bound at call time, so they can be created even when a table
+# they join is missing; calling one then fails with the stub view's message.
+
+_MACRO_SQL = """\
 
 -- Annotation card for a single protein
 CREATE OR REPLACE MACRO protein_card(target_acc) AS TABLE (
@@ -221,14 +239,60 @@ def connect(
     elif base.startswith("s3://"):
         con.sql("INSTALL httpfs; LOAD httpfs;")
 
-    # Create views and macros.
-    # Split on semicolons that aren't inside single-quoted strings,
+    # Views: over the manifest's explicit file lists when the manifest is
+    # readable (partial lakes, plain HTTP), else over globs.
+    m = _read_manifest(base)
+    if m is None:
+        for table in TABLE_NAMES:
+            con.sql(_view_sql(table, f"'{base}/{table}/*/*.parquet'"))
+    else:
+        for table, info in m.get("tables", {}).items():
+            files = [f"{base}/{table}/{rel}" for rel in info.get("files", [])]
+            if not files or not _table_present(con, table, files):
+                con.sql(_missing_view_sql(table, [c["name"] for c in info.get("columns", [])]))
+                continue
+            file_list = "[" + ", ".join(f"'{f}'" for f in files) + "]"
+            con.sql(_view_sql(table, file_list))
+
+    # Macros.  Split on semicolons that aren't inside single-quoted strings,
     # so JSON schemas like '[{"name":{"value":"VARCHAR"}}]' stay intact.
-    sql = _SETUP_SQL.replace("{BASE}", base)
-    for statement in _split_sql(sql):
+    for statement in _split_sql(_MACRO_SQL):
         con.sql(statement)
 
     return con
+
+
+def _is_remote(base: str) -> bool:
+    return base.startswith(("http://", "https://", "s3://"))
+
+
+def _read_manifest(base: str) -> dict | None:
+    """manifest.json from a local dir, http(s) URL or s3 URI; None if unreachable."""
+    try:
+        if base.startswith(("http://", "https://")):
+            import urllib.request
+            with urllib.request.urlopen(f"{base}/manifest.json", timeout=30) as r:
+                return json.loads(r.read())
+        if base.startswith("s3://"):
+            con = duckdb.connect()
+            con.sql("INSTALL httpfs; LOAD httpfs;")
+            return json.loads(con.sql(f"SELECT content FROM read_text('{base}/manifest.json')").fetchone()[0])
+        with open(os.path.join(base, "manifest.json")) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _table_present(con, table: str, files: list[str]) -> bool:
+    """Is the table's first file readable from this lake copy?"""
+    first = files[0]
+    if not _is_remote(first):
+        return os.path.exists(first)
+    try:
+        con.sql(f"SELECT 1 FROM read_parquet('{first}') LIMIT 0")
+        return True
+    except (duckdb.IOException, duckdb.HTTPException, duckdb.Error):
+        return False
 
 
 def manifest(lake_path: str) -> dict:
@@ -240,14 +304,20 @@ def manifest(lake_path: str) -> dict:
     Parameters
     ----------
     lake_path : str
-        Path to the lake directory (local only for now).
+        Path to the lake directory: local, http(s):// or s3://.
 
     Returns
     -------
     dict
         The parsed manifest with keys like "tables", "release", etc.
     """
-    manifest_path = os.path.join(lake_path, "manifest.json")
+    base = lake_path.rstrip("/")
+    manifest_path = f"{base}/manifest.json"
+    if _is_remote(base):
+        m = _read_manifest(base)
+        if m is None:
+            raise FileNotFoundError(f"manifest.json could not be fetched from {manifest_path}")
+        return m
     try:
         with open(manifest_path) as f:
             return json.load(f)
@@ -262,16 +332,43 @@ def manifest(lake_path: str) -> dict:
         ) from None
 
 
-def tables(lake_path: str) -> dict[str, int]:
-    """Return a {table_name: row_count} dict from the manifest.
+def tables(lake_path: str) -> dict[str, dict]:
+    """Return {table_name: {"row_count": n, "present": bool}} from the manifest.
 
-    Quick way to see what's in the lake without querying anything.
+    ``present`` says whether the table's files are in *this* copy of the lake
+    (a partial download may hold entries/ and accession_map/ only).
 
     >>> tables("/data/uniprot/2026_01/lake")
-    {'entries': 248799253, 'features': 1234567890, ...}
+    {'entries': {'row_count': 248799253, 'present': True}, 'features': {...}, ...}
+    """
+    base = lake_path.rstrip("/")
+    m = manifest(base)
+    con = duckdb.connect()
+    if _is_remote(base):
+        con.sql("INSTALL httpfs; LOAD httpfs;")
+    out = {}
+    for name, info in m.get("tables", {}).items():
+        files = [f"{base}/{name}/{rel}" for rel in info.get("files", [])]
+        out[name] = {"row_count": info["row_count"],
+                     "present": bool(files) and _table_present(con, name, files)}
+    return out
+
+
+def files_for_taxid(lake_path: str, taxid: int, table: str = "entries") -> list[str]:
+    """Relative paths of the files that can contain rows for one organism.
+
+    Every partition is sorted (taxid ASC, acc ASC) and manifest.json records
+    each file's taxid range, so the files holding one organism are contiguous
+    and usually one or two per side — an organism-level download without a
+    layout change (plan D.5).
+
+    >>> files_for_taxid("/data/uniprot/2026_01/lake", 9606)
+    ['entries/review_status=swissprot/entries_00001.parquet', 'entries/review_status=trembl/entries_00017.parquet']
     """
     m = manifest(lake_path)
-    return {name: info["row_count"] for name, info in m.get("tables", {}).items()}
+    fd = m["tables"][table]["file_details"]
+    return [f"{table}/{rel}" for rel, d in fd.items()
+            if d.get("taxid_min") is not None and d["taxid_min"] <= taxid <= d["taxid_max"]]
 
 
 def schema(lake_path: str, table: str | None = None) -> dict | str:
@@ -286,7 +383,7 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
     Parameters
     ----------
     lake_path : str
-        Path to the lake directory (local only for now).
+        Path to the lake directory: local, http(s):// or s3://.
     table : str, optional
         Table name to inspect.  If omitted, returns overview of all tables.
 
@@ -386,7 +483,7 @@ def datapackage(lake_path: str) -> dict:
     Parameters
     ----------
     lake_path : str
-        Path to the lake directory (local only for now).
+        Path to the lake directory: local, http(s):// or s3://.
 
     Returns
     -------
