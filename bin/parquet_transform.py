@@ -42,6 +42,8 @@ Requires: duckdb, pyarrow
 import os
 import sys
 import argparse
+import atexit
+import tempfile
 import time
 import json
 import shutil
@@ -243,8 +245,12 @@ def init_duckdb(memory_limit: str, threads: int | None,
     # Priority: explicit --temp-dir > $TMPDIR (SLURM local scratch) > /tmp
     if temp_dir is None:
         temp_dir = os.environ.get("TMPDIR", "/tmp/duckdb_temp")
-    spill_dir = os.path.join(temp_dir, "duckdb_spill")
-    os.makedirs(spill_dir, exist_ok=True)
+    # Unique per process: concurrent jobs may share --temp-dir (e.g. the
+    # documented /scratch/$USER/duckdb_tmp), and a shared spill path risks
+    # collisions and cross-job cleanup.
+    os.makedirs(temp_dir, exist_ok=True)
+    spill_dir = tempfile.mkdtemp(prefix="duckdb_spill_", dir=temp_dir)
+    atexit.register(shutil.rmtree, spill_dir, ignore_errors=True)
     con.sql(f"SET temp_directory='{_sql_escape(spill_dir)}'")
     eprint(f"  DuckDB temp directory: {spill_dir}")
     return con

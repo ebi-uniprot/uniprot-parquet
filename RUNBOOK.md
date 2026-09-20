@@ -236,7 +236,7 @@ column -t -s $'\t' /scratch/$USER/uplake_subset/reports/trace.txt | cut -c1-200
 #    compare with the README time budgets (STREAM 2–4h, SORT 4–8h, TRANSFORM 6–12h)
 
 # 4. Spill went where you pointed it
-ls /scratch/$USER/duckdb_tmp/duckdb_spill 2>/dev/null                 # exists (may be empty after the run)
+ls -d /scratch/$USER/duckdb_tmp/duckdb_spill_* 2>/dev/null            # one per job while running; removed on exit
 
 # 5. Resume works on the cluster
 ./run_lake.sh subset --outdir /scratch/$USER/uplake_subset --duckdb-tmp /scratch/$USER/duckdb_tmp
