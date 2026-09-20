@@ -50,13 +50,13 @@ python -m pytest tests/ -q --stress      # ~8 min; ~15K entries (one-time ~60 MB
 
 **Checks**
 
-- `184 passed`, no skips, no failures (the `--stress` count is the same).
+- `192 passed`, no skips, no failures (the `--stress` count is the same).
 - If the fixture fetch fails (no network), run `python tests/fetch_fixtures.py`
   from a machine that can reach `rest.uniprot.org` and copy
   `tests/fixtures/diverse*.json.gz` over.
 - Optional: confirm the suite exercises the recent fixes —
-  `python -m pytest tests/ -q -k "sentinel or expected_count or interrupt or git_info or OptionalPathGuards or map_columns"`
-  should report 19 passed.
+  `python -m pytest tests/ -q -k "sentinel or expected_count or interrupt or git_info or OptionalPathGuards or map_columns or EmptyChildTables or decompresses_jsonl_once or sql_parity or path_with_quote or null_bounds"`
+  should report 27 passed.
 
 ---
 
@@ -369,8 +369,10 @@ If it OOMs: expect exit 137/140 in `.exitcode`, then a second attempt with
 `MEMORY` in `run_lake.sh`'s `full` mode (or `--process_memory`) and re-submit —
 `-resume` restarts from the transform, not from the stream.
 
-**VALIDATE (1–2 h)** — watch `$WD/.command.log` for `[PASS]` lines; a single
-`[FAIL]` exits 1 and PROVENANCE does not run, so no `RELEASE_COMPLETE` appears.
+**VALIDATE (< 1 h; was 1–2 h when it decompressed the JSONL four times —
+it now makes a single count+sample pass)** — watch `$WD/.command.log` for
+`[PASS]` lines; a single `[FAIL]` exits 1 and PROVENANCE does not run, so no
+`RELEASE_COMPLETE` appears.
 
 **PROVENANCE (< 1 min)** — the workflow's `onComplete` renames
 `.RELEASE_COMPLETE.pending` to `RELEASE_COMPLETE` after every publish copy has
