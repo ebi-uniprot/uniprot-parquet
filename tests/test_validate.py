@@ -118,6 +118,31 @@ def test_release_manifest_writes_complete_marker_last(small_jsonl, parquet_lake,
     assert prov["tables"]["entries"]["total_size_bytes"] > 0
 
 
+def _head(cwd):
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cwd, text=True).strip()
+
+
+def test_git_info_ignores_working_directory(tmp_path, monkeypatch):
+    """Provenance records the pipeline checkout's commit, not whatever repo the
+    Nextflow task work dir happens to be in (or none at all)."""
+    from release_manifest import git_info
+
+    repo_head = _head(os.path.join(BIN_DIR, ".."))
+
+    monkeypatch.chdir(tmp_path)                     # outside any repo
+    assert git_info()["commit"] == repo_head
+
+    other = tmp_path / "other"                      # inside an unrelated repo
+    other.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q"], cwd=other, check=True)
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "x"], cwd=other, env=env, check=True)
+    assert _head(other) != repo_head
+    monkeypatch.chdir(other)
+    assert git_info()["commit"] == repo_head
+
+
 @pytest.mark.parametrize("sidecar", ["manifest.json", "SHA256SUMS.txt"])
 def test_release_manifest_refuses_marker_without_sidecars(small_jsonl, parquet_lake, tmp_path, sidecar):
     """No RELEASE_COMPLETE for a lake missing manifest.json or SHA256SUMS.txt:

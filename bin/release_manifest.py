@@ -50,19 +50,23 @@ def md5_file(path, chunk_size=8 * 1024 * 1024):
 
 
 def git_info():
-    """Get current git commit and dirty status, or None if not in a repo."""
+    """Git commit and dirty status of the pipeline checkout this script lives
+    in, or None if it is not a git repo.  Resolved from __file__, not the
+    working directory: Nextflow runs this in a task work dir that may be
+    outside the repo (or inside an unrelated one)."""
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
     try:
         commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, cwd=repo_dir
         ).decode().strip()
         dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL
+            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL, cwd=repo_dir
         ).decode().strip()
         return {
             "commit": commit,
             "dirty": len(dirty) > 0,
         }
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, OSError):
         return None
 
 
