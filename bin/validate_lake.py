@@ -283,8 +283,13 @@ class ValidationReport:
 # ─── Individual check implementations ─────────────────────────────────
 
 
-def check_completeness(report, lake_dir, jsonl_count):
-    """Verify row counts match the JSONL ground truth."""
+def check_completeness(report, lake_dir, jsonl_count, expected_count=None):
+    """Verify row counts match the JSONL ground truth.
+
+    ``expected_count`` is the entry count recorded upstream of the sort
+    (STREAM_JSONL's entry_count.txt): the sorted JSONL is the ground truth for
+    every other check, so this is the one anchor that catches rows lost
+    between the raw stream and the file being validated against."""
     report.checks.append("\n--- 1. COMPLETENESS ---")
     eprint("\n--- 1. COMPLETENESS ---")
 
@@ -295,6 +300,12 @@ def check_completeness(report, lake_dir, jsonl_count):
         entries_count == jsonl_count,
         f"entries={entries_count:,}, jsonl={jsonl_count:,}"
     )
+    if expected_count is not None:
+        report.check(
+            "JSONL line count and entries count == expected count",
+            jsonl_count == expected_count == entries_count,
+            f"expected={expected_count:,}, jsonl={jsonl_count:,}, entries={entries_count:,}"
+        )
 
     # Sum all four count columns in a single scan of entries
     count_cols = ["feature_count", "xref_count", "comment_count", "reference_count"]
@@ -1080,7 +1091,9 @@ def check_reconstruction(report, lake_dir, jsonl_path, n):
         path = _table_glob(lake_dir, table)
         tbl = duckdb.sql(f"SELECT * FROM read_parquet('{path}') WHERE acc IN ({in_list})").arrow().read_all()
         grouped = {}
-        for row in tbl.to_pylist():
+        # MAP columns come back as dicts (an empty MAP as {}, not []), so
+        # reconstruct.py never has to guess a column's type from its values.
+        for row in tbl.to_pylist(maps_as_pydicts="strict"):
             grouped.setdefault(row["acc"], []).append(row)
         return grouped
 
@@ -1281,6 +1294,11 @@ def main():
         "--schema-baseline", default=None,
         help="Path to schema baseline JSON (enables schema evolution check)",
     )
+    parser.add_argument(
+        "--expected-count", type=int, default=None,
+        help="Entry count recorded upstream of the sort (STREAM_JSONL's "
+             "entry_count.txt); both the JSONL and the entries table must match it",
+    )
     parser.add_argument("-o", "--output", default="validation_report.txt")
     args = parser.parse_args()
 
@@ -1298,7 +1316,7 @@ def main():
     eprint(f"  JSONL: {jsonl_count:,} lines ({time.time()-t0:.1f}s)")
 
     # ── Run all checks ──
-    check_completeness(report, args.lake, jsonl_count)
+    check_completeness(report, args.lake, jsonl_count, args.expected_count)
     entry_total, entry_unique = check_uniqueness(report, args.lake)
     check_null_keys(report, args.lake)
     check_referential_integrity(report, args.lake, entry_unique)

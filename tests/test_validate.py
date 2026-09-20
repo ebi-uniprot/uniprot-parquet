@@ -62,6 +62,36 @@ def test_validate_passes_on_good_lake(small_jsonl, parquet_lake, tmp_path):
     assert any("file hashes match" in c["name"] for c in data["checks"])
 
 
+def _run_validator(lake, jsonl, report_path, *extra):
+    return subprocess.run(
+        [sys.executable, os.path.join(BIN_DIR, "validate_lake.py"), "--lake", lake, "--jsonl", jsonl,
+         "--spot-check-n", "10", "-o", report_path, *extra],
+        capture_output=True, text=True,
+    )
+
+
+def _checks(report_path):
+    with open(os.path.splitext(report_path)[0] + ".json") as f:
+        return {c["name"]: c for c in json.load(f)["checks"]}
+
+
+def test_validate_expected_count(small_jsonl, parquet_lake, tmp_path):
+    """--expected-count (STREAM_JSONL's pre-sort count) must match both the JSONL
+    and the entries table: it is the only anchor independent of the sorted file."""
+    import pyarrow.dataset as ds
+    from conftest import table_files
+    n = ds.dataset(table_files(parquet_lake["lake_dir"], "entries"), format="parquet").count_rows()
+    name = "JSONL line count and entries count == expected count"
+
+    ok = str(tmp_path / "ok.txt")
+    assert _run_validator(parquet_lake["lake_dir"], small_jsonl, ok, "--expected-count", str(n)).returncode == 0
+    assert _checks(ok)[name]["passed"] is True
+
+    bad = str(tmp_path / "bad.txt")
+    assert _run_validator(parquet_lake["lake_dir"], small_jsonl, bad, "--expected-count", str(n + 1)).returncode != 0
+    assert _checks(bad)[name]["passed"] is False
+
+
 def test_validate_fails_on_file_outside_manifest(small_jsonl, parquet_lake, tmp_path):
     """A Parquet file the manifest does not list — here a writer's leftover under
     a hidden .tmp/ directory, which DuckDB's ** glob would read — fails validation."""

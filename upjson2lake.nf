@@ -38,8 +38,8 @@
 
 /* ── PARAMS ────────────────────────────────────────────────────────── */
 params.inputfile      = "${projectDir}/tests/fixtures/small.json.gz"
-params.outdir         = "${projectDir}/results/uniprot_parquet"
-params.release        = "2026_01"
+params.outdir         = "${projectDir}/results/uniprot_parquet"   // also in nextflow.config (report paths)
+params.release        = "2026_03"
 params.process_memory = '96 GB'   // Total memory for heavy processes (Nextflow directive)
 params.duckdb_pct     = 75        // % of process_memory allocated to DuckDB buffer pool
 params.notify_email   = null      // Email for SLURM failure notifications (null = disabled)
@@ -65,16 +65,30 @@ def banner_line(String s) {
 // DuckDB memory is computed inside each process script block (not here) so that
 // it reacts to task.memory on retry — when Nextflow doubles the allocation after
 // an OOM, DuckDB's buffer pool scales up with it.
+//
+// OOM retry lives on the two heavy processes themselves (not in a profile) so
+// it applies under every executor.  Exit codes: 137 = SIGKILL (OOM killer),
+// 140 = SLURM OOM, 143 = SIGTERM (SLURM pre-kill before SIGKILL).  Memory is
+// params.process_memory × attempt, capped at 256 GB; non-OOM failures are terminal.
+def oom_retry(exit_status) {
+    exit_status in [137, 140, 143] ? 'retry' : 'finish'
+}
+
+def scaled_memory(attempt) {
+    [(params.process_memory as MemoryUnit) * attempt, 256.GB].min()
+}
 
 // Scripts live in bin/ which Nextflow adds to $PATH automatically.
 // This allows the pipeline to run from remote URLs (e.g. GitHub).
 
 
 /* ── PROCESS: Stream input to single zstd-compressed JSONL ────────── */
-// Emits a sidecar entry_count.txt for downstream processes.
+// Emits a sidecar entry_count.txt that VALIDATE checks the sorted JSONL and
+// the entries table against — the one count taken upstream of SORT_JSONL.
 // Post-hoc verification: decompresses the output and counts lines
 // to catch pipe-level data loss between stream_jsonl and zstd.
 // Optionally checks against params.expected_count (from release metadata).
+// Accepts gzip-compressed (.gz) or plain JSON input.
 process STREAM_JSONL {
     tag 'stream'
     cpus 4
@@ -91,11 +105,12 @@ process STREAM_JSONL {
     script:
     def cpus = task.cpus
     def expected_flag = params.expected_count ? "--expected-count ${params.expected_count}" : ''
+    def decompress = inputfile.name.endsWith('.gz') ? "pigz -dc ${inputfile}" : "cat ${inputfile}"
     """
     set -euo pipefail
     echo " .-- STREAM_JSONL BEGUN \$(date)"
 
-    pigz -dc ${inputfile} \
+    ${decompress} \
         | stream_jsonl.py --count-file entry_count.txt ${expected_flag} \
         | zstd -3 -T${cpus} -o uniprot.jsonl.zst
 
@@ -124,7 +139,9 @@ process STREAM_JSONL {
 process SORT_JSONL {
     tag 'sort_jsonl'
     cpus 4
-    memory params.process_memory
+    memory { scaled_memory(task.attempt) }
+    errorStrategy { oom_retry(task.exitStatus) }
+    maxRetries 1
     time '24h'
     disk '1 TB'          // DuckDB spill space for ORDER BY
 
@@ -164,15 +181,19 @@ process SORT_JSONL {
 //
 // NOTE on --skip-existing and retries:
 //   --skip-existing is useful for manual re-runs (e.g. fix root cause, then
-//   `nextflow run ... -resume`).  It does NOT help with automatic retries
-//   because Nextflow provisions a fresh work directory per attempt — partial
-//   outputs from a failed attempt are not visible to the retry.  This is a
-//   known limitation; splitting into per-table processes would fix it but
-//   adds significant complexity for a rare failure mode.
+//   `nextflow run ... -resume`).  It does NOT help with the automatic OOM
+//   retry below because Nextflow provisions a fresh work directory per
+//   attempt — partial outputs from a failed attempt are not visible to the
+//   retry.  This is a known limitation; splitting into per-table processes
+//   would fix it but adds significant complexity for a rare failure mode.
+//   A table is only skipped when its completion sentinel matches the files on
+//   disk (see stream_to_parquet in bin/parquet_transform.py).
 process PARQUET_TRANSFORM {
     tag 'transform'
     cpus 4
-    memory params.process_memory
+    memory { scaled_memory(task.attempt) }
+    errorStrategy { oom_retry(task.exitStatus) }
+    maxRetries 1
     time '48h'
     disk '2 TB'          // DuckDB ORDER BY spill + Parquet output.  accession_map is the one
                          // table with a real sort (reviewed DESC, acc): ~250M + secondaries rows
@@ -210,7 +231,8 @@ process PARQUET_TRANSFORM {
 // Validates completeness, uniqueness, referential integrity, sort order,
 // round-trip spot checks against the source JSONL, Parquet file integrity,
 // manifest consistency, and optionally schema evolution against a baseline.
-// Exits 1 on ANY failure.  Uses the sorted JSONL as ground truth (same entries, same count).
+// Exits 1 on ANY failure.  Uses the sorted JSONL as ground truth (same entries, same count),
+// anchored to STREAM_JSONL's entry_count.txt so a row lost in SORT_JSONL is caught.
 //
 // SCHEMA EVOLUTION GUARD (intentionally disabled):
 //   A schema_baseline.json exists in the repo and validate_lake.py supports
@@ -234,6 +256,7 @@ process VALIDATE {
     input:
     path lake
     path sorted_jsonl
+    path count_file
 
     output:
     path "validation_report.txt", emit: report
@@ -250,6 +273,7 @@ process VALIDATE {
     validate_lake.py \
         --lake ${lake} \
         --jsonl ${sorted_jsonl} \
+        --expected-count \$(cat ${count_file}) \
         --spot-check-n 1000 \
         ${schema_baseline_flag} \
         -o validation_report.txt
@@ -339,10 +363,12 @@ workflow {
     PARQUET_TRANSFORM(SORT_JSONL.out.sorted_jsonl)
 
     // 4. Validate the Parquet lake (uses sorted JSONL as ground truth —
-    //    same entries, same count, just reordered)
+    //    same entries, same count, just reordered — anchored to the entry
+    //    count taken before the sort)
     VALIDATE(
         PARQUET_TRANSFORM.out.lake,
         SORT_JSONL.out.sorted_jsonl,
+        STREAM_JSONL.out.count_file,
     )
 
     // 5. Generate provenance record (only after validation passes)
