@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # ─── UniProtKB → Parquet Data Lake Pipeline ─────────────────────
 # Usage:
-#   ./run_lake.sh                                         # small: ~4K entries, local
+#   ./run_lake.sh                                         # small: 52-entry committed fixture, local
+#   ./run_lake.sh --input demo/input.json.gz              # small: ~5K demo entries (after demo/run_demo.sh)
 #   ./run_lake.sh subset                                  # subset: 100K entries, SLURM short
 #   ./run_lake.sh full --expected-count 248799253          # full UniProtKB, SLURM prod
 #   ./run_lake.sh full --expected-count 248799253 --input /path/to/UniProtKB.json.gz
 #   ./run_lake.sh full --expected-count 248799253 --outdir /scratch/results
+#   ./run_lake.sh full --expected-count 248799253 --release 2026_04
 
 # Prerequisites:
 #   Activate your conda/mamba environment before running this script.
@@ -17,14 +19,20 @@
 
 set -euo pipefail
 
-MODE="${1:-small}"
-shift || true
+# Mode defaults to small and may be omitted when the first argument is a flag.
+if [[ "${1:-}" == --* ]]; then
+    MODE="small"
+else
+    MODE="${1:-small}"
+    shift || true
+fi
 
 # ─── Parse optional flags ─────────────────────────────────────────
 INPUTFILE_OVERRIDE=""
 OUTDIR_OVERRIDE=""
 DUCKDB_TEMP_OVERRIDE=""
 EXPECTED_COUNT=""
+RELEASE_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -32,6 +40,7 @@ while [[ $# -gt 0 ]]; do
         --outdir)         OUTDIR_OVERRIDE="$2";      shift 2 ;;
         --duckdb-tmp)     DUCKDB_TEMP_OVERRIDE="$2"; shift 2 ;;
         --expected-count) EXPECTED_COUNT="$2";        shift 2 ;;
+        --release)        RELEASE_OVERRIDE="$2";      shift 2 ;;
         *)                echo "Unknown flag: $1"; exit 1  ;;
     esac
 done
@@ -39,7 +48,7 @@ done
 # ─── Defaults ─────────────────────────────────────────────────────
 case "$MODE" in
     small)
-        INPUTFILE="demo/input.json.gz"
+        INPUTFILE="tests/fixtures/small.json.gz"   # committed: works on a fresh clone
         OUTDIR="$(pwd)/datalake"
         MEMORY="8GB"
         RELEASE="small"
@@ -56,11 +65,11 @@ case "$MODE" in
         INPUTFILE="UniProtKB.json.gz"
         OUTDIR="$(pwd)/datalake"
         MEMORY="96GB"
-        RELEASE="2026_01"
+        RELEASE="2026_03"
         PROFILE="prod"
         ;;
     *)
-        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N]"
+        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL]"
         exit 1
         ;;
 esac
@@ -77,6 +86,7 @@ fi
 # Apply overrides
 [[ -n "$INPUTFILE_OVERRIDE" ]] && INPUTFILE="$INPUTFILE_OVERRIDE"
 [[ -n "$OUTDIR_OVERRIDE" ]]    && OUTDIR="$OUTDIR_OVERRIDE"
+[[ -n "$RELEASE_OVERRIDE" ]]   && RELEASE="$RELEASE_OVERRIDE"
 
 W=55
 BAR=$(printf '═%.0s' $(seq 1 $W))
@@ -96,6 +106,9 @@ echo ""
 if [[ ! -f "$INPUTFILE" ]]; then
     echo "ERROR: Input file not found: $INPUTFILE" >&2
     echo "  (resolved from working directory: $(pwd))" >&2
+    if [[ "$INPUTFILE" == demo/* ]]; then
+        echo "  Run demo/run_demo.sh first to download the demo input, or pass --input." >&2
+    fi
     exit 1
 fi
 

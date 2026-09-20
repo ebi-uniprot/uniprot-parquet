@@ -349,7 +349,8 @@ cd demo && ./run_demo.sh
 #### Quick start with run_lake.sh
 
 ```bash
-./run_lake.sh                                          # small: ~4K entries (demo data), local
+./run_lake.sh                                          # small: 52-entry committed fixture, local
+./run_lake.sh --input demo/input.json.gz               # small: ~5K demo entries (after demo/run_demo.sh)
 ./run_lake.sh subset                                   # subset: 100K entries, SLURM short queue
 ./run_lake.sh full --expected-count 248799253           # full UniProtKB, SLURM prod queue
 ```
@@ -361,6 +362,7 @@ Override defaults with flags:
 ```bash
 ./run_lake.sh full \
     --expected-count 248799253 \
+    --release 2026_03 \
     --input /path/to/UniProtKB.json.gz \
     --outdir /scratch/uniprot_parquet \
     --duckdb-tmp /scratch/$USER/duckdb_tmp
@@ -377,7 +379,7 @@ nextflow run upjson2lake.nf -profile local \
 # Production (SLURM)
 nextflow run upjson2lake.nf -profile prod \
     --inputfile /path/to/UniProtKB.json.gz \
-    --release 2026_02 \
+    --release 2026_03 \
     --outdir /scratch/uniprot_parquet \
     --process_memory '96 GB' \
     --expected_count 248799253 \
@@ -392,7 +394,7 @@ nextflow run upjson2lake.nf -profile prod \
 | ------------------ | ------------------------------ | ------------------------------------------------------------------------------------------ |
 | `--inputfile`      | `tests/fixtures/small.json.gz` | Input UniProtKB JSON(.gz) file                                                             |
 | `--outdir`         | `results/uniprot_parquet`         | Output base directory                                                                      |
-| `--release`        | `2026_01`                      | Release label (output goes to `<outdir>/<release>/`)                                       |
+| `--release`        | `2026_03`                      | Release label (output goes to `<outdir>/<release>/`)                                       |
 | `--process_memory` | `96 GB`                        | Memory for heavy processes (DuckDB gets 75% of this)                                       |
 | `--duckdb_pct`     | `75`                           | Percentage of process memory allocated to DuckDB buffer pool                               |
 | `--duckdb_temp`    | `$TMPDIR` or `/tmp`            | DuckDB spill directory for out-of-core sorts                                               |

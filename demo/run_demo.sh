@@ -12,7 +12,7 @@
 #
 # Output (all inside demo/):
 #   input.json.gz           Downloaded UniProtKB JSON (kept for re-runs)
-#   lake/2026_01/           Parquet data lake + sorted JSONL + provenance
+#   lake/<release>/         Parquet data lake + sorted JSONL + provenance (RELEASE below)
 #
 # Usage:
 #   cd demo && ./run_demo.sh            # default
@@ -32,7 +32,7 @@ cd "$(dirname "$0")"
 #                     Arabidopsis (3702), S. cerevisiae (559292)
 # Length 70–75 aa keeps the download fast while giving ~5k diverse entries.
 QUERY="(organism_id:9606+OR+organism_id:10090+OR+organism_id:7227+OR+organism_id:3702+OR+organism_id:559292)+AND+(length:%5B70+TO+75%5D)"
-RELEASE="2026_01"
+RELEASE="2026_03"
 INPUT="input.json.gz"
 LAKE_DIR="lake"
 MEMORY="8GB"
