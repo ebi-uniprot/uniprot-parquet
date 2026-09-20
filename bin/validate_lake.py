@@ -404,9 +404,10 @@ def check_null_keys(report, lake_dir):
 
         for batch in dataset.to_batches(columns=columns):
             for col_name in columns:
+                # pc.sum returns null on an empty batch (zero-row tables)
                 empty_counts[col_name] += pc.sum(
                     pc.equal(batch.column(col_name), "")
-                ).as_py()
+                ).as_py() or 0
 
         for col_name in columns:
             ec = empty_counts[col_name]
@@ -794,7 +795,7 @@ def check_sequence_integrity(report, lake_dir):
         seq_lens = batch.column("seq_length")
         str_lens = pc.utf8_length(batch.column("sequence"))
         is_equal = pc.equal(seq_lens, str_lens)
-        n_bad = pc.sum(pc.invert(is_equal)).as_py()
+        n_bad = pc.sum(pc.invert(is_equal)).as_py() or 0
         if n_bad > 0:
             mismatches += n_bad
             if len(mismatch_examples) < 3:
@@ -808,7 +809,7 @@ def check_sequence_integrity(report, lake_dir):
                             f"len(sequence)={stls[i]}"
                         )
 
-        zero_length += pc.sum(pc.equal(seq_lens, 0)).as_py()
+        zero_length += pc.sum(pc.equal(seq_lens, 0)).as_py() or 0
 
     report.check(
         "len(sequence) == seq_length for all entries",
@@ -848,7 +849,7 @@ def check_feature_coordinates(report, lake_dir):
             both_present,
             pc.greater(starts, ends),
         )
-        n_bad = pc.sum(start_gt_end).as_py()
+        n_bad = pc.sum(start_gt_end).as_py() or 0
         if n_bad > 0:
             inverted += n_bad
             if len(inversion_examples) < 3:

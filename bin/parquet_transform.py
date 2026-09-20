@@ -1546,7 +1546,10 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
         sentinel_path: where to write the completion sentinel (None: no sentinel)
 
     Returns (total_rows, file_list, arrow_schema); file paths are relative to
-    ``table_dir`` (``review_status=swissprot/entries_00001.parquet``).
+    ``table_dir`` (``review_status=swissprot/entries_00001.parquet``).  A
+    zero-row result still publishes one empty schema-valid file under
+    ``review_status=swissprot/`` so glob and dataset readers never miss the
+    table.
     """
     eprint(f"  Querying DuckDB for {label}...")
     reader = con.sql(sql).to_arrow_reader(batch_size=batch_size)
@@ -1631,6 +1634,15 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
             elapsed = time.time() - t0
             eprint(f"    {label}: {total_rows:,} rows so far "
                    f"({elapsed:.0f}s, {total_rows / elapsed if elapsed else 0:,.0f} rows/s)")
+
+        if arrow_schema is None:
+            # Zero rows (a tiny subset may have no entries with, say,
+            # comments): still publish one empty schema-valid file so
+            # ``<table>/**/*.parquet`` globs and dataset readers work.
+            arrow_schema = _annotate_schema(reader.schema, label, _file_metadata(release))
+            sorting_columns = build_sorting_columns(sort_order, arrow_schema) if sort_order else None
+            st["side"] = PARTITION_VALUES[True]
+            open_writer()
 
         close_writer()
         # All-or-nothing publish.  First drop Parquet files a previous run left

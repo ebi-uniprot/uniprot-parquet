@@ -792,3 +792,73 @@ class TestSortOrder:
         accs = arrow.column("acc").to_pylist()
         keys = [(not r, t, a) for r, t, a in zip(reviewed, taxids, accs)]
         assert keys == sorted(keys), "Publications not sorted by (reviewed DESC, taxid ASC, acc ASC)"
+
+
+# ─── Zero-row child tables (tiny subsets) ──────────────────────────
+
+@pytest.fixture(scope="module")
+def empty_child_lake(tmp_path_factory):
+    """A lake built from entries stripped of comments and references: the
+    comments and publications tables are zero-row and must still publish one
+    empty schema-valid Parquet file each."""
+    import orjson
+    import zstandard as zstd
+    from conftest import _json_gz_to_jsonl_zst, run_transform  # noqa: F401
+
+    out_dir = tmp_path_factory.mktemp("emptychild")
+    with gzip.open(SMALL_JSON_GZ, "rt") as f:
+        entries = json.load(f)["results"]
+    jsonl = str(out_dir / "stripped.jsonl.zst")
+    cctx = zstd.ZstdCompressor(level=3)
+    with open(jsonl, "wb") as fout:
+        with cctx.stream_writer(fout) as w:
+            for e in entries:
+                e.pop("comments", None)
+                e.pop("references", None)
+                w.write(orjson.dumps(e) + b"\n")
+    lake = str(out_dir / "lake")
+    run_transform(jsonl, lake, release="empty_2026")
+    return {"lake_dir": lake, "jsonl": jsonl}
+
+
+class TestEmptyChildTables:
+    def test_zero_row_table_publishes_empty_file(self, empty_child_lake):
+        import duckdb
+        lake = empty_child_lake["lake_dir"]
+        for table in ("comments", "publications"):
+            files = table_files(lake, table)
+            assert files, f"{table}: zero-row table published no Parquet file"
+            assert all(pq.read_metadata(f).num_rows == 0 for f in files)
+            n = duckdb.sql(
+                f"SELECT count(*) FROM read_parquet('{lake}/{table}/**/*.parquet')"
+            ).fetchone()[0]
+            assert n == 0
+            assert open_table(lake, table).count_rows() == 0
+
+    def test_zero_row_table_in_manifest(self, empty_child_lake):
+        with open(os.path.join(empty_child_lake["lake_dir"], "manifest.json")) as f:
+            m = json.load(f)
+        for table in ("comments", "publications"):
+            t = m["tables"][table]
+            assert t["row_count"] == 0
+            assert t["files"], f"{table}: manifest lists no files"
+            assert t["columns"], f"{table}: manifest lost the schema"
+
+    def test_validator_passes_on_zero_row_tables(self, empty_child_lake, tmp_path):
+        import subprocess
+        import sys
+        bin_dir = os.path.join(os.path.dirname(__file__), "..", "bin")
+        env = os.environ.copy()
+        env["PYTHONPATH"] = bin_dir + ":" + env.get("PYTHONPATH", "")
+        report = str(tmp_path / "report.txt")
+        result = subprocess.run(
+            [sys.executable, os.path.join(bin_dir, "validate_lake.py"),
+             "--lake", empty_child_lake["lake_dir"],
+             "--jsonl", empty_child_lake["jsonl"],
+             "--spot-check-n", "5", "-o", report],
+            env=env, capture_output=True, text=True)
+        detail = ""
+        if result.returncode != 0 and os.path.exists(report):
+            with open(report) as f:
+                detail = f.read()
+        assert result.returncode == 0, f"validator failed:\n{result.stderr}\n{detail}"

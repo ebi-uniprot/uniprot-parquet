@@ -426,7 +426,7 @@ print(con.sql(\"SELECT count(*) FROM accession_map WHERE NOT is_primary\").fetch
 | Manual re-run of the transform on an existing `lake/` (outside Nextflow) | `parquet_transform.py ... --skip-existing` skips only tables whose `.complete/<table>.json` matches the files on disk; anything else is rebuilt, with a `REBUILD <table>` line on stderr. |
 | Reports in `<outdir>/reports/` look stale | They are overwritten on every run; check the mtime, then `.nextflow.log` for `Failed to render` (should not appear). |
 
-Known limitation: a subset in which *no* entry has, say, comments produces a
-zero-row `comments` table with no Parquet files, and the validator's
-`**/*.parquet` glob then fails on that table. This cannot happen on the full
-dump; for tiny hand-made subsets pick entries that exercise every table.
+A subset in which *no* entry has, say, comments produces a zero-row `comments`
+table holding one empty schema-valid Parquet file, so `**/*.parquet` globs,
+dataset readers, and the validator all still work (previously the table got no
+files at all and the validator's glob failed).
