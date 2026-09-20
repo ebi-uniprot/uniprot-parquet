@@ -191,3 +191,36 @@ def test_release_manifest_refuses_marker_without_sidecars(small_jsonl, parquet_l
     assert result.returncode != 0
     assert sidecar in result.stderr
     assert not marker.exists()
+
+
+def test_validator_decompresses_jsonl_once(small_lake, tmp_path, monkeypatch):
+    """main() makes exactly one pass over the source JSONL: the fused
+    count+sample pass feeds every check that needs source entries."""
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    import validate_lake
+
+    calls = {"open": 0}
+    real_open = validate_lake._open_jsonl_lines
+
+    def counting_open(path):
+        calls["open"] += 1
+        return real_open(path)
+
+    def fail_count(path):
+        raise AssertionError("count_jsonl_lines must not be called from main()")
+
+    monkeypatch.setattr(validate_lake, "_open_jsonl_lines", counting_open)
+    monkeypatch.setattr(validate_lake, "count_jsonl_lines", fail_count)
+
+    report = str(tmp_path / "report.txt")
+    monkeypatch.setattr(sys, "argv", [
+        "validate_lake.py",
+        "--lake", small_lake["lake_dir"],
+        "--jsonl", small_lake["jsonl"],
+        "--spot-check-n", "5",
+        "-o", report,
+    ])
+    with pytest.raises(SystemExit) as exc:
+        validate_lake.main()
+    assert exc.value.code == 0
+    assert calls["open"] == 1, f"JSONL decompressed {calls['open']} times, expected 1"

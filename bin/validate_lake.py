@@ -198,9 +198,14 @@ def _open_jsonl_lines(jsonl_path: str):
             yield from f
 
 
-def sample_jsonl_entries(jsonl_path: str, n: int,
-                         seed: int = 42) -> list[dict]:
-    """Reservoir-sample N parsed entries from a JSONL(.zst) file."""
+def sample_and_count_jsonl(jsonl_path: str, n: int,
+                           seed: int = 42) -> tuple[list[dict], int]:
+    """Reservoir-sample N parsed entries from a JSONL(.zst) file and count
+    its non-empty lines, in a single decompression pass.
+
+    The full stream (~1 TB uncompressed at production scale) is expensive to
+    decompress, so main() does this once and shares the sample across every
+    check that needs source entries."""
     rng = random.Random(seed)
     reservoir = []
     idx = 0
@@ -217,7 +222,22 @@ def sample_jsonl_entries(jsonl_path: str, n: int,
                 reservoir[j] = json.loads(line)
         idx += 1
 
-    return reservoir
+    return reservoir, idx
+
+
+def sample_jsonl_entries(jsonl_path: str, n: int,
+                         seed: int = 42) -> list[dict]:
+    """Reservoir-sample N parsed entries from a JSONL(.zst) file."""
+    return sample_and_count_jsonl(jsonl_path, n, seed)[0]
+
+
+def _spot_subsample(sampled: list[dict], n: int, seed: int = 42) -> list[dict]:
+    """A deterministic size-n subsample of the shared JSONL sample, for the
+    checks that honour --spot-check-n (the shared sample holds
+    max(spot_check_n, 1000) entries)."""
+    if n >= len(sampled):
+        return sampled
+    return random.Random(seed).sample(sampled, n)
 
 
 # ─── Validation framework ─────────────────────────────────────────────
@@ -548,15 +568,12 @@ def check_sort_order(report, lake_dir):
 
 
 
-def check_round_trip(report, lake_dir, jsonl_path, n):
-    """Spot-check N entries against the JSONL ground truth."""
+def check_round_trip(report, lake_dir, sampled_entries, n):
+    """Spot-check N entries from the shared JSONL sample against the lake."""
     report.checks.append(f"\n--- 6. ROUND-TRIP SPOT CHECK (n={n}) ---")
     eprint(f"\n--- 6. ROUND-TRIP SPOT CHECK (n={n}) ---")
 
-    eprint(f"  Sampling {n} entries from JSONL (reservoir sampling)...")
-    t0 = time.time()
-    sampled = sample_jsonl_entries(jsonl_path, n)
-    eprint(f"  Sampled {len(sampled)} entries in {time.time()-t0:.1f}s")
+    sampled = _spot_subsample(sampled_entries, n)
 
     if not sampled:
         report.check("round-trip sample non-empty", False, "no entries sampled")
@@ -950,7 +967,7 @@ def check_schema_types(report, lake_dir):
         )
 
 
-def check_field_completeness(report, lake_dir, jsonl_path):
+def check_field_completeness(report, lake_dir, sampled_entries):
     """Verify the lake captures every top-level field from the source JSON.
 
     Samples one entry from the JSONL and checks that every top-level key is
@@ -967,10 +984,9 @@ def check_field_completeness(report, lake_dir, jsonl_path):
     eprint("\n--- 13. FIELD COMPLETENESS ---")
 
     # ── Collect all top-level keys from a sample of source entries ──
-    eprint("  Sampling source JSONL for top-level field names...")
     source_keys = set()
-    # Use the existing sample (up to 1000 entries) to cover rare fields.
-    sampled = sample_jsonl_entries(jsonl_path, 1000)
+    # The shared sample (>= 1000 entries) covers rare fields.
+    sampled = sampled_entries
     if not sampled:
         report.check("field completeness sample non-empty", False, "no entries sampled")
         return
@@ -1072,7 +1088,7 @@ def check_text_value(report, lake_dir):
                      f"{with_text:,}/{n:,} rows have text")
 
 
-def check_reconstruction(report, lake_dir, jsonl_path, n):
+def check_reconstruction(report, lake_dir, sampled_entries, n):
     """g(f(x)) == x on a sample: rebuild sampled entries from the five tables
     with bin/reconstruct.py and compare with the JSONL (plan A11, the release
     gate for the residual trim A13)."""
@@ -1081,7 +1097,7 @@ def check_reconstruction(report, lake_dir, jsonl_path, n):
     import duckdb
     from reconstruct import reconstruct_entry, entries_match
 
-    sampled = sample_jsonl_entries(jsonl_path, n)
+    sampled = _spot_subsample(sampled_entries, n)
     originals = {e["primaryAccession"]: e for e in sampled if e.get("primaryAccession")}
     if not originals:
         report.check("reconstruction sample non-empty", False, "no entries sampled")
@@ -1310,11 +1326,17 @@ def main():
 
     report = ValidationReport()
 
-    # ── 1. Count JSONL lines (ground truth) ──
-    eprint("\nCounting JSONL lines (ground truth)...")
+    # ── 1. Count JSONL lines + sample entries (ground truth, one pass) ──
+    # A single decompression pass serves both the line count and every check
+    # that needs source entries (round-trip, field completeness,
+    # reconstruction) — decompressing the stream per check is the dominant
+    # cost at production scale.
+    sample_n = max(args.spot_check_n, 1000)
+    eprint(f"\nCounting JSONL lines and sampling {sample_n:,} entries (one pass)...")
     t0 = time.time()
-    jsonl_count = count_jsonl_lines(args.jsonl)
-    eprint(f"  JSONL: {jsonl_count:,} lines ({time.time()-t0:.1f}s)")
+    sampled_entries, jsonl_count = sample_and_count_jsonl(args.jsonl, sample_n)
+    eprint(f"  JSONL: {jsonl_count:,} lines, {len(sampled_entries):,} sampled "
+           f"({time.time()-t0:.1f}s)")
 
     # ── Run all checks ──
     check_completeness(report, args.lake, jsonl_count, args.expected_count)
@@ -1322,16 +1344,16 @@ def main():
     check_null_keys(report, args.lake)
     check_referential_integrity(report, args.lake, entry_unique)
     check_sort_order(report, args.lake)
-    check_round_trip(report, args.lake, args.jsonl, args.spot_check_n)
+    check_round_trip(report, args.lake, sampled_entries, args.spot_check_n)
     check_parquet_integrity(report, args.lake)
     check_manifest(report, args.lake)
     check_denormalized_sync(report, args.lake)
     check_sequence_integrity(report, args.lake)
     check_feature_coordinates(report, args.lake)
     check_schema_types(report, args.lake)
-    check_field_completeness(report, args.lake, args.jsonl)
+    check_field_completeness(report, args.lake, sampled_entries)
     check_text_value(report, args.lake)
-    check_reconstruction(report, args.lake, args.jsonl, args.spot_check_n)
+    check_reconstruction(report, args.lake, sampled_entries, args.spot_check_n)
     check_accession_map(report, args.lake)
     check_partitions(report, args.lake)
     if args.schema_baseline:
