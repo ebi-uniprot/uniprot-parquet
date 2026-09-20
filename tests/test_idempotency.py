@@ -141,6 +141,48 @@ def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
             )
 
 
+def _sentinel(outdir, name):
+    return os.path.join(outdir, ".complete", f"{name}.json")
+
+
+def test_skip_existing_rebuilds_without_sentinel(small_jsonl, tmp_path):
+    """Files on disk are not proof of a complete table: a run killed during the
+    publish window leaves Parquet files but no completion sentinel, and
+    --skip-existing must rebuild rather than trust (and hash) them."""
+    outdir = str(tmp_path / "lake")
+    assert _run_transform(small_jsonl, outdir).returncode == 0
+    with open(_sentinel(outdir, "entries")) as f:
+        sentinel = json.load(f)
+    assert sentinel["files"] == sorted(
+        os.path.relpath(p, os.path.join(outdir, "entries")) for p in table_files(outdir, "entries"))
+    n = _expected_entries_from_jsonl(small_jsonl)
+    assert sentinel["row_count"] == n
+
+    os.remove(_sentinel(outdir, "entries"))
+    mtime_before = os.path.getmtime(table_files(outdir, "entries")[0])
+    result = _run_transform(small_jsonl, outdir, extra_args=["--skip-existing"])
+    assert result.returncode == 0, result.stderr
+    assert "REBUILD entries" in result.stderr
+    assert "SKIP features" in result.stderr
+    assert os.path.getmtime(table_files(outdir, "entries")[0]) > mtime_before
+    assert os.path.exists(_sentinel(outdir, "entries"))
+    assert _get_row_counts(outdir)["entries"] == n
+
+
+def test_skip_existing_rebuilds_on_file_list_mismatch(small_jsonl, tmp_path):
+    """A table whose files on disk differ from what its sentinel recorded (here
+    one partition file lost) is rebuilt, restoring the full row count."""
+    outdir = str(tmp_path / "lake")
+    assert _run_transform(small_jsonl, outdir).returncode == 0
+    n = _expected_entries_from_jsonl(small_jsonl)
+    os.remove(table_files(outdir, "entries")[-1])
+    assert _get_row_counts(outdir)["entries"] < n
+    result = _run_transform(small_jsonl, outdir, extra_args=["--skip-existing"])
+    assert result.returncode == 0, result.stderr
+    assert "REBUILD entries" in result.stderr
+    assert _get_row_counts(outdir)["entries"] == n
+
+
 def test_rebuild_with_fewer_files_removes_stale_ones(small_jsonl, tmp_path):
     """A rebuild that writes fewer files per partition deletes the previous run's extras."""
     outdir = str(tmp_path / "lake")

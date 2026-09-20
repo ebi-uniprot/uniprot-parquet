@@ -558,6 +558,88 @@ class TestTypedFallbacks:
             assert actual.get(col) == expected, f"{table}.{col}: {actual.get(col)} != {expected}"
 
 
+class TestOptionalPathGuards:
+    """Every SQL builder binds against a subset that lacks optional paths, and a
+    non-UniProtKB input is refused with a clear message (not a BinderException)."""
+
+    # A single entry carrying only the paths every UniProtKB entry has.
+    MINIMAL = {
+        "primaryAccession": "P00001", "uniProtkbId": "TEST_HUMAN",
+        "entryType": "UniProtKB reviewed (Swiss-Prot)",
+        "organism": {"taxonId": 9606, "scientificName": "Homo sapiens"},
+        "sequence": {"value": "MKV", "length": 3, "molWeight": 360, "md5": "x", "crc64": "y"},
+        "entryAudit": {"firstPublicDate": "2000-01-01", "lastAnnotationUpdateDate": "2000-01-02",
+                       "lastSequenceUpdateDate": "2000-01-03", "entryVersion": 1, "sequenceVersion": 1},
+        "proteinExistence": "1: Evidence at protein level", "annotationScore": 1.0,
+    }
+    # Optional top-level groups, dropped one at a time from the real fixture.
+    OPTIONAL_GROUPS = ["genes", "secondaryAccessions", "proteinDescription", "extraAttributes",
+                       "keywords", "uniProtKBCrossReferences", "features", "comments",
+                       "references", "organismHosts", "geneLocations"]
+
+    @staticmethod
+    def _builders():
+        from parquet_transform import (_build_entries_sql, _build_features_sql, _build_xrefs_sql,
+                                       _build_comments_sql, _build_publications_sql,
+                                       _build_accession_map_sql)
+        return {"entries": _build_entries_sql, "features": _build_features_sql,
+                "xrefs": _build_xrefs_sql, "comments": _build_comments_sql,
+                "publications": _build_publications_sql, "accession_map": _build_accession_map_sql}
+
+    @staticmethod
+    def _stage(entries, tmp_path):
+        """JSONL → staged Parquet → (con, read_clause, schema_paths), as main() does."""
+        import duckdb
+        from parquet_transform import build_read_clause, stage_to_parquet, discover_schema_paths
+        jsonl = tmp_path / "in.jsonl"
+        with open(jsonl, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        con = duckdb.connect()
+        staged = str(tmp_path / "staged.parquet")
+        read_clause, _ = stage_to_parquet(con, build_read_clause(str(jsonl)), staged)
+        return con, read_clause, discover_schema_paths(staged)
+
+    def _build_all(self, entries, tmp_path):
+        from parquet_transform import check_required_paths, check_declared_types, check_promoted_paths
+        con, read_clause, paths = self._stage(entries, tmp_path)
+        check_required_paths(paths)
+        check_declared_types(con, paths)
+        check_promoted_paths(paths)
+        return {name: con.sql(build(paths).format(read_clause=read_clause)).arrow().read_all()
+                for name, build in self._builders().items()}
+
+    def test_minimal_entry_builds_every_table(self, tmp_path):
+        tables = self._build_all([self.MINIMAL], tmp_path)
+        assert tables["entries"].num_rows == 1 and tables["accession_map"].num_rows == 1
+        for child in ("features", "xrefs", "comments", "publications"):
+            assert tables[child].num_rows == 0, child
+        row = tables["entries"].to_pylist()[0]
+        assert row["acc"] == "P00001" and row["division"] == "human"
+        assert row["protein_name"] is None and row["lineage"] is None
+        assert row["feature_count"] == 0 and row["keyword_ids"] == [] and row["go_ids"] == []
+
+    @pytest.mark.parametrize("group", OPTIONAL_GROUPS)
+    def test_fixture_without_optional_group_builds(self, group, tmp_path):
+        with gzip.open(SMALL_JSON_GZ, "rt") as f:
+            entries = json.load(f)["results"][:20]
+        for e in entries:
+            e.pop(group, None)
+        tables = self._build_all(entries, tmp_path)
+        assert tables["entries"].num_rows == len(entries)
+
+    def test_missing_required_path_is_refused_clearly(self, tmp_path):
+        from parquet_transform import check_required_paths
+        _, _, paths = self._stage([{k: v for k, v in self.MINIMAL.items() if k != "entryAudit"}], tmp_path)
+        with pytest.raises(RuntimeError, match="entryAudit.entryVersion"):
+            check_required_paths(paths)
+        with pytest.raises(RuntimeError, match="features.type"):
+            check_required_paths(set(self.MINIMAL) | {"features", "features.description"}
+                                 | {"organism.taxonId", "organism.scientificName"}
+                                 | {f"sequence.{k}" for k in self.MINIMAL["sequence"]}
+                                 | {f"entryAudit.{k}" for k in self.MINIMAL["entryAudit"]})
+
+
 def _top_level_keys(json_gz):
     import gzip, json
     with gzip.open(json_gz, "rt") as f:

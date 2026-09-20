@@ -263,6 +263,23 @@ COLUMN_TYPES: dict[tuple[str, str], str] = {
     ("entries", "go_terms"): "STRUCT(id VARCHAR, aspect VARCHAR, term VARCHAR, evidence_type VARCHAR)[]",
     ("entries", "extra_attributes"): "STRUCT(countByCommentType MAP(VARCHAR, BIGINT), countByFeatureType MAP(VARCHAR, BIGINT), uniParcId VARCHAR)",
     ("entries", "gene_locations"): 'STRUCT(geneEncodingType VARCHAR, evidences STRUCT(evidenceCode VARCHAR, "source" VARCHAR, id VARCHAR)[], "value" VARCHAR)[]',
+    # Scalar / list columns whose source a subset may lack altogether (a
+    # TrEMBL-only slice has no recommendedName; an unnamed-organism slice no
+    # commonName or lineage; a subset of entries without genes or secondaries).
+    ("entries", "protein_name"): "VARCHAR",
+    ("entries", "gene_names"): "VARCHAR[]",
+    ("entries", "gene_name"): "VARCHAR",
+    ("entries", "gene_synonyms"): "VARCHAR[]",
+    ("entries", "alt_protein_names"): "VARCHAR[]",
+    ("entries", "protein_flag"): "VARCHAR",
+    ("entries", "secondary_accs"): "VARCHAR[]",
+    ("entries", "organism_common"): "VARCHAR",
+    ("entries", "lineage"): "VARCHAR[]",
+    ("entries", "uniparc_id"): "VARCHAR",
+    ("features", "description"): "VARCHAR",
+    ("features", "start_modifier"): "VARCHAR",
+    ("features", "end_modifier"): "VARCHAR",
+    ("publications", "publication_date"): "VARCHAR",
     ("features", "feature_id"): "VARCHAR",
     ("features", "original_sequence"): "VARCHAR",
     ("features", "alternative_sequences"): "VARCHAR[]",
@@ -590,14 +607,71 @@ REVIEWED_EXPR = "CASE WHEN e.entryType LIKE '%Swiss-Prot%' THEN true ELSE false 
 # The SQL generator substitutes a typed NULL for any that are absent.
 _OPTIONAL_ENTRY_FIELDS = {"organismHosts", "geneLocations"}
 
+# Paths every UniProtKB entry carries; the builders dereference them without
+# a guard.  A dump lacking one is refused up front with a clear message
+# (check_required_paths) instead of a DuckDB BinderException mid-build.
+# Everything else the builders read is guarded with has() / _typed().
+REQUIRED_PATHS: frozenset[str] = frozenset({
+    "primaryAccession", "uniProtkbId", "entryType",
+    "organism.taxonId", "organism.scientificName",
+    "sequence.value", "sequence.length", "sequence.molWeight", "sequence.md5", "sequence.crc64",
+    "entryAudit.firstPublicDate", "entryAudit.lastAnnotationUpdateDate",
+    "entryAudit.lastSequenceUpdateDate", "entryAudit.entryVersion", "entryAudit.sequenceVersion",
+    "proteinExistence", "annotationScore",
+})
+
+# Paths required only when their top-level array exists at all (a subset
+# with no features has no features table; one with features has typed ones).
+REQUIRED_CHILD_PATHS: dict[str, frozenset[str]] = {
+    "features": frozenset({"features.type",
+                           "features.location.start.value", "features.location.end.value"}),
+    "uniProtKBCrossReferences": frozenset({"uniProtKBCrossReferences.database",
+                                           "uniProtKBCrossReferences.id"}),
+    "references": frozenset({"references.referenceNumber",
+                             "references.citation.citationType", "references.citation.id"}),
+}
+
+
+def check_required_paths(schema_paths: set[str]) -> None:
+    """Abort the build if the input lacks a field every UniProtKB entry has."""
+    missing = sorted(REQUIRED_PATHS - schema_paths)
+    for parent, paths in REQUIRED_CHILD_PATHS.items():
+        if parent in schema_paths:
+            missing += sorted(paths - schema_paths)
+    if missing:
+        raise RuntimeError("Input lacks fields every UniProtKB entry carries "
+                           f"(is this a UniProtKB JSON dump?): {missing}")
+
+
+# Element types for a child table whose source array is absent from the
+# input: the builder's SQL then unnests an empty list of this shape and
+# writes a zero-row table instead of failing to bind the missing column.
+_EMPTY_CHILD_SOURCE: dict[str, str] = {
+    "features": 'CAST([] AS STRUCT("type" VARCHAR, location STRUCT("start" STRUCT("value" BIGINT, '
+                'modifier VARCHAR), "end" STRUCT("value" BIGINT, modifier VARCHAR)))[])',
+    "uniProtKBCrossReferences": 'CAST([] AS STRUCT("database" VARCHAR, id VARCHAR)[])',
+    "comments": "CAST([] AS MAP(VARCHAR, JSON)[])",
+    "references": 'CAST([] AS STRUCT(referenceNumber BIGINT, '
+                  'citation STRUCT(citationType VARCHAR, id VARCHAR))[])',
+}
+
+
+def _child_source(field: str, schema_paths: set[str]) -> str:
+    """SQL for a child table's source array: the column, or an empty typed list."""
+    if field in schema_paths:
+        return f'e."{field}"'
+    return _EMPTY_CHILD_SOURCE[field]
+
 
 def _build_entries_sql(schema_paths: set[str]) -> str:
     """Build the entries SQL with NULLs for any fields absent from the schema.
 
     ``schema_paths`` is the set of all valid dotted paths discovered from the
-    staged Parquet (see :func:`discover_schema_paths`).  Any path not in the
-    set gets ``NULL`` in the SQL — no BinderException, no matter how exotic
-    the dataset.
+    staged Parquet (see :func:`discover_schema_paths`).  Any optional path not
+    in the set gets a typed ``NULL`` (or ``[]`` / ``0`` for list and count
+    columns) in the SQL — no BinderException, no matter how exotic the
+    dataset.  Only REQUIRED_PATHS are dereferenced unguarded, and
+    check_required_paths() has already refused an input without them.
     """
 
     def has(path: str) -> bool:
@@ -640,16 +714,96 @@ def _build_entries_sql(schema_paths: set[str]) -> str:
     # Swiss-Prot entries have recommendedName; TrEMBL entries typically only have submissionNames.
     # Without this fallback, protein_name is NULL for >99% of the lake (TrEMBL dominates).
     # UniProtKB API renamed submittedNames → submissionNames; handle both.
-    protein_name_parts = ["e.proteinDescription.recommendedName.fullName.value"]
+    # Every naming block is optional in a subset, so only existing ones are read.
+    protein_name_parts = []
+    if has("proteinDescription.recommendedName.fullName.value"):
+        protein_name_parts.append("e.proteinDescription.recommendedName.fullName.value")
     _submitted_name_field = (
-        "submissionNames" if has("proteinDescription.submissionNames")
-        else "submittedNames" if has("proteinDescription.submittedNames")
+        "submissionNames" if has("proteinDescription.submissionNames.fullName.value")
+        else "submittedNames" if has("proteinDescription.submittedNames.fullName.value")
         else None
     )
     if _submitted_name_field:
         protein_name_parts.append(f"e.proteinDescription.{_submitted_name_field}[1].fullName.value")
-    protein_name_parts.append("(list_extract(COALESCE(e.proteinDescription.alternativeNames, []), 1)).fullName.value")
-    protein_name_expr = "COALESCE(" + ", ".join(protein_name_parts) + ")"
+    if has("proteinDescription.alternativeNames.fullName.value"):
+        protein_name_parts.append("(list_extract(COALESCE(e.proteinDescription.alternativeNames, []), 1)).fullName.value")
+    if protein_name_parts:
+        protein_name_expr = (f"CAST(COALESCE({', '.join(protein_name_parts)}) AS "
+                             f"{COLUMN_TYPES[('entries', 'protein_name')]})")
+    else:
+        protein_name_expr = _null("entries", "protein_name")
+
+    # Genes, secondary accessions, organism names/lineage, protein flag and
+    # alternative names: all absent from some subsets.
+    gene_names_expr = _typed("entries", "gene_names",
+                             "list_transform(COALESCE(e.genes, []), g -> g.geneName.value)", schema_paths)
+    gene_name_expr = (
+        f"CAST(list_extract(list_transform(COALESCE(e.genes, []), g -> g.geneName.value), 1) AS "
+        f"{COLUMN_TYPES[('entries', 'gene_name')]})"
+        if has("genes.geneName.value") else _null("entries", "gene_name")
+    )
+    gene_synonyms_expr = _typed(
+        "entries", "gene_synonyms",
+        "flatten(list_transform(COALESCE(e.genes, []), g -> list_transform(COALESCE(g.synonyms, []), s -> s.value)))",
+        schema_paths)
+    alt_protein_names_expr = _typed(
+        "entries", "alt_protein_names",
+        "list_transform(COALESCE(e.proteinDescription.alternativeNames, []), x -> x.fullName.value)",
+        schema_paths)
+    protein_flag_expr = _typed("entries", "protein_flag", "e.proteinDescription.flag", schema_paths)
+    secondary_accs_expr = _typed("entries", "secondary_accs", "e.secondaryAccessions", schema_paths)
+    organism_common_expr = _typed("entries", "organism_common", "e.organism.commonName", schema_paths)
+    lineage_expr = _typed("entries", "lineage", "e.organism.lineage", schema_paths)
+    uniparc_id_expr = _typed("entries", "uniparc_id", "e.extraAttributes.uniParcId", schema_paths)
+    # Full nested pass-through columns: no declared type (they carry whatever
+    # UniProt ships), so an absent source gets a NULL of the minimal shape.
+    genes_full_expr = ("e.genes" if has("genes")
+                       else 'NULL::STRUCT(geneName STRUCT("value" VARCHAR))[]')
+    keywords_full_expr = ("e.keywords" if has("keywords")
+                          else 'NULL::STRUCT(id VARCHAR, category VARCHAR, "name" VARCHAR)[]')
+
+    def _keyword_list(field):
+        if not has(f"keywords.{field}"):
+            return "CAST([] AS VARCHAR[])"
+        return f"list_transform(COALESCE(e.keywords, []), x -> x.{field})"
+
+    # Taxonomic division needs the lineage; without it only the human rule applies.
+    if has("organism.lineage"):
+        division_rules = """
+      WHEN list_contains(e.organism.lineage, 'Rodentia')         THEN 'rodents'
+      WHEN list_contains(e.organism.lineage, 'Mammalia')         THEN 'mammals'
+      WHEN list_contains(e.organism.lineage, 'Vertebrata')       THEN 'vertebrates'
+      WHEN list_contains(e.organism.lineage, 'Fungi')            THEN 'fungi'
+      WHEN list_contains(e.organism.lineage, 'Viridiplantae')    THEN 'plants'
+      WHEN list_contains(e.organism.lineage, 'Eukaryota')        THEN 'invertebrates'
+      WHEN list_contains(e.organism.lineage, 'Bacteria')         THEN 'bacteria'
+      WHEN list_contains(e.organism.lineage, 'Archaea')          THEN 'archaea'
+      WHEN list_contains(e.organism.lineage, 'Viruses')          THEN 'viruses'"""
+    else:
+        division_rules = ""
+
+    # Cross-reference shortcuts and per-array counts: [] / 0 when the array is
+    # absent, matching what an entry without the array gets when it is present.
+    xrefs_present = has("uniProtKBCrossReferences")
+    go_ids_expr = ("""list_distinct([
+        x.id
+        FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
+        IF x.database = 'GO'
+    ])""" if xrefs_present else "CAST([] AS VARCHAR[])")
+    xref_dbs_expr = ("""list_distinct([
+        x.database
+        FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
+    ])""" if xrefs_present else "CAST([] AS VARCHAR[])")
+    proteome_ids_expr = ("""list_sort(list_distinct([
+        x.id
+        FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
+        IF x.database = 'Proteomes'
+    ]))""" if xrefs_present else "CAST([] AS VARCHAR[])")
+
+    def _count(field):
+        if not has(field):
+            return "CAST(0 AS INTEGER)"
+        return f'CAST(len(COALESCE(e."{field}", [])) AS INTEGER)'
 
     # Residual structs (plan A13): what the convenience columns do not carry.
     organism_residual = _residual_sql("entries", "organism_residual", "e.organism", schema_paths)
@@ -708,52 +862,34 @@ SELECT
     {REVIEWED_EXPR}                                 AS reviewed,
     e.organism.taxonId                              AS taxid,
     e.organism.scientificName                       AS organism_name,
-    list_transform(
-        COALESCE(e.genes, []),
-        g -> g.geneName.value
-    )                                               AS gene_names,
+    {gene_names_expr}                               AS gene_names,
     {protein_name_expr}                                AS protein_name,
     CAST(e.sequence.length AS INTEGER)              AS seq_length,
     e.sequence.value                                AS sequence,
 
     -- Primary gene name = first of gene_names (plan B.4)
-    list_extract(list_transform(COALESCE(e.genes, []), g -> g.geneName.value), 1) AS gene_name,
+    {gene_name_expr}                                AS gene_name,
 
     -- Identity / organism (remaining)
-    e.secondaryAccessions                           AS secondary_accs,
-    e.organism.commonName                           AS organism_common,
-    e.organism.lineage                              AS lineage,
+    {secondary_accs_expr}                           AS secondary_accs,
+    {organism_common_expr}                          AS organism_common,
+    {lineage_expr}                                  AS lineage,
     -- UniProt taxonomic division (plan D.5), most specific rule first.
     -- First approximation of the FTP taxonomic_divisions/ rules; the D.5
     -- correctness gate (per-division counts vs the FTP) decides the final CASE.
     -- Protists land in 'invertebrates' as on the FTP; 'unclassified' is the rest.
     CASE
-      WHEN e.organism.taxonId = 9606                             THEN 'human'
-      WHEN list_contains(e.organism.lineage, 'Rodentia')         THEN 'rodents'
-      WHEN list_contains(e.organism.lineage, 'Mammalia')         THEN 'mammals'
-      WHEN list_contains(e.organism.lineage, 'Vertebrata')       THEN 'vertebrates'
-      WHEN list_contains(e.organism.lineage, 'Fungi')            THEN 'fungi'
-      WHEN list_contains(e.organism.lineage, 'Viridiplantae')    THEN 'plants'
-      WHEN list_contains(e.organism.lineage, 'Eukaryota')        THEN 'invertebrates'
-      WHEN list_contains(e.organism.lineage, 'Bacteria')         THEN 'bacteria'
-      WHEN list_contains(e.organism.lineage, 'Archaea')          THEN 'archaea'
-      WHEN list_contains(e.organism.lineage, 'Viruses')          THEN 'viruses'
+      WHEN e.organism.taxonId = 9606                             THEN 'human'{division_rules}
       ELSE 'unclassified'
     END                                             AS division,
 
     -- Gene & protein (remaining)
     -- All gene synonyms across all genes (searchable list)
-    flatten(list_transform(
-        COALESCE(e.genes, []),
-        g -> list_transform(COALESCE(g.synonyms, []), s -> s.value)
-    ))                                              AS gene_synonyms,
+    {gene_synonyms_expr}                            AS gene_synonyms,
     -- Alternative protein names (searchable list)
-    list_transform(
-        COALESCE(e.proteinDescription.alternativeNames, []),
-        x -> x.fullName.value
-    )                                               AS alt_protein_names,
+    {alt_protein_names_expr}                        AS alt_protein_names,
     -- Precursor / Fragment flag (commonly used to filter incomplete sequences)
-    e.proteinDescription.flag                       AS protein_flag,
+    {protein_flag_expr}                             AS protein_flag,
     -- EC numbers: extract from all naming blocks (recommended, alternative, submitted)
     {ec_numbers_expr}                               AS ec_numbers,
     e.proteinExistence                              AS protein_existence,
@@ -765,33 +901,13 @@ SELECT
     e.sequence.crc64                                AS seq_crc64,
 
     -- Cross-reference shortcuts
-    list_distinct([
-        x.id
-        FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
-        IF x.database = 'GO'
-    ])                                              AS go_ids,
+    {go_ids_expr}                                   AS go_ids,
     {go_terms_expr}                                 AS go_terms,
-    list_distinct([
-        x.database
-        FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
-    ])                                              AS xref_dbs,
-    list_sort(list_distinct([
-        x.id
-        FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
-        IF x.database = 'Proteomes'
-    ]))                                             AS proteome_ids,
-    list_transform(
-        COALESCE(e.keywords, []),
-        x -> x.id
-    )                                               AS keyword_ids,
-    list_transform(
-        COALESCE(e.keywords, []),
-        x -> x.name
-    )                                               AS keyword_names,
-    list_transform(
-        COALESCE(e.keywords, []),
-        x -> x.category
-    )                                               AS keyword_categories,
+    {xref_dbs_expr}                                 AS xref_dbs,
+    {proteome_ids_expr}                             AS proteome_ids,
+    {_keyword_list('id')}                           AS keyword_ids,
+    {_keyword_list('name')}                         AS keyword_names,
+    {_keyword_list('category')}                     AS keyword_categories,
 
     -- Versioning
     CAST(e.entryAudit.firstPublicDate AS DATE)      AS first_public,
@@ -801,12 +917,12 @@ SELECT
     CAST(e.entryAudit.sequenceVersion AS INTEGER)   AS seq_version,
 
     -- Counts
-    CAST(len(COALESCE(e.features, [])) AS INTEGER)  AS feature_count,
-    CAST(len(COALESCE(e.uniProtKBCrossReferences, [])) AS INTEGER) AS xref_count,
-    CAST(len(COALESCE(e.comments, [])) AS INTEGER)  AS comment_count,
-    CAST(len(COALESCE(e."references", [])) AS INTEGER) AS reference_count,
+    {_count('features')}                            AS feature_count,
+    {_count('uniProtKBCrossReferences')}            AS xref_count,
+    {_count('comments')}                            AS comment_count,
+    {_count('references')}                          AS reference_count,
     {pubmed_ids_expr}                               AS pubmed_ids,
-    e.extraAttributes.uniParcId                     AS uniparc_id,
+    {uniparc_id_expr}                               AS uniparc_id,
 
     -- Entry type (lossless round-trip — the boolean 'reviewed' loses the exact string)
     e.entryType                                     AS entry_type,
@@ -821,8 +937,8 @@ SELECT
     -- features, xrefs, comments, and publications are in their own tables
     {organism_residual}                             AS organism_residual,
     {protein_desc_residual}                         AS protein_desc_residual,
-    e.genes                                         AS genes_full,
-    e.keywords                                      AS keywords_full,
+    {genes_full_expr}                               AS genes_full,
+    {keywords_full_expr}                            AS keywords_full,
     {organism_hosts}                                 AS organism_hosts,
     {gene_locations}                                 AS gene_locations
 
@@ -860,7 +976,11 @@ def _build_features_sql(schema_paths: set[str]) -> str:
     ligand_label = _typed("features", "ligand_label", "unnest.ligand.label", schema_paths)
     ligand_note = _typed("features", "ligand_note", "unnest.ligand.note", schema_paths)
     location_sequence = _typed("features", "location_sequence", "unnest.location.sequence", schema_paths)
+    start_modifier = _typed("features", "start_modifier", "unnest.location.start.modifier", schema_paths)
+    end_modifier = _typed("features", "end_modifier", "unnest.location.end.modifier", schema_paths)
+    description = _typed("features", "description", "unnest.description", schema_paths)
     feature_residual = _residual_sql("features", "feature_residual", "unnest", schema_paths)
+    features_src = _child_source("features", schema_paths)
 
     return f"""
 SELECT
@@ -874,9 +994,9 @@ SELECT
     unnest.type                                     AS type,
     CAST(unnest.location.start.value AS INTEGER)    AS start_pos,
     CAST(unnest.location.end.value AS INTEGER)      AS end_pos,
-    unnest.location.start.modifier                  AS start_modifier,
-    unnest.location.end.modifier                    AS end_modifier,
-    unnest.description                              AS description,
+    {start_modifier}                                AS start_modifier,
+    {end_modifier}                                  AS end_modifier,
+    {description}                                   AS description,
     {feature_id}                                    AS feature_id,
 
     {evidence_codes}                                AS evidence_codes,
@@ -902,9 +1022,9 @@ FROM (
         e.organism.taxonId                           AS taxid,
         e.organism.scientificName                    AS organism_name,
         CAST(e.sequence.length AS INTEGER)           AS seq_length,
-        e.features
+        {features_src}                               AS features
     FROM {{read_clause}} e
-    WHERE e.features IS NOT NULL AND len(e.features) > 0
+    WHERE {features_src} IS NOT NULL AND len({features_src}) > 0
 ) sub, LATERAL unnest(sub.features)
 ORDER BY sub.reviewed DESC, sub.taxid, sub.acc
 """
@@ -923,6 +1043,7 @@ def _build_xrefs_sql(schema_paths: set[str]) -> str:
     isoform_id = _typed("xrefs", "isoform_id", "unnest.isoformId", schema_paths)
     xref_evidences = _typed("xrefs", "evidences", "unnest.evidences", schema_paths)
     properties = _typed("xrefs", "properties", "unnest.properties", schema_paths)
+    xrefs_src = _child_source("uniProtKBCrossReferences", schema_paths)
 
     return f"""
 SELECT
@@ -946,10 +1067,10 @@ FROM (
         e.primaryAccession                           AS acc,
         {REVIEWED_EXPR}                             AS reviewed,
         e.organism.taxonId                           AS taxid,
-        e.uniProtKBCrossReferences
+        {xrefs_src}                                  AS uniProtKBCrossReferences
     FROM {{read_clause}} e
-    WHERE e.uniProtKBCrossReferences IS NOT NULL
-      AND len(e.uniProtKBCrossReferences) > 0
+    WHERE {xrefs_src} IS NOT NULL
+      AND len({xrefs_src}) > 0
 ) sub, LATERAL unnest(sub.uniProtKBCrossReferences)
 ORDER BY sub.reviewed DESC, sub.taxid, sub.acc
 """
@@ -967,7 +1088,7 @@ def _build_comments_sql(schema_paths: set[str]) -> str:
     SUBCELLULAR LOCATION keep their prose under ``note.texts`` and are also
     NULL here; the full comment is in the ``comment`` column.
     """
-    del schema_paths  # no optional paths in this builder (see docstring)
+    comments_src = _child_source("comments", schema_paths)   # the only optional path here
 
     text_value_expr = """NULLIF(array_to_string(
         from_json(unnest.texts->'$[*].value', '["VARCHAR"]'),
@@ -996,9 +1117,9 @@ FROM (
         e.primaryAccession                           AS acc,
         {REVIEWED_EXPR}                             AS reviewed,
         e.organism.taxonId                           AS taxid,
-        e.comments
+        {comments_src}                               AS comments
     FROM {{read_clause}} e
-    WHERE e.comments IS NOT NULL AND len(e.comments) > 0
+    WHERE {comments_src} IS NOT NULL AND len({comments_src}) > 0
 ) sub, LATERAL unnest(sub.comments)
 ORDER BY sub.reviewed DESC, sub.taxid, sub.acc
 """
@@ -1035,6 +1156,8 @@ def _build_publications_sql(schema_paths: set[str]) -> str:
     )
     reference_residual = _residual_sql("publications", "reference_residual", "unnest", schema_paths,
                                        nested={"citation": citation_residual})
+    publication_date = _typed("publications", "publication_date", "unnest.citation.publicationDate", schema_paths)
+    references_src = _child_source("references", schema_paths)
 
     return f"""
 SELECT
@@ -1049,7 +1172,7 @@ SELECT
     {title}                                         AS title,
     {authors}                                       AS authors,
     {authoring_group}                               AS authoring_group,
-    unnest.citation.publicationDate                 AS publication_date,
+    {publication_date}                              AS publication_date,
     {journal}                                       AS journal,
     {volume}                                        AS volume,
     {first_page}                                    AS first_page,
@@ -1068,9 +1191,9 @@ FROM (
         e.primaryAccession                           AS acc,
         {REVIEWED_EXPR}                             AS reviewed,
         e.organism.taxonId                           AS taxid,
-        e."references"
+        {references_src}                             AS "references"
     FROM {{read_clause}} e
-    WHERE e."references" IS NOT NULL AND len(e."references") > 0
+    WHERE {references_src} IS NOT NULL AND len({references_src}) > 0
 ) sub, LATERAL unnest(sub."references")
 ORDER BY sub.reviewed DESC, sub.taxid, sub.acc
 """
@@ -1352,7 +1475,7 @@ def _bloom_kwargs(label: str) -> dict:
 
 
 def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order=None,
-                      partition_column="reviewed", release=None):
+                      partition_column="reviewed", release=None, sentinel_path=None):
     """Stream DuckDB result → Hive-partitioned Parquet files in bounded-memory batches.
 
     DuckDB executes the query lazily and yields Arrow record batches of
@@ -1371,11 +1494,18 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
 
     Atomicity: files are written to ``<partition>/.tmp/`` and moved to their
     final location only after the whole table has been written, so nothing
-    is visible under the final directories until the table is complete
-    (--skip-existing relies on this).  ``.tmp/`` is removed on error and any
-    leftover from a killed run is removed before writing: DuckDB's ``**``
-    glob descends into hidden directories, so a stale partial file there
-    would be double-counted by every ``<table>/**/*.parquet`` reader.
+    is visible under the final directories until the table is complete.
+    ``.tmp/`` is removed on error and any leftover from a killed run is
+    removed before writing: DuckDB's ``**`` glob descends into hidden
+    directories, so a stale partial file there would be double-counted by
+    every ``<table>/**/*.parquet`` reader.
+
+    The publish itself (drop stale finals, move new files in) is not atomic:
+    a kill inside it leaves a mix of old and new files.  So the table's
+    completion sentinel (``sentinel_path``, see ``_sentinel_path``) is deleted
+    before the write starts and written, with the final file list, only
+    after the publish ends; --skip-existing trusts a table only when the
+    sentinel exists and lists exactly the files on disk.
 
     Args:
         con: DuckDB connection
@@ -1387,6 +1517,7 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
                    to embed in Parquet footer metadata (PyArrow 16.0+).
         partition_column: boolean column that decides the partition directory
         release: UniProt release name, written into the footer metadata
+        sentinel_path: where to write the completion sentinel (None: no sentinel)
 
     Returns (total_rows, file_list, arrow_schema); file paths are relative to
     ``table_dir`` (``review_status=swissprot/entries_00001.parquet``).
@@ -1395,6 +1526,8 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
     reader = con.sql(sql).to_arrow_reader(batch_size=batch_size)
     os.makedirs(table_dir, exist_ok=True)
     t0 = time.time()
+    if sentinel_path and os.path.exists(sentinel_path):
+        os.remove(sentinel_path)       # the table is incomplete from here on
 
     total_rows = 0
     arrow_schema = None
@@ -1498,8 +1631,48 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
         raise
 
     files = [rel for _, _, rel in pending]
+    if sentinel_path:
+        _write_sentinel(sentinel_path, label, files, total_rows, release)
     eprint(f"  {label}: {total_rows:,} rows in {len(files)} files ({time.time()-t0:.1f}s)")
     return total_rows, files, arrow_schema
+
+
+# ─── Per-table completion sentinels ─────────────────────────────────────
+# ``<outdir>/.complete/<table>.json`` records the file list a finished write
+# published.  It lives outside the table directory (which holds Parquet only:
+# directory readers treat every file under ``<table>/`` as Parquet) and is
+# the only thing --skip-existing trusts: a kill during the publish window
+# leaves files on disk but no sentinel, so the table is rebuilt.
+
+def _sentinel_path(outdir, table_name):
+    return os.path.join(outdir, ".complete", f"{table_name}.json")
+
+
+def _write_sentinel(path, table_name, files, row_count, release):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"table": table_name, "files": list(files), "row_count": row_count,
+                   "release": release, "completed_at": datetime.now(timezone.utc).isoformat()},
+                  f, indent=2)
+    os.replace(tmp, path)              # the sentinel itself appears atomically
+
+
+def _read_sentinel(path):
+    """The sentinel's contents, or None if absent or unreadable."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _table_is_complete(outdir, table_name, table_dir):
+    """True only if the sentinel exists and lists exactly the files on disk."""
+    sentinel = _read_sentinel(_sentinel_path(outdir, table_name))
+    if sentinel is None:
+        return False
+    return sentinel.get("files") == _list_table_files(table_dir)
 
 
 def _list_table_files(table_dir):
@@ -2017,11 +2190,15 @@ def main():
         if args.skip_existing:
             for name, _, _, _ in table_defs:
                 table_dir = os.path.join(outdir, name)
-                if os.path.isdir(table_dir):
-                    existing = _list_table_files(table_dir)
-                    if existing:
-                        skip_set.add(name)
-                        eprint(f"  SKIP {name} (already has {len(existing)} Parquet files, --skip-existing)")
+                if not os.path.isdir(table_dir):
+                    continue
+                existing = _list_table_files(table_dir)
+                if _table_is_complete(outdir, name, table_dir):
+                    skip_set.add(name)
+                    eprint(f"  SKIP {name} (complete: {len(existing)} Parquet files, --skip-existing)")
+                elif existing:
+                    eprint(f"  REBUILD {name}: {len(existing)} Parquet files on disk but no "
+                           f"completion sentinel matching them (interrupted publish?)")
 
         tables_to_write = {name for name, _, _, _ in table_defs} - skip_set
 
@@ -2043,7 +2220,10 @@ def main():
             if not schema_paths:
                 eprint("FATAL: staging produced an empty schema — no field paths found")
                 sys.exit(1)
-            # Refuse to build if a declared type would drop a nested field (plan G.2).
+            # Refuse to build if the input is not a UniProtKB dump, if a declared
+            # type would drop a nested field (plan G.2), or if a promoted struct
+            # has a child no column carries.
+            check_required_paths(schema_paths)
             check_declared_types(con, schema_paths)
             check_promoted_paths(schema_paths)
         else:
@@ -2124,6 +2304,7 @@ def main():
                 row_count, files, arrow_schema = stream_to_parquet(
                     con, sql, table_dir, args.batch_size, label=name, sort_order=sort_order,
                     partition_column=partition_column, release=args.release,
+                    sentinel_path=_sentinel_path(outdir, name),
                 )
                 manifest_tables[name] = {
                     "description": meta.get("description", ""),
