@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, static-lake]
   pull_request:
-    branches: [main]
+    branches: [main, static-lake]
 
 permissions:
   contents: read
@@ -29,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install duckdb pyarrow orjson ijson zstandard pytest frictionless
+          pip install duckdb pyarrow orjson ijson zstandard pytest frictionless polars pandas
 
       - name: Cache test fixtures
         uses: actions/cache@v4
@@ -60,6 +60,36 @@ jobs:
 
       - name: Check all scripts compile
         run: |
-          for f in bin/*.py uniprot_parquet.py; do
+          for f in bin/*.py benchmarks/*.py uniprot_parquet.py; do
             python -m py_compile "$f"
+          done
+
+  nextflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Nextflow
+        run: |
+          curl -s https://get.nextflow.io | bash
+          sudo mv nextflow /usr/local/bin/
+          nextflow -version
+
+      - name: Lint pipeline
+        run: nextflow lint upjson2lake.nf nextflow.config
+
+      # Strict-parser check of the pipeline + config under every profile
+      # (catches .nf/.config syntax errors without executing anything).
+      - name: Resolve config per profile
+        run: |
+          for p in local short prod; do
+            nextflow config -profile "$p" upjson2lake.nf > /dev/null
           done
