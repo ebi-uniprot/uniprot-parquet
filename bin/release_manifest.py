@@ -32,7 +32,10 @@ def eprint(*args, **kwargs):
 
 
 def hash_file(path, chunk_size=8 * 1024 * 1024):
-    """(md5, sha256) of a file in one streamed pass."""
+    """(sha256, md5) of a file in one streamed pass.
+
+    Return order matches _hash_file in parquet_transform.py — keep the two
+    in sync."""
     md5, sha = hashlib.md5(), hashlib.sha256()
     with open(path, "rb") as f:
         while True:
@@ -41,12 +44,7 @@ def hash_file(path, chunk_size=8 * 1024 * 1024):
                 break
             md5.update(chunk)
             sha.update(chunk)
-    return md5.hexdigest(), sha.hexdigest()
-
-
-def md5_file(path, chunk_size=8 * 1024 * 1024):
-    """Compute MD5 of a file without loading it into memory."""
-    return hash_file(path, chunk_size)[0]
+    return sha.hexdigest(), md5.hexdigest()
 
 
 def git_info():
@@ -103,7 +101,7 @@ def main():
     manifest["inputs"] = {}
     for label, path in [("jsonl", args.input_jsonl)]:
         abspath = os.path.abspath(path)
-        md5, sha256 = hash_file(abspath)
+        sha256, md5 = hash_file(abspath)
         manifest["inputs"][label] = {
             "path": os.path.basename(abspath),
             "md5": md5,
@@ -197,7 +195,7 @@ def write_complete_marker(args, lake_manifest):
     lines = [
         f"release: {args.release}",
         f"schema_version: {lake_manifest['schema_version']}",
-        f"sha256sums_sha256: {hash_file(sums)[1]}",
+        f"sha256sums_sha256: {hash_file(sums)[0]}",
         f"completed_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
     ]
     with open(marker, "w") as f:

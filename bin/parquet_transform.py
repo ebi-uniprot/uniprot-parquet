@@ -1313,11 +1313,11 @@ ZSTD_LEVEL = 9                          # plan H.1. PROVISIONAL: chosen from the
 PARTITION_KEY = "review_status"         # plan Part D: Hive directory key ...
 PARTITION_VALUES = {True: "swissprot", False: "trembl"}   # ... derived from the stored `reviewed`
 
-# (name, sql_template, sort_order, partition_column).  Every table names its
+# (name, sort_order, partition_column).  Every table names its
 # partition column explicitly so a future table cannot be written
 # unpartitioned by accident.
 TABLE_DEFS = [
-    ("entries",      None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
+    ("entries",      ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
     # Child tables inherit (reviewed DESC, taxid ASC, acc ASC) from the
     # pre-sorted JSONL input — DuckDB's ORDER BY on these three columns is
     # essentially free (data arrives already in order after LATERAL unnest).
@@ -1325,15 +1325,35 @@ TABLE_DEFS = [
     # are deliberately omitted to avoid ~1.2 TB of sort spill at production
     # scale (~3B xref + ~1.3B feature + ~1B publication + ~400M comment rows).
     # Users who need within-protein ordering can add it at query time.
-    ("features",     None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
-    ("xrefs",        None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
-    ("comments",     None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
-    ("publications", None, ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
+    ("features",     ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
+    ("xrefs",        ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
+    ("comments",     ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
+    ("publications", ["reviewed DESC", "taxid ASC", "acc ASC"], "reviewed"),
     # accession_map is acc-sorted within each review side: the lookup table
     # (plan Part A).  A real sort at production scale (~250M + secondaries rows
     # of five narrow columns; low tens of GB of spill).
-    ("accession_map", None, ["reviewed DESC", "acc ASC", "primary_acc ASC"], "reviewed"),
+    ("accession_map", ["reviewed DESC", "acc ASC", "primary_acc ASC"], "reviewed"),
 ]
+
+# All table SQL is built dynamically to handle optional fields. schema_paths
+# is the single source of truth — no field is referenced without first
+# checking that it exists in the staged Parquet schema.
+_SQL_BUILDERS = {
+    "entries":      _build_entries_sql,
+    "features":     _build_features_sql,
+    "xrefs":        _build_xrefs_sql,
+    "comments":     _build_comments_sql,
+    "publications": _build_publications_sql,
+    "accession_map": _build_accession_map_sql,
+}
+
+# VARIANT child tables (evaluation-only, --variant-children) — no schema_paths needed.
+_VARIANT_BUILDERS = {
+    "features":     _build_features_variant_sql,
+    "xrefs":        _build_xrefs_variant_sql,
+    "comments":     _build_comments_variant_sql,
+    "publications": _build_publications_variant_sql,
+}
 
 
 # ─── Semantic metadata (embedded in manifest.json for agents/tools) ─────
@@ -1713,6 +1733,8 @@ def _file_details(table_dir, rel_path):
 
 
 def _hash_file(path):
+    # Return order (sha256, md5) matches hash_file in release_manifest.py —
+    # keep the two in sync.
     sha, md5 = hashlib.sha256(), hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -2188,7 +2210,7 @@ def main():
         # ── Determine which tables to write ──
         skip_set = set()
         if args.skip_existing:
-            for name, _, _, _ in table_defs:
+            for name, _, _ in table_defs:
                 table_dir = os.path.join(outdir, name)
                 if not os.path.isdir(table_dir):
                     continue
@@ -2200,7 +2222,7 @@ def main():
                     eprint(f"  REBUILD {name}: {len(existing)} Parquet files on disk but no "
                            f"completion sentinel matching them (interrupted publish?)")
 
-        tables_to_write = {name for name, _, _, _ in table_defs} - skip_set
+        tables_to_write = {name for name, _, _ in table_defs} - skip_set
 
         # ── Stage JSONL → Parquet (parse JSON once, read Parquet 5× faster) ──
         if tables_to_write:
@@ -2247,7 +2269,7 @@ def main():
         t_total = time.time()
         manifest_tables = {}
 
-        for name, sql_template, sort_order, partition_column in table_defs:
+        for name, sort_order, partition_column in table_defs:
             eprint(f"\n--- {name.upper()} ---")
             table_dir = os.path.join(outdir, name)
 
@@ -2276,30 +2298,10 @@ def main():
                 }
                 _add_file_details(manifest_tables[name], table_dir)
             else:
-                # All table SQL is built dynamically to handle optional fields.
-                # schema_paths is the single source of truth — no field is referenced
-                # without first checking that it exists in the staged Parquet schema.
                 if getattr(args, "variant_children", False) and name not in ("entries", "accession_map"):
-                    # VARIANT child tables — no schema_paths needed.
-                    _VARIANT_BUILDERS = {
-                        "features":     _build_features_variant_sql,
-                        "xrefs":        _build_xrefs_variant_sql,
-                        "comments":     _build_comments_variant_sql,
-                        "publications": _build_publications_variant_sql,
-                    }
-                    if sql_template is None:
-                        sql_template = _VARIANT_BUILDERS[name]()
+                    sql_template = _VARIANT_BUILDERS[name]()
                 else:
-                    _SQL_BUILDERS = {
-                        "entries":      _build_entries_sql,
-                        "features":     _build_features_sql,
-                        "xrefs":        _build_xrefs_sql,
-                        "comments":     _build_comments_sql,
-                        "publications": _build_publications_sql,
-                        "accession_map": _build_accession_map_sql,
-                    }
-                    if sql_template is None:
-                        sql_template = _SQL_BUILDERS[name](schema_paths)
+                    sql_template = _SQL_BUILDERS[name](schema_paths)
                 sql = sql_template.format(read_clause=read_clause)
                 row_count, files, arrow_schema = stream_to_parquet(
                     con, sql, table_dir, args.batch_size, label=name, sort_order=sort_order,
@@ -2369,7 +2371,7 @@ def main():
         eprint("\n" + "=" * 60)
         eprint(f"DONE in {elapsed:.1f}s")
         total_parquet_bytes = 0
-        for name, _, _, _ in table_defs:
+        for name, _, _ in table_defs:
             table_dir = os.path.join(outdir, name)
             table_bytes = sum(
                 os.path.getsize(os.path.join(table_dir, f))

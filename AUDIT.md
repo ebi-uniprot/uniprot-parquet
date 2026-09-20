@@ -26,7 +26,7 @@ What blocks a confident public release falls into four buckets:
 | ID | Decision | Rationale | Status |
 |---|---|---|---|
 | **D1** | **Latest-only publishing model** | UniProt FTP archives the source-of-record (XML/.dat/FASTA). Parquet here is a derived analytical view; archival belongs upstream. Old releases re-derivable from FTP XML on demand via the pipeline. | Direction confirmed; needs execution in A1+A5 |
-| **D2** | **No VARIANT type. Typed star schema only.** | `benchmarks/VARIANT_EVALUATION.md:148-156` (rigorous evaluation, supersedes `VARIANT_BENCHMARK_BRIEF.md`) concludes no VARIANT layout matched baseline on any of 16 queries. Even Layout D shows 2-17× overhead on child-table queries. | Decision made; existing VARIANT code (`parquet_transform.py:660-727`, CLI flag `:1279-1283`) to be deleted in A2 |
+| **D2** | **No VARIANT type. Typed star schema only.** | `benchmarks/VARIANT_EVALUATION.md:148-156` (rigorous evaluation, supersedes `VARIANT_BENCHMARK_BRIEF.md`) concludes no VARIANT layout matched baseline on any of 16 queries. Even Layout D shows 2-17× overhead on child-table queries. | Decision made for the published schema. The deletion planned in A2 was later reversed: `NEXT_TASKS.md` 3.6 keeps `--variant-children` as documented evaluation-only code |
 | **D3** | **Adopt dedup proposal Phases 1+2** | `benchmarks/DEDUPLICATION_PROPOSAL.md` v2 — ~17% storage shrink, lossless reconstruction via `g()`, round-trip test as release gate. Phase 1 = build `g` + test (no schema change). Phase 2 = trim nested columns to residuals. | Approved; execution in A11+A13 |
 | **D4** | **5-table star schema with hybrid convenience + nested** | Surveyed peer-project consensus (`BIOINFORMATICS_PARQUET_SURVEY.md:450-457`). Star matches data shape; convenience columns serve 90% of queries; nested preserves losslessness. Denormalized join keys (`acc`, `taxid`, `from_reviewed`) on child tables avoid most joins. | Already shipped, validated |
 | **D5** | **Sort order `(reviewed/from_reviewed DESC, taxid ASC, acc ASC)`** | Swiss-Prot first; per-organism locality drives the most common query pattern. Within-protein sorts (start_pos for features) deliberately omitted to avoid ~1.2 TB sort spill — but see S4 below. | Already shipped, validated |
@@ -119,7 +119,7 @@ Items resolved by schema work (§4) or roadmap actions (§7) are cross-reference
 | ID | Finding | Location | Resolved by |
 |---|---|---|---|
 | **Q-H1** | Personal branding in published `datapackage.json` | `parquet_transform.py:1209` (`homepage: github.com/dlrice/...`), `:1229-1232` (contributor) | A6 |
-| **Q-H2** | ~~Half-shipped VARIANT~~ | — | A2 (delete entirely, per D2) |
+| **Q-H2** | ~~Half-shipped VARIANT~~ | — | Superseded: kept as evaluation-only code per `NEXT_TASKS.md` 3.6 |
 | **Q-H3** | `seq_md5`/`seq_crc64` propagated, not verified | `parquet_transform.py:350-351` write; `validate_lake.py:707-750` only checks length | S7 |
 | **Q-H4** | Provenance missing reproducibility fields | `release_manifest.py:81-137` no Python/DuckDB/PyArrow versions, no hostname, no duration, no validator outcome embed | A7 (also covers Parquet footer metadata) |
 | **Q-H5** | No partitioning | All tables are flat sorted directories | S8 (pending O4) |
@@ -205,7 +205,7 @@ If hypothetically retaining all releases: ~7-8 TB/year, ~70-80 TB/decade. **D1 (
 | ID | Action | Resolves | Effort |
 |---|---|---|---|
 | **A1** | Execute D1 latest-only model: README update + transition window (O1) decision | D1, O1 | hours |
-| **A2** | Delete VARIANT code (`parquet_transform.py:660-727`, `:1279-1283`, `:1393-1402`, `benchmarks/build_variant_lake.py`, `benchmarks/bench_variant.py`). Keep `VARIANT_EVALUATION.md` as rationale. | D2, Q-H2 | hours |
+| **A2** | ~~Delete VARIANT code~~ Reversed by `NEXT_TASKS.md` 3.6: `--variant-children` and the benchmark scripts stay as documented evaluation-only code. `VARIANT_EVALUATION.md` remains the rationale for D2. | D2, Q-H2 | done (kept) |
 | **A3** | Pick canonical EBI URL (O2). Update README, `uniprot_parquet.connect()` default, CI httpfs test. | O2 | hours |
 | **A4** | Ship user survey (Google Form or similar) — see §4.4 for question set. Distribute via UniProt mailing list, EBI Slack, BioStars, related forums. | O6 + informs S8-S12 | 1 day to build, 2-4 weeks to collect |
 
