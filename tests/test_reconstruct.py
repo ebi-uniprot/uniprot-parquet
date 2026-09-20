@@ -1,8 +1,19 @@
 """g(f(x)) == x: bin/reconstruct.py rebuilds every fixture entry from the lake (plan A11)."""
 
+import pyarrow as pa
 import pytest
 
-from reconstruct import reconstruct_entry, entries_match
+from reconstruct import reconstruct_entry, entries_match, normalize_value, first_diff
+
+
+@pytest.mark.parametrize("source", [{}, {"FUNCTION": 2, "SUBUNIT": 1}])
+def test_map_columns_round_trip_through_arrow(source):
+    """An empty Parquet MAP must come back as {} — the source's {} — not [] (the
+    validator's reconstruction check would otherwise report 'type list != dict')."""
+    tbl = pa.table({"m": pa.array([source], type=pa.map_(pa.string(), pa.int64()))})
+    row = tbl.to_pylist(maps_as_pydicts="strict")[0]
+    assert normalize_value(row["m"]) == source
+    assert first_diff(normalize_value(row["m"]), source) is None
 
 
 def test_every_entry_reconstructs(originals, lake_entries, lake_features, lake_xrefs,

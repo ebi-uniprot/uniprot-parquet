@@ -38,16 +38,16 @@ def deep_sort(obj):
 def normalize_value(val):
     """Normalise a value for comparison: drop None-valued dict fields (Parquet
     unions add nullable fields the source never had), keep numbers, stringify
-    everything else (dates, etc.)."""
+    everything else (dates, etc.).
+
+    Callers must convert Arrow rows with ``to_pylist(maps_as_pydicts="strict")``
+    so MAP columns arrive as dicts: the default list-of-tuples form makes an
+    empty MAP indistinguishable from an empty JSON array."""
     if val is None:
         return None
     if isinstance(val, dict):
         return {k: normalize_value(v) for k, v in val.items() if v is not None}
     if isinstance(val, list):
-        # A Parquet MAP comes back from PyArrow as a list of (key, value)
-        # tuples (JSON arrays never yield tuples): rebuild the JSON object.
-        if val and all(isinstance(x, tuple) and len(x) == 2 for x in val):
-            return {k: normalize_value(v) for k, v in val if v is not None}
         return [normalize_value(v) for v in val]
     if isinstance(val, (int, float)):
         return val

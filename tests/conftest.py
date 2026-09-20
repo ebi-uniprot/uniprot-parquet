@@ -157,7 +157,7 @@ def _rows_by_acc(lake_dir, name):
     """All rows of a child table as dicts, grouped by accession."""
     from collections import defaultdict
     grouped = defaultdict(list)
-    for row in open_table(lake_dir, name).to_table().to_pylist():
+    for row in open_table(lake_dir, name).to_table().to_pylist(maps_as_pydicts="strict"):
         grouped[row["acc"]].append(row)
     return dict(grouped)
 
@@ -176,7 +176,8 @@ def lake(parquet_lake):
 @pytest.fixture(scope="module")
 def lake_entries(lake):
     """All entries from the Parquet lake, keyed by accession."""
-    return {row["acc"]: row for row in open_table(lake, "entries").to_table().to_pylist()}
+    return {row["acc"]: row
+            for row in open_table(lake, "entries").to_table().to_pylist(maps_as_pydicts="strict")}
 
 
 @pytest.fixture(scope="module")
