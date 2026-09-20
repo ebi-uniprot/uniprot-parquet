@@ -387,7 +387,11 @@ workflow {
     onComplete:
     def pending = file(pending_marker())
     if (workflow.success && pending.exists()) {
-        pending.moveTo("${release_dir()}/RELEASE_COMPLETE")
+        def complete = file("${release_dir()}/RELEASE_COMPLETE")
+        if (complete.exists()) {
+            complete.delete()
+        }
+        pending.moveTo(complete)
         log.info "RELEASE_COMPLETE written to ${release_dir()}"
     }
     else if (pending.exists()) {

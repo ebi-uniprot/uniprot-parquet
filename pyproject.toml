@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uniprot-parquet"
+version = "0.1.0"
+description = "DuckDB client and macros for the UniProtKB Parquet data lake"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Daniel Rice" }
+]
+dependencies = [
+    "duckdb>=1.5"
+]
+
+[project.urls]
+Homepage = "https://github.com/ebi-uniprot/uniprot-parquet"
+Repository = "https://github.com/ebi-uniprot/uniprot-parquet.git"
+
+[tool.setuptools]
+py-modules = ["uniprot_parquet"]
