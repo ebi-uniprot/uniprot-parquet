@@ -85,7 +85,11 @@ def main():
               f"(downstream consumer died)", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
-        pass
+        # Must not fall through to the success path: the count file would
+        # record a truncated stream that the caller then treats as complete.
+        print(f"  stream_jsonl: FATAL — interrupted after {count:,} entries",
+              file=sys.stderr)
+        sys.exit(130)
     except Exception as e:
         print(f"  stream_jsonl: FATAL — {type(e).__name__} after {count:,} entries: {e}",
               file=sys.stderr)
