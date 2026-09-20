@@ -119,6 +119,31 @@ def test_files_for_taxid(full_lake, fixture_acc):
     assert up.files_for_taxid(full_lake, -1) == []
 
 
+def test_files_for_taxid_null_bounds(full_lake, tmp_path):
+    """A foreign/hand-edited manifest with taxid_max: null must be skipped, not crash."""
+    import json
+    m = up.manifest(full_lake)
+    fd = m["tables"]["entries"]["file_details"]
+    rel = next(iter(fd))
+    fd[rel]["taxid_max"] = None
+    lake = tmp_path / "nullbounds"
+    lake.mkdir()
+    (lake / "manifest.json").write_text(json.dumps(m))
+    files = up.files_for_taxid(str(lake), 9606)
+    assert f"entries/{rel}" not in files
+
+
+def test_connect_path_with_quote(full_lake, tmp_path):
+    """A lake path containing an apostrophe works (paths are SQL-escaped)."""
+    lake = str(tmp_path / "o'brien" / "lake")
+    shutil.copytree(full_lake, lake)
+    con = up.connect(lake)  # manifest branch: explicit file list
+    assert con.sql("SELECT count(*) FROM entries").fetchone()[0] > 0
+    os.remove(os.path.join(lake, "manifest.json"))
+    con = up.connect(lake)  # fallback branch: glob
+    assert con.sql("SELECT count(*) FROM entries").fetchone()[0] > 0
+
+
 def test_entries_view_has_single_gene_name(full_lake):
     con = up.connect(full_lake)
     names = [r[0] for r in con.sql("DESCRIBE entries").fetchall()]

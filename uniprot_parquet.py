@@ -54,6 +54,11 @@ _VIEW_REPLACE = {
 }
 
 
+def _q(s) -> str:
+    """Escape a value for interpolation inside a single-quoted SQL literal."""
+    return str(s).replace("'", "''")
+
+
 def _view_sql(table: str, source: str) -> str:
     """CREATE VIEW over a read_parquet source (a glob or an explicit file list)."""
     replace = _VIEW_REPLACE.get(table, "(review_status = 'swissprot') AS reviewed")
@@ -226,7 +231,7 @@ def connect(
     con = duckdb.connect()
 
     if memory_limit:
-        con.sql(f"SET memory_limit = '{memory_limit}'")
+        con.sql(f"SET memory_limit = '{_q(memory_limit)}'")
     if threads:
         con.sql(f"SET threads = {threads}")
 
@@ -244,14 +249,14 @@ def connect(
     m = _read_manifest(base)
     if m is None:
         for table in TABLE_NAMES:
-            con.sql(_view_sql(table, f"'{base}/{table}/*/*.parquet'"))
+            con.sql(_view_sql(table, f"'{_q(base)}/{table}/*/*.parquet'"))
     else:
         for table, info in m.get("tables", {}).items():
             files = _present_files(con, base, table, info.get("files", []))
             if not files:
                 con.sql(_missing_view_sql(table, [c["name"] for c in info.get("columns", [])]))
                 continue
-            file_list = "[" + ", ".join(f"'{f}'" for f in files) + "]"
+            file_list = "[" + ", ".join(f"'{_q(f)}'" for f in files) + "]"
             con.sql(_view_sql(table, file_list))
 
     # Macros.  Split on semicolons that aren't inside single-quoted strings,
@@ -273,7 +278,7 @@ def _read_manifest(base: str) -> dict | None:
 
 def _remote_readable(con, url: str) -> bool:
     try:
-        con.sql(f"SELECT 1 FROM read_parquet('{url}') LIMIT 0")
+        con.sql(f"SELECT 1 FROM read_parquet('{_q(url)}') LIMIT 0")
         return True
     except (duckdb.IOException, duckdb.HTTPException, duckdb.Error):
         return False
@@ -321,7 +326,7 @@ def _read_json(base: str, name: str) -> dict | None:
         if base.startswith("s3://"):
             con = duckdb.connect()
             con.sql("INSTALL httpfs; LOAD httpfs;")
-            return json.loads(con.sql(f"SELECT content FROM read_text('{base}/{name}')").fetchone()[0])
+            return json.loads(con.sql(f"SELECT content FROM read_text('{_q(base)}/{name}')").fetchone()[0])
         with open(os.path.join(base, name)) as f:
             return json.load(f)
     except Exception:
@@ -404,7 +409,8 @@ def files_for_taxid(lake_path: str, taxid: int, table: str = "entries") -> list[
     m = manifest(lake_path)
     fd = m["tables"][table]["file_details"]
     return [f"{table}/{rel}" for rel, d in fd.items()
-            if d.get("taxid_min") is not None and d["taxid_min"] <= taxid <= d["taxid_max"]]
+            if d.get("taxid_min") is not None and d.get("taxid_max") is not None
+            and d["taxid_min"] <= taxid <= d["taxid_max"]]
 
 
 def schema(lake_path: str, table: str | None = None) -> dict | str:
