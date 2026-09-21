@@ -2094,7 +2094,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
             "accession_map resolves primary and secondary accessions. "
             "Per-file SHA-256 hashes are in SHA256SUMS.txt and manifest.json file_details."
         ),
-        "homepage": "https://github.com/dlrice/uniprot-parquet",
+        "homepage": "https://github.com/ebi-uniprot/uniprot-parquet",
         "version": SCHEMA_VERSION,
         "licenses": [
             {

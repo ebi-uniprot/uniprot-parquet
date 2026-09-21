@@ -1,6 +1,6 @@
 # UniProtKB Parquet Data Lake
 
-[![CI](https://github.com/dlrice/uniprot-parquet/actions/workflows/ci.yml/badge.svg)](https://github.com/dlrice/uniprot-parquet/actions/workflows/ci.yml)
+[![CI](https://github.com/ebi-uniprot/uniprot-parquet/actions/workflows/ci.yml/badge.svg)](https://github.com/ebi-uniprot/uniprot-parquet/actions/workflows/ci.yml)
 
 Analysis-ready Parquet tables covering the complete UniProtKB dataset — sorted, denormalized, and queryable from any language that reads Parquet.
 

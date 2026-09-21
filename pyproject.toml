@@ -7,13 +7,13 @@ name = "uniprot-parquet"
 version = "0.1.0"
 description = "DuckDB client and macros for the UniProtKB Parquet data lake"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 license = { text = "MIT" }
 authors = [
     { name = "Daniel Rice" }
 ]
 dependencies = [
-    "duckdb>=1.5"
+    "duckdb>=1.5,<2"
 ]
 
 [project.urls]
