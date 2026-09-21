@@ -363,7 +363,7 @@ workflow {
     }
 
     // 1. Stream input → single zstd-compressed JSONL
-    def input_ch = Channel.fromPath(params.inputfile)
+    def input_ch = channel.fromPath(params.inputfile)
     STREAM_JSONL(input_ch)
 
     // 2. Sort JSONL by reviewed DESC, taxid ASC, acc ASC
