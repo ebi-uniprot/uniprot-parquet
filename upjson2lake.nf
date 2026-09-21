@@ -348,6 +348,20 @@ workflow {
         error "Input file not found: ${params.inputfile}"
     }
 
+    // A re-run republishes into an existing release_dir, so a marker left by
+    // a previous successful run must be removed NOW — before the first
+    // publishDir copy can land — or a mirror that checks RELEASE_COMPLETE
+    // first would sync a mix of old and half-written files as a "complete"
+    // release.  A fresh marker is written by onComplete only if this run
+    // succeeds end to end.
+    if (!workflow.preview) {
+        def stale = file("${release_dir()}/RELEASE_COMPLETE")
+        if (stale.exists()) {
+            stale.delete()
+            log.info "Removed stale RELEASE_COMPLETE from ${release_dir()} (re-run)"
+        }
+    }
+
     // 1. Stream input → single zstd-compressed JSONL
     def input_ch = Channel.fromPath(params.inputfile)
     STREAM_JSONL(input_ch)
@@ -387,11 +401,12 @@ workflow {
     onComplete:
     def pending = file(pending_marker())
     if (workflow.success && pending.exists()) {
-        def complete = file("${release_dir()}/RELEASE_COMPLETE")
-        if (complete.exists()) {
-            complete.delete()
-        }
-        pending.moveTo(complete)
+        // moveTo overwrites an existing file target atomically
+        // (FilesEx.moveTo passes REPLACE_EXISTING), so no delete-first is
+        // needed — and none is wanted: a separate delete would open a window
+        // with no marker at all.  A stale marker from a previous run was
+        // already removed at workflow start.
+        pending.moveTo(file("${release_dir()}/RELEASE_COMPLETE"))
         log.info "RELEASE_COMPLETE written to ${release_dir()}"
     }
     else if (pending.exists()) {
