@@ -71,3 +71,16 @@ def test_feature_coverage_cell(cell_results):
 def test_isoform_cell_shows_its_table(cell_results):
     df = _cell(cell_results, "# Unnest isoforms")
     assert df is not None and len(df) > 0
+
+
+def test_isoform_census_counts_isoforms_per_protein(cell_results, small_lake):
+    """The census ranks proteins by their number of isoforms (one row per
+    protein), not by the isoform IDs of a single isoform."""
+    import uniprot_parquet as up
+    df = _cell(cell_results, "# Proteome-wide isoform census")
+    con = up.connect(small_lake["lake_dir"])
+    most = con.sql("SELECT max(len(isoforms)) FROM comments "
+                   "WHERE commentType = 'ALTERNATIVE PRODUCTS'").fetchone()[0]
+    assert most > 1                                          # precondition
+    assert df["n_isoforms"].iloc[0] == most
+    assert df["accession"].is_unique

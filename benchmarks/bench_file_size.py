@@ -6,8 +6,7 @@ For each target in (256, 512, 1024) MB: build `entries` only from a JSONL
 into a temp dir, serve it over HTTP, run the default-column organism query
 (`WHERE organism_id = 9606`) through DuckDB httpfs, and record files opened, footer
 bytes of those files, data bytes fetched (bytes served by the HTTP server),
-request count and wall time; plus the footer-size delta with and without the
-page index.  Prints a Markdown table and writes JSON + text under --out.
+request count and wall time; plus the file bytes the page index adds.  Prints a Markdown table and writes JSON + text under --out.
 
 Meant for the measurement slice.  On the test fixtures every build is one
 file per side, so the table only shows the mechanics.
@@ -18,19 +17,39 @@ Usage:
 
 import os
 import sys
+import math
 import argparse
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _bench_common import (  # noqa: E402
-    eprint, human_size, build_lake, table_files, footer_bytes, table_bytes,
+    BIN_DIR, eprint, human_size, build_lake, table_files, footer_bytes, table_bytes,
     serve_directory, duckdb_http_connection, time_query, write_results, read_parquet_source,
 )
+sys.path.insert(0, BIN_DIR)
+from parquet_transform import ROW_GROUP_SIZE  # noqa: E402
 
 QUERY = ("SELECT accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary, length "
          "FROM read_parquet({source}, hive_partitioning = true) WHERE organism_id = {organism_id}")
 TARGETS_MB = (256, 512, 1024)
 FULL_ENTRIES = 248_000_000
+
+
+def extrapolate_files(files, target_bytes, full_rows=FULL_ENTRIES):
+    """Files a full release would have at ``target_bytes``: each partition's
+    bytes per row scaled to its share of ``full_rows``, in files of the
+    target size.  Not the sample's own file count scaled by rows: a sample
+    smaller than the target holds one partial file per partition."""
+    import pyarrow.parquet as pq
+    by_part = {}
+    for f in files:
+        size, rows = by_part.get(os.path.dirname(f), (0, 0))
+        by_part[os.path.dirname(f)] = (size + os.path.getsize(f), rows + pq.read_metadata(f).num_rows)
+    total_rows = sum(rows for _, rows in by_part.values())
+    if not total_rows:
+        return 0
+    return sum(math.ceil(size * full_rows / total_rows / target_bytes)
+               for size, _ in by_part.values())
 
 
 def measure(jsonl, target_mb, organism_id, memory, tmp_root):
@@ -43,7 +62,7 @@ def measure(jsonl, target_mb, organism_id, memory, tmp_root):
     import pyarrow.parquet as pq
     n_rows = sum(pq.read_metadata(f).num_rows for f in files)
     row["rows"] = n_rows
-    row["files_extrapolated"] = round(len(files) * FULL_ENTRIES / max(n_rows, 1))
+    row["files_extrapolated"] = extrapolate_files(files, target_mb * 1024 * 1024)
     with serve_directory(outdir) as (base, stats):
         con = duckdb_http_connection()
         sql = QUERY.format(source=read_parquet_source(outdir, "entries", base), organism_id=organism_id)
@@ -64,26 +83,33 @@ def measure(jsonl, target_mb, organism_id, memory, tmp_root):
         row["files_opened"] = int(m.group(1)) if m else None
     row["footer_bytes_opened"] = (footer_bytes(files) if row["files_opened"] is None
                                   else round(footer_bytes(files) * row["files_opened"] / len(files)))
-    row["footer_over_data"] = (round(row["footer_bytes_opened"] / row["cold_bytes"], 4)
-                               if row["cold_bytes"] else None)
+    # cold_bytes counts every byte served, the opened files' footers included.
+    data_bytes = row["cold_bytes"] - row["footer_bytes_opened"]
+    row["footer_over_data"] = (round(row["footer_bytes_opened"] / data_bytes, 4)
+                               if data_bytes > 0 else None)
     return row
 
 
 def page_index_delta(jsonl, memory, tmp_root):
-    """Footer bytes with (default) and without write_page_index, same build."""
+    """File bytes with and without write_page_index: each built file
+    rewritten both ways with the transform's row-group size, so only the
+    page index differs.  File size, not the footer's serialized_size: the
+    column and offset indexes sit between the data and the Thrift footer,
+    which holds only their offsets."""
     import pyarrow.parquet as pq
     outdir = os.path.join(tmp_root, "pageindex")
     build_lake(jsonl, outdir, only="entries", memory=memory)
-    files = table_files(outdir, "entries")
-    with_idx = footer_bytes(files)
-    without = 0
-    for f in files:
+    sizes = {True: 0, False: 0}
+    for f in table_files(outdir, "entries"):
         t = pq.read_table(f)
-        p = f + ".noidx"
-        pq.write_table(t, p, compression="zstd", write_page_index=False)
-        without += pq.read_metadata(p).serialized_size
-        os.remove(p)
-    return {"with_page_index": with_idx, "without_page_index": without, "delta": with_idx - without}
+        for with_index in sizes:
+            p = f + ".rewrite"
+            pq.write_table(t, p, compression="zstd", row_group_size=ROW_GROUP_SIZE,
+                           write_page_index=with_index)
+            sizes[with_index] += os.path.getsize(p)
+            os.remove(p)
+    return {"with_page_index": sizes[True], "without_page_index": sizes[False],
+            "delta": sizes[True] - sizes[False]}
 
 
 def main():
@@ -113,7 +139,7 @@ def main():
                      f"{r['footer_over_data']} | {r['cold_requests']} | {r['wall_ms_median']} |")
     pi = results["page_index"]
     lines.append("")
-    lines.append(f"Page index footer delta: {human_size(pi['delta'])} "
+    lines.append(f"Page index cost (file bytes): {human_size(pi['delta'])} "
                  f"({human_size(pi['with_page_index'])} with, {human_size(pi['without_page_index'])} without)")
     lines.append("")
     lines.append("Decision rule: smallest target whose extrapolated footer bytes are < 10% of data bytes; else 1 GB.")

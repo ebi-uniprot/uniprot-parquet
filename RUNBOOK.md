@@ -255,7 +255,7 @@ column -t -s $'\t' datalake/reports/trace.txt | cut -c1-200
 #    difference between this machine and the cluster nodes
 
 # 4. Spill went where you pointed it
-ls -d /path/with/space/duckdb_tmp/duckdb_spill_* 2>/dev/null        # one per task while running; removed on exit
+ls -d /path/with/space/duckdb_tmp/*/duckdb_spill_* 2>/dev/null      # under <release>.<process>.<hash>/, one per task while running; removed on exit
 
 # 5. Resume: the same nextflow command again
 #    -> cached=5
@@ -354,7 +354,7 @@ grep -c "executor >.*slurm" .nextflow.log                   # >= 1
 # 2. The compute nodes see your env and tools
 WD=$(grep -o "work/[0-9a-f]\{2\}/[0-9a-f]*" .nextflow.log | head -1)
 grep "SLURM Job ID" $WD/.command.log                       # beforeScript ran on a node
-grep -L "command not found" work/*/*/.command.err          # no missing pigz/zstd/python on nodes
+grep -l "command not found" work/*/*/.command.err          # no output: no missing pigz/zstd/python on nodes
 
 # 3. Same end-state checks as stage 2a on /scratch/$USER/uplake_smoke/subset/
 #    (RELEASE_COMPLETE, VERDICT, expected count, provenance commit, checksums, SCHEMA.md)
@@ -398,7 +398,7 @@ nextflow run upjson2lake.nf -profile short \
 The kernel's OOM killer (exit 137/140) and SLURM's pre-kill (143) are retried
 the same way. A 143 can also be a wall-time kill, so a retry also gets twice
 its base time, capped at `--max_time` (default 72h). Set that to at most the
-queue's wall-time limit.
+queue's wall-time limit (`run_lake.sh --max-time`).
 
 If the cluster nodes are very different from the machine you ran stage 4 on,
 repeat stage 4 here with `./run_lake.sh subset --outdir /scratch/$USER/uplake_subset
@@ -431,8 +431,12 @@ ls -l /path/to/UniProtKB.json.gz        # ~160 GB compressed for 2026 releases
 #    reserves this for you — check the spill filesystem yourself:
 df -h /scratch/$USER                    # >= 3 TB free on the spill filesystem, plus the output
 
-# 5. Queue limits: SORT_JSONL asks 24h, PARQUET_TRANSFORM and STREAM_JSONL 48h, 96 GB, 4 CPUs,
-#    and the OOM retry may ask 192 GB (exact headers: -c 4 -t 48:00:00 --mem 98304M -p production).
+# 5. Queue limits: SORT_JSONL asks 24h, PARQUET_TRANSFORM and STREAM_JSONL 48h, 96 GB,
+#    4 CPUs (VALIDATE 8) (exact headers: -c 4 -t 48:00:00 --mem 98304M -p production).
+#    A retry (out of memory, or a SIGTERM that may be a wall-time kill) asks double:
+#    192 GB, and 48h for SORT_JSONL and VALIDATE, 72h for PARQUET_TRANSFORM (twice
+#    48h, capped at --max_time, default 72h). If the queue's MaxWall is lower, pass
+#    `--max-time <limit>` to run_lake.sh, or SLURM rejects the retry.
 #    Confirm the production queue permits all of that:
 sinfo -p production -o "%P %l %m %c"
 sacctmgr show qos format=name,maxwall,maxtres | grep -i production
@@ -441,7 +445,11 @@ sacctmgr show qos format=name,maxwall,maxtres | grep -i production
 ### 8b. Submit
 
 Run from `tmux`/`screen` on the login node, or wrap the command in a small
-`sbatch` head job with a wall time longer than the whole pipeline (2–3 days):
+`sbatch` head job with a wall time longer than the whole pipeline (2–3 days).
+Give the head job an output file outside the checkout (`sbatch -o
+/scratch/$USER/uplake-%j.out ...`): `.gitignore` covers the default
+`slurm-<jobid>.out`, but any other untracked file in the checkout makes
+`provenance.json` record `dirty: true`.
 
 ```bash
 ./run_lake.sh full \
@@ -529,7 +537,10 @@ size and SHA-256 of every file published beside `lake/`); the workflow's
 once every publish copy has finished, and renames `.RELEASE_COMPLETE.pending`
 to `RELEASE_COMPLETE` only if it passes. Otherwise the log says
 `RELEASE_COMPLETE not written` with the problems, and no marker is left:
-re-run with `-resume` to republish.
+re-run with `-resume` to republish. Nextflow itself still exits 0 then (the
+check runs after the workflow has succeeded), so `run_lake.sh` checks for the
+marker and exits 1 without it. When you call `nextflow run` directly, the
+marker, not the exit status, says the release is complete.
 
 ---
 
@@ -593,7 +604,7 @@ head -5 $OUT/SCHEMA.md
 | `Process requirement exceeds available memory` (local executor) | `--process_memory` is more than the machine has; lower it (DuckDB spills to `--duckdb_temp`). |
 | `STREAM_JSONL` count mismatch (`FATAL — count mismatch`) | The dump is not the release you think, or is truncated: re-check `EXPECTED` and `pigz -t`. |
 | `STREAM_JSONL` stops with `FATAL — LoneSurrogate` or `Integer exceeds 64-bit range` | The dump holds data a JSON line cannot carry exactly (a `\uD800`-style escape without its pair, an integer outside −2^63 … 2^64−1). The message names the entry number (and the byte offset for a surrogate). Report it to UniProt; the pipeline refuses rather than change the data. |
-| `VALIDATE` fails | Read `validation_report.txt`; the lake was not marked complete. Fix, then re-submit — VALIDATE alone re-runs. |
+| `VALIDATE` fails | Read the failed task's report: `WD=$(nextflow log last -f process,status,workdir \| awk '$1=="VALIDATE" && $2=="FAILED" {print $3}' \| tail -1)`, then `$WD/validation_report.txt`. A failing report is not published, so `$OUT/validation_report.txt` is missing or a previous run's (passing) report. The lake was not marked complete. Fix, then re-submit — VALIDATE alone re-runs. |
 | `PARQUET_TRANSFORM` stops with `Input lacks fields every UniProtKB entry carries` | UniProt removed or renamed a field a shortcut column is built from (or the input is not a UniProtKB dump). Update the SQL builder and `REQUIRED_PATHS` in `bin/parquet_transform.py`; this is a shortcut-schema change. New fields, and retyped fields that no shortcut reads, never stop the build: they are source columns. |
 | `PARQUET_TRANSFORM` stops with `Shortcut columns whose source field has a different type in different entries` | UniProt ships a field a shortcut is built from with more than one type (for example a string in some entries and an object in others), so DuckDB inferred JSON. The message names the column and the source path. Decide how the shortcut should read the field, update its SQL builder in `bin/parquet_transform.py`, and bump `schema_version` if the column's type or meaning changes. |
 | `PARQUET_TRANSFORM` stops with `Input has entryType value(s) [...]` | UniProt reworded or added an `entryType` value. The review flag and the swissprot/trembl partitions depend on it, so the build refuses rather than file every such entry as TrEMBL. Add the value to `ENTRY_TYPES` in `bin/parquet_transform.py` and to `ENTRY_TYPES` in `bin/shortcut_reference.py`, mapping it to reviewed or unreviewed. |

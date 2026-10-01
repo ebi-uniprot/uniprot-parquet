@@ -1,6 +1,6 @@
 # Evaluation of DuckDB VARIANT for Semi-Structured Protein Data in uniprot-parquet
 
-> **Dated record (April 2026, DuckDB 1.5.1, the 5,378-entry `2026_01` demo lake).** It was measured against an earlier schema (before `accession_map`, Hive partitioning, the `*_index` columns and today's layout of UniProt's JSON keys as source columns beside typed shortcuts) and has not been rerun. It is kept as the only measured comparison of a schema-free layout. The summary's "no layout outperformed baseline on any query" is too strong: Layout D ran 0.5–0.9× baseline time on six queries and was 9% smaller. The published schema has no VARIANT columns, PyArrow 23 cannot write them anyway, and the pipeline's evaluation-only `--variant-children` flag has been removed.
+> **Dated record (April 2026, DuckDB 1.5.1, the 5,378-entry `2026_01` demo lake).** It was measured against an earlier schema (before `accession_map`, Hive partitioning, the `*_index` columns and today's layout of UniProt's JSON keys as source columns beside typed shortcuts) and has not been rerun. It is kept as the only measured comparison of a schema-free layout. Read its Layout D results with care. D's entries table is a byte copy of the baseline's file, so its D/Base ratios on the nine entries-only queries do not measure a layout. Q1, Q3, Q6 and Q11 ran the same SQL on identical bytes, through the client views on one side and raw `read_parquet` on the other, so their 0.8–0.9× ratios are run-to-run noise: `go_term_search` was 1.72× in one recorded run and 0.85× in the next. Q2 and Q14 ran different, cheaper SQL in D (§2.4). An earlier version of this note said D "ran 0.5–0.9× baseline time on six queries"; those were these six entries-only queries, and that claim is withdrawn. What was measured is that D was slower on the child-table queries and 9% smaller on disk. The published schema has no VARIANT columns, PyArrow 23 cannot write them anyway, and the pipeline's evaluation-only `--variant-children` flag has been removed.
 
 ## 1. Introduction
 
@@ -48,7 +48,7 @@ We evaluated five Parquet layouts built from the same source data:
 
 ### 2.4 Benchmark queries
 
-We defined 16 analytical queries spanning six categories: point lookups, organism-filtered scans, keyword/GO searches, aggregations, joins, full-table scans, nested struct access, and comment/publication retrieval. Each query was executed identically across all layouts (with SQL adapted to the column access pattern of each layout) and verified to return identical row counts.
+We defined 16 analytical queries spanning six categories: point lookups, organism-filtered scans, keyword/GO searches, aggregations, joins, full-table scans, nested struct access, and comment/publication retrieval. Each query was executed across all layouts (with SQL adapted to the column access pattern of each layout) and verified to return identical row counts. Two of Layout D's entries queries were not the baseline's SQL. Q2 (`protein_card_macro`) selects six typed columns instead of calling the `protein_card` macro. Q14 (`nested_protein_desc_access`) tests `protein_name IS NOT NULL` instead of the `protein_desc` struct path. Both are cheaper than the baseline's query.
 
 ### 2.5 VARIANT-specific implementation details
 
@@ -86,7 +86,7 @@ The table below reports median warm query latency in milliseconds across all fiv
 
 Layout A queries consistently exceeded 3,000 ms (3–9 seconds) due to full-table VARIANT deserialisation on every query. Layouts B and C showed that entries queries touching the VARIANT column remained slow (3–9 seconds for B; 100–800 ms for C with stripped arrays), while child table queries on pre-unnested VARIANT achieved near-baseline performance. Layout D eliminates entries VARIANT overhead entirely by retaining typed columns, making it the strongest VARIANT alternative — but it still does not match the fully typed baseline on child-table queries.
 
-Of Layout D's 16 queries, 10 matched baseline latency (≤1.5x), 3 showed moderate overhead (1.5–5x) on child-table aggregations, and 3 showed higher overhead (8–17x) on queries that join with or scan VARIANT child tables extracting multiple nested fields. No VARIANT layout outperformed the baseline on any query.
+Nine of the 16 queries read only entries, and D's entries file is the baseline's file, so their D/Base ratios are noise or reflect different SQL, not the layout (see the note at the top). Of Layout D's 16 queries, 10 matched baseline latency (≤1.5x), 3 showed moderate overhead (1.5–5x) on child-table aggregations, and 3 showed higher overhead (8–17x) on queries that join with or scan VARIANT child tables extracting multiple nested fields. No VARIANT layout outperformed the baseline on any query.
 
 ### 3.2 Storage
 
@@ -118,7 +118,7 @@ Layout D achieved 2.95 MB total storage, 9% smaller than the 3.23 MB baseline. T
 | Layout C | 3.39 s     | 5 tables with stripped VARIANT entries          |
 | Layout D | 2.80 s     | Entries copied from baseline + 4 VARIANT children |
 
-Layout D build time (2.80 s) is comparable to the baseline (2.04 s). In production, Layout D avoids the entries SQL builder entirely (copies the existing Parquet file) and uses simple UNNEST + VARIANT cast for child tables.
+Layout D's 2.80 s does not include building its entries table, which was copied from the baseline. A real Layout D build needs the baseline's entries build plus the four VARIANT child tables, so its build time is not comparable to the baseline's 2.04 s.
 
 ### 3.4 Schema complexity
 
@@ -151,7 +151,7 @@ UniProtKB comments posed a unique challenge. DuckDB's JSON reader infers comment
 
 The fully typed baseline star schema delivers the best query performance across all 16 benchmark queries. No VARIANT layout matched or outperformed the baseline on any query category. The performance advantage of explicit typing is consistent: typed columns enable direct columnar reads without runtime deserialisation or CAST overhead, which benefits every access pattern from point lookups to aggregations to joins.
 
-Layout D (hybrid) was the strongest VARIANT alternative, achieving near-parity on entries queries (which retain typed columns) and the smallest overhead on child tables. However, even Layout D showed 2–17x overhead on child-table queries that extract nested fields — overhead that is entirely absent in the fully typed baseline.
+Layout D (hybrid) was the strongest VARIANT alternative. Its parity on entries queries holds by construction, because its entries file is the baseline's, and it had the smallest overhead on child tables. However, even Layout D showed 2–17x overhead on child-table queries that extract nested fields — overhead that is entirely absent in the fully typed baseline.
 
 The 375 lines of schema-dependent SQL builder code that VARIANT would eliminate are a real maintenance cost, but the query performance benefit of explicit typing justifies this investment for a data lake whose primary purpose is to serve analytical queries. Schema evolution remains a manual process, but the typed approach ensures that every query against the lake runs at columnar-native speed without runtime type resolution.
 
@@ -227,7 +227,7 @@ GROUP BY acc ORDER BY n DESC LIMIT 10
 
 ### S2. Benchmark query SQL — Layout D (hybrid)
 
-Layout D entries queries are identical to baseline (typed columns). Child table queries use VARIANT dot notation with explicit CAST for type extraction. Table references use `read_parquet()` with glob patterns.
+Layout D entries queries read the baseline's entries file (typed columns); Q2 and Q14 differ from the baseline's SQL (§2.4). Child table queries use VARIANT dot notation with explicit CAST for type extraction. Table references use `read_parquet()` with glob patterns.
 
 ```sql
 -- Q1: point_lookup_by_acc (Point lookup, typed entries)

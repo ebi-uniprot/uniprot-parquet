@@ -336,7 +336,7 @@ rsync -avm --include='*/' --include='review_status=swissprot/***' --include='*.j
 rsync -av rsync://<host>/<release>/lake/ ./lake/
 ```
 
-A release is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors should check it first. `python bin/verify_release.py <release> --full` re-checks a downloaded or mirrored copy: every file listed, every SHA-256 matching `SHA256SUMS.txt` and `provenance.json`, no stray Parquet file. To fetch the whole lake over HTTP(S) with every file checked against its size and checksums, use the Metalink file with aria2: `aria2c -M RELEASE.metalink --metalink-base-uri=https://<host>/<release>/lake/` (its `<url>` entries are relative to the lake directory; curl dropped Metalink support in 7.78). Without downloading, `connect("https://<host>/<release>/lake")` reads only the byte ranges a query needs; use the two-step accession lookup for remote point queries.
+A release is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors should check it first. To check a downloaded `lake/`, run `(cd lake && sha256sum -c --quiet SHA256SUMS.txt)` for the full lake, or the `grep` form above for a tier (`'review_status=swissprot/'` for Swiss-Prot only). `python bin/verify_release.py <release> --full` re-checks a full mirror of the release directory, with `provenance.json` and the files beside `lake/`: every file listed, every SHA-256 matching `SHA256SUMS.txt` and `provenance.json`, no stray Parquet file. It fails on a download of `lake/` alone, or of a tier. To fetch the whole lake over HTTP(S) with every file checked against its size and checksums, use the Metalink file with aria2: `aria2c -M RELEASE.metalink --metalink-base-uri=https://<host>/<release>/lake/` (its `<url>` entries are relative to the lake directory; curl dropped Metalink support in 7.78). Without downloading, `connect("https://<host>/<release>/lake")` reads only the byte ranges a query needs; use the two-step accession lookup for remote point queries.
 
 ---
 
@@ -408,13 +408,13 @@ cd demo && ./run_demo.sh
     --previous-manifest /scratch/uniprot_parquet/2026_03/lake/manifest.json
 ```
 
-`--expected-count` is required in full mode: take the entry count from the [UniProt release statistics](https://www.uniprot.org/help/release-statistics). It guards against silent loss during the JSON-to-JSONL streaming step. Full mode also requires `--previous-manifest` (the previous release's `lake/manifest.json`, for the schema diff) or, when there is no previous release, `--first-release`. A manifest inside the release being built is refused.
+`--expected-count` is required in full mode: take the entry count from the [UniProt release statistics](https://www.uniprot.org/help/release-statistics). It guards against silent loss during the JSON-to-JSONL streaming step. Full mode also requires `--previous-manifest` (the previous release's `lake/manifest.json`, for the schema diff) or, when there is no previous release, `--first-release`. A manifest inside the release being built is refused. `--max-time` lowers the wall-time cap of a retried heavy process (`--max_time`, 72h by default) to the queue's limit. `run_lake.sh` exits 1 unless the run wrote `RELEASE_COMPLETE`; a direct `nextflow run` exits 0 even when the published copy fails verification, so check for the marker.
 
 ### Nextflow directly
 
 ```bash
 nextflow run upjson2lake.nf -profile local \
-    --inputfile tests/fixtures/small.json.gz --release test_2026
+    --inputfile tests/fixtures/small.json.gz --release test_2026 --process_memory '4 GB'
 
 nextflow run upjson2lake.nf -profile prod \
     --inputfile /path/to/UniProtKB.json.gz --release 2026_03 \
@@ -478,7 +478,7 @@ DuckDB does the JSON parsing, the SQL transforms and the sorting; it streams Arr
 ### Production notes (SLURM)
 
 - **OOM recovery.** `SORT_JSONL`, `PARQUET_TRANSFORM` and `VALIDATE` retry once on an out-of-memory failure with doubled memory, capped at 256 GB. That covers DuckDB's own out-of-memory error (the scripts exit 75), the OOM killer (137/140), and SLURM's pre-kill SIGTERM (143). A 143 may also be a wall-time kill, so the retry also doubles the time limit, capped at `--max_time` (72h by default; keep it within the queue's limit). Other failures are terminal.
-- **Spill directory.** Point `--duckdb_temp` at a large scratch filesystem (1–2 TB free); node-local NVMe is best. The processes' `disk` directives are not passed to SLURM, so check the space yourself. Each process spills into `<duckdb_temp>/<release>.<process>/`, which is emptied when the process starts, so the spill of an attempt killed by OOM is reclaimed by its retry.
+- **Spill directory.** Point `--duckdb_temp` at a large scratch filesystem (1–2 TB free); node-local NVMe is best. The processes' `disk` directives are not passed to SLURM, so check the space yourself. Each process spills into `<duckdb_temp>/<release>.<process>.<hash>/` (the hash is of the absolute release directory, so runs into different outdirs never share one), which is emptied when the process starts, so the spill of an attempt killed by OOM is reclaimed by its retry.
 - **Resume.** Runs use `-resume`; resubmitting after a wall-time kill or preemption picks up from the last completed process. Every `publishDir` overwrites, so a resumed run republishes cached outputs whole, repairing a copy that an interrupted run left damaged; the marker is written only if `bin/verify_release.py` finds the published copy matches its metadata.
 - **Integrity.** `STREAM_JSONL` writes an entry count, checks the compressed line count against it and, with `--expected_count`, against UniProt's published count. `VALIDATE` checks the lake against the same count.
 - **Memory model.** DuckDB gets 75% of process memory by default; the rest is headroom for Python and PyArrow.

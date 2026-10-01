@@ -250,7 +250,7 @@ def analyze_storage(lake_path):
     total_bytes = 0
     total_rows = 0
 
-    tables = ["entries", "features", "xrefs", "comments", "publications"]
+    tables = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
 
     for table in tables:
         table_dir = os.path.join(lake_path, table)
@@ -260,11 +260,13 @@ def analyze_storage(lake_path):
         table_info = {"files": [], "columns": []}
         table_bytes = 0
         table_rows = 0
+        # Every Parquet file under the table, Hive partitions included
+        # (<table>/review_status=*/<table>_*.parquet).
+        paths = sorted(os.path.join(dirpath, f)
+                       for dirpath, _, files in os.walk(table_dir)
+                       for f in files if f.endswith(".parquet"))
 
-        for fname in sorted(os.listdir(table_dir)):
-            if not fname.endswith(".parquet"):
-                continue
-            fpath = os.path.join(table_dir, fname)
+        for fpath in paths:
             fsize = os.path.getsize(fpath)
             table_bytes += fsize
 
@@ -272,7 +274,7 @@ def analyze_storage(lake_path):
             meta = pq.read_metadata(fpath)
             table_rows += meta.num_rows
             table_info["files"].append({
-                "name": fname,
+                "name": os.path.relpath(fpath, table_dir),
                 "size_bytes": fsize,
                 "size_human": _human_size(fsize),
                 "num_rows": meta.num_rows,
@@ -280,24 +282,25 @@ def analyze_storage(lake_path):
                 "num_columns": meta.num_columns,
             })
 
-            # Column-level breakdown (from first file only)
-            if len(table_info["columns"]) == 0:
-                schema = pq.read_schema(fpath)
+            # Column-level breakdown (from the first file only): one entry
+            # per column, summed over the file's row groups.
+            if not table_info["columns"]:
+                sizes = {}
                 for rg_idx in range(meta.num_row_groups):
                     rg = meta.row_group(rg_idx)
                     for col_idx in range(rg.num_columns):
                         col = rg.column(col_idx)
-                        col_name = col.path_in_schema
-                        # Find physical type from schema
-                        table_info["columns"].append({
-                            "name": col_name,
-                            "total_compressed_bytes": col.total_compressed_size,
-                            "total_uncompressed_bytes": col.total_uncompressed_size,
-                            "compression_ratio": round(
-                                col.total_uncompressed_size / col.total_compressed_size, 2
-                            ) if col.total_compressed_size > 0 else 0,
-                            "compressed_human": _human_size(col.total_compressed_size),
-                        })
+                        compressed, uncompressed = sizes.get(col.path_in_schema, (0, 0))
+                        sizes[col.path_in_schema] = (compressed + col.total_compressed_size,
+                                                     uncompressed + col.total_uncompressed_size)
+                for col_name, (compressed, uncompressed) in sizes.items():
+                    table_info["columns"].append({
+                        "name": col_name,
+                        "total_compressed_bytes": compressed,
+                        "total_uncompressed_bytes": uncompressed,
+                        "compression_ratio": round(uncompressed / compressed, 2) if compressed > 0 else 0,
+                        "compressed_human": _human_size(compressed),
+                    })
 
         table_info["total_bytes"] = table_bytes
         table_info["total_human"] = _human_size(table_bytes)
