@@ -446,11 +446,12 @@ DuckDB streams Arrow record batches to PyArrow, which writes zstd-compressed Par
 python -m pytest tests/ -v                      # default suite, ~4,600 entries (fetched on first run)
 python tests/fetch_fixtures.py --scale stress   # one-time fetch, ~70 MB
 python -m pytest tests/ -v --stress             # stress suite, ~14,000 entries; needs ~8 GB RAM
+ruff check . && mypy                            # lint, and strict type checking (config in pyproject.toml)
 ```
 
 Use `python -m pytest` so the repository root is on `sys.path`. The default fixture is fetched from the UniProt REST API on first use (targeted queries plus the most heavily annotated Swiss-Prot and TrEMBL entries); `python tests/fetch_fixtures.py --force` re-fetches it after a UniProt release. The committed `tests/fixtures/small.json.gz` (52 entries) needs no network.
 
-The suites cover the tables, sort order and array positions, manifests, checksums and data package, idempotency and `--skip-existing`, lossless reconstruction of every entry (also with fields injected at every level or changing shape), the client on full and partial lakes, every README SQL example, and the validator. `tests/test_workflow.py` runs the pipeline end to end, including the `prod` profile through Nextflow's SLURM executor on the stand-ins in `tests/fake_slurm/` (RUNBOOK 4c); it is skipped without `nextflow` on `PATH` unless `REQUIRE_NEXTFLOW=1` is set. CI (`.github/workflows/ci.yml`) runs the default suite, the workflow tests, a compile check of every script and `nextflow lint`.
+The suites cover the tables, sort order and array positions, manifests, checksums and data package, idempotency and `--skip-existing`, lossless reconstruction of every entry (also with fields injected at every level or changing shape), the client on full and partial lakes, every README SQL example, and the validator. `tests/test_workflow.py` runs the pipeline end to end, including the `prod` profile through Nextflow's SLURM executor on the stand-ins in `tests/fake_slurm/` (RUNBOOK 4c); it is skipped without `nextflow` on `PATH` unless `REQUIRE_NEXTFLOW=1` is set. CI (`.github/workflows/ci.yml`) runs the default suite, the workflow tests, `ruff check`, `mypy` (strict; every function is annotated) and `nextflow lint`.
 
 ---
 

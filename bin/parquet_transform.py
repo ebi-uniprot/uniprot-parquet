@@ -48,23 +48,29 @@ Usage:
 Requires: duckdb, pyarrow
 """
 
+import argparse
+import hashlib
+import json
 import os
 import re
-import sys
-import argparse
-import time
-import json
 import shutil
-import hashlib
-from datetime import datetime, timezone
+import sys
+import time
+from collections.abc import Callable, Collection, Iterable
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from duckdb.sqltypes import DuckDBPyType
+from duckdb_util import (
+    _sql_escape,
+    run_main,
+)
+from duckdb_util import init_duckdb as init_duckdb  # re-exported: validate_lake imports init_duckdb from here
 from frictionless import Package
-
-from duckdb_util import run_main, _sql_escape, init_duckdb  # noqa: F401  (re-exported: validate_lake imports init_duckdb from here)
 
 # ─── Release constants ──────────────────────────────────────────────────
 SCHEMA_VERSION = "1.0.0"          # semver of the shortcut columns (see README "Schema versioning")
@@ -79,11 +85,11 @@ LICENSE_HEADER = (
 )
 
 
-def eprint(*args, **kwargs):
+def eprint(*args: Any, **kwargs: Any) -> None:
     print(*args, file=sys.stderr, **kwargs)
 
 
-def build_sorting_columns(sort_order, arrow_schema):
+def build_sorting_columns(sort_order: list[str] | None, arrow_schema: pa.Schema) -> list[Any] | None:
     """Convert sort order strings to PyArrow SortingColumn objects.
 
     Args:
@@ -134,22 +140,23 @@ _PARSED_STRING_TYPE_IDS = {"date", "time", "time with time zone", "timestamp",
                            "timestamp_ns", "uuid"}
 
 
-def _as_read(t) -> str:
+def _as_read(t: DuckDBPyType) -> str:
     """SQL type string of inferred type ``t`` with every string DuckDB
     parsed into a date, time, timestamp or UUID kept as VARCHAR."""
     if t.id in _PARSED_STRING_TYPE_IDS:
         return "VARCHAR"
     if t.id == "struct":
-        return "STRUCT(" + ", ".join(f"{_ident(name)} {_as_read(child)}"
+        return "STRUCT(" + ", ".join(f"{_ident(name)} {_as_read(cast(DuckDBPyType, child))}"
                                      for name, child in t.children) + ")"
     if t.id == "list":
-        return _as_read(t.children[0][1]) + "[]"
+        return _as_read(cast(DuckDBPyType, t.children[0][1])) + "[]"
     if t.id == "map":
-        return f"MAP({_as_read(t.children[0][1])}, {_as_read(t.children[1][1])})"
+        return (f"MAP({_as_read(cast(DuckDBPyType, t.children[0][1]))}, "
+                f"{_as_read(cast(DuckDBPyType, t.children[1][1]))})")
     return str(t)
 
 
-def build_read_clause(con, jsonl_path: str) -> str:
+def build_read_clause(con: duckdb.DuckDBPyConnection, jsonl_path: str) -> str:
     """Build the DuckDB read_json SQL fragment for ``jsonl_path``.
 
     DuckDB infers column names and types from the data itself.
@@ -191,7 +198,7 @@ def build_read_clause(con, jsonl_path: str) -> str:
             f"a DuckDB struct cannot hold both, so this upstream change needs a code "
             f"decision.  DuckDB: {e}") from None
     columns = ", ".join(f"'{_sql_escape(name)}': '{_sql_escape(_as_read(t))}'"
-                        for name, t in zip(rel.columns, rel.types))
+                        for name, t in zip(rel.columns, rel.types, strict=True))
     return f"read_json('{safe_path}', {options}, columns={{{columns}}})"
 
 
@@ -207,7 +214,7 @@ def _human_size(nbytes: int | float) -> str:
     return f"{nbytes:.1f} TB"  # pragma: no cover
 
 
-def stage_to_parquet(con, read_clause: str, staging_path: str) -> tuple[str, int]:
+def stage_to_parquet(con: duckdb.DuckDBPyConnection, read_clause: str, staging_path: str) -> tuple[str, int]:
     """Convert JSONL to a Parquet staging file for faster repeated reads.
 
     Parses the JSON once and writes a zstd-compressed Parquet file.
@@ -245,7 +252,8 @@ def _join(prefix: str, name: str) -> str:
 def _segment_name(seg: str) -> str | None:
     """The field name of one path segment, or None if ``seg`` spans several
     segments (holds an unescaped '.')."""
-    name, escaped = [], False
+    name: list[str] = []
+    escaped = False
     for ch in seg:
         if escaped:
             name.append(ch)
@@ -289,7 +297,7 @@ def discover_schema_paths(staging_path: str) -> dict[str, None]:
 
     paths: dict[str, None] = {}
 
-    def _walk(field_or_type, prefix: str) -> None:
+    def _walk(field_or_type: Any, prefix: str) -> None:
         if isinstance(field_or_type, pa.Schema):
             for field in field_or_type:
                 _walk(field, prefix)
@@ -311,47 +319,47 @@ def discover_schema_paths(staging_path: str) -> dict[str, None]:
     return paths
 
 
-def _type_paths(t, prefix: str, out: dict[str, object]) -> None:
+def _type_paths(t: DuckDBPyType, prefix: str, out: dict[str, DuckDBPyType]) -> None:
     """Record every dotted path under a DuckDB type (discover_schema_paths
     convention: list elements add no segment, a MAP's values sit under
     ``<path>.*``) mapped to its DuckDBPyType."""
     if t.id == "list":
-        _type_paths(t.children[0][1], prefix, out)
+        _type_paths(cast(DuckDBPyType, t.children[0][1]), prefix, out)
     elif t.id == "map":
-        value_type = t.children[1][1]
+        value_type = cast(DuckDBPyType, t.children[1][1])
         out[prefix + ".*"] = value_type
         _type_paths(value_type, prefix + ".*", out)
     elif t.id == "struct":
         for name, child in t.children:
             path = _join(prefix, name)
-            out[path] = child
-            _type_paths(child, path, out)
+            out[path] = cast(DuckDBPyType, child)
+            _type_paths(cast(DuckDBPyType, child), path, out)
 
 
-def _unlist(t):
+def _unlist(t: DuckDBPyType) -> DuckDBPyType:
     """The element type of a (nested) list; any other type unchanged."""
     while t.id == "list":
-        t = t.children[0][1]
+        t = cast(DuckDBPyType, t.children[0][1])
     return t
 
 
-def _is_json(t) -> bool:
+def _is_json(t: DuckDBPyType) -> bool:
     """True for JSON or a (nested) list of JSON."""
     return str(_unlist(t)) == "JSON"
 
 
-def inferred_types(con, read_clause: str) -> dict[str, object]:
+def inferred_types(con: duckdb.DuckDBPyConnection, read_clause: str) -> dict[str, DuckDBPyType]:
     """Every dotted path of the input (discover_schema_paths convention)
     mapped to the DuckDBPyType DuckDB inferred for it."""
     rel = con.sql(f"SELECT * FROM {read_clause} LIMIT 0")
-    types: dict[str, object] = {}
-    for name, t in zip(rel.columns, rel.types):
+    types: dict[str, DuckDBPyType] = {}
+    for name, t in zip(rel.columns, rel.types, strict=True):
         types[_join("", name)] = t
         _type_paths(t, _join("", name), types)
     return types
 
 
-def discover_json_paths(types: dict[str, object]) -> set[str]:
+def discover_json_paths(types: dict[str, DuckDBPyType]) -> set[str]:
     """Paths of ``types`` (inferred_types) whose type is JSON or a list of
     JSON.
 
@@ -528,7 +536,7 @@ def _cast(table: str, column: str, expr: str) -> str:
     return f"CAST({expr} AS {COLUMN_TYPES[(table, column)]})"
 
 
-def _typed(table: str, column: str, expr: str, schema_paths: set[str]) -> str:
+def _typed(table: str, column: str, expr: str, schema_paths: Collection[str]) -> str:
     """SQL for an optional curated column: the source expression cast to its
     declared type when the source path exists, else a typed NULL."""
     if COLUMN_SOURCES[(table, column)] not in schema_paths:
@@ -537,7 +545,7 @@ def _typed(table: str, column: str, expr: str, schema_paths: set[str]) -> str:
 
 
 def _per_element(table: str, column: str, array: str, array_path: str, element_expr: str,
-                 schema_paths: set[str]) -> str:
+                 schema_paths: Collection[str]) -> str:
     """SQL for an optional shortcut holding one value per element of
     ``array`` (``element_expr`` of ``x``): a typed NULL when the array is
     absent from the input, and one NULL per element when the array is there
@@ -555,7 +563,7 @@ def _needs_json(prefix: str, json_paths: set[str]) -> bool:
     return any(p == prefix or p.startswith(prefix + ".") for p in json_paths)
 
 
-def _children(prefix: str, schema_paths) -> list[str]:
+def _children(prefix: str, schema_paths: Collection[str]) -> list[str]:
     """Direct child field names (unescaped) under a dotted prefix ('' = top
     level), in the order discover_schema_paths found them (the input's key
     order); sorted when ``schema_paths`` is a plain set."""
@@ -565,7 +573,7 @@ def _children(prefix: str, schema_paths) -> list[str]:
     return sorted(ordered) if isinstance(schema_paths, (set, frozenset)) else ordered
 
 
-def _has_elements(array: str, schema_paths) -> bool:
+def _has_elements(array: str, schema_paths: Collection[str]) -> bool:
     """True if the input has element fields under child array ``array``.  An
     array that is empty in every entry is inferred with none (JSON[]): it is
     treated like an absent array, a zero-row child table."""
@@ -578,21 +586,22 @@ def _source_path(table: str, key: str) -> str:
     return _join("" if table == "entries" else CHILD_TABLES[table][0], key)
 
 
-def _source_keys(table: str, schema_paths) -> list[str]:
+def _source_keys(table: str, schema_paths: Collection[str]) -> list[str]:
     """The top-level keys of ``table``'s JSON element in the input, in the
     input's order: the source column names (an entry's four child arrays
     excepted)."""
     prefix = "" if table == "entries" else CHILD_TABLES[table][0]
     if prefix and not _has_elements(prefix, schema_paths):
-        # No such array in the input (or empty in every entry): the zero-row table still has the keys
-        # every element carries (the _EMPTY_CHILD_SOURCE shape), so queries
-        # and macros naming them bind on any lake.
+        # No such array in the input (or empty in every entry): the zero-row
+        # table still has the keys every element carries (the
+        # _EMPTY_CHILD_SOURCE shape), so queries and macros naming them bind
+        # on any lake.
         return list(_EMPTY_CHILD_KEYS[prefix])
     return [k for k in _children(prefix, schema_paths)
             if not (table == "entries" and k in _CHILD_ARRAYS)]
 
 
-def json_source_columns(table: str, schema_paths, json_paths: set[str]) -> set[str]:
+def json_source_columns(table: str, schema_paths: Collection[str], json_paths: set[str]) -> set[str]:
     """Source columns of ``table`` stored as JSON text: those whose value
     holds a field typed JSON (its type differs between entries).  The writer
     gives them Parquet's JSON type (_as_json_columns)."""
@@ -602,7 +611,7 @@ def json_source_columns(table: str, schema_paths, json_paths: set[str]) -> set[s
             if _needs_json(_source_path(table, k), json_paths)}
 
 
-def _source_columns(table: str, base: str, schema_paths,
+def _source_columns(table: str, base: str, schema_paths: Collection[str],
                     json_paths: set[str]) -> list[tuple[str, str]]:
     """(key, SQL select item) for every source column of ``table``: one per
     top-level key of its JSON element (the entry, or an element of the child
@@ -644,7 +653,7 @@ ENTRY_TYPES: dict[str, bool] = {
 }
 
 
-def check_entry_types(con, read_clause: str) -> None:
+def check_entry_types(con: duckdb.DuckDBPyConnection, read_clause: str) -> None:
     """Abort the build if an entry's entryType is not one of ENTRY_TYPES."""
     values = [v for (v,) in con.sql(f"SELECT DISTINCT entryType FROM {read_clause}").fetchall()]
     unknown = sorted((v for v in values if v not in ENTRY_TYPES), key=str)
@@ -681,7 +690,7 @@ REQUIRED_CHILD_PATHS: dict[str, frozenset[str]] = {
 }
 
 
-def check_required_paths(schema_paths: set[str]) -> None:
+def check_required_paths(schema_paths: Collection[str]) -> None:
     """Abort the build if the input lacks a field every UniProtKB entry has."""
     missing = sorted(p for p in REQUIRED_PATHS if p not in schema_paths)
     for parent, paths in REQUIRED_CHILD_PATHS.items():
@@ -702,7 +711,7 @@ _UNNESTED_SOURCES: frozenset[tuple[tuple[str, str], str]] = frozenset({
     (("accession_map", "accession"), "secondaryAccessions"),
 })
 
-def _is_object(t) -> bool:
+def _is_object(t: DuckDBPyType) -> bool:
     """True for a STRUCT or MAP, or a (nested) list of one."""
     return _unlist(t).id in ("struct", "map")
 
@@ -710,7 +719,9 @@ def _is_object(t) -> bool:
 def _curated_sources() -> list[tuple[tuple[str, str], str, str]]:
     """((table, column), source path, kind) for every path a shortcut column
     reads; kind is "column" or "derived"."""
-    shortcut = lambda key: key[1] in TABLE_META[key[0]]["columns"]["shortcut"]  # noqa: E731
+    def shortcut(key: tuple[str, str]) -> bool:
+        return key[1] in TABLE_META[key[0]]["columns"]["shortcut"]
+
     sources = [(key, path, "column") for key, source in COLUMN_SOURCES.items() if shortcut(key)
                for path in source.split(" | ")]
     sources += [(key, path, "derived") for key, paths in DERIVED_SOURCES.items() if shortcut(key)
@@ -718,7 +729,7 @@ def _curated_sources() -> list[tuple[tuple[str, str], str, str]]:
     return sources
 
 
-def absent_curated_sources(schema_paths) -> list[str]:
+def absent_curated_sources(schema_paths: Collection[str]) -> list[str]:
     """"table.column ← source path(s)" for every shortcut column none of
     whose source paths is in the input: it is a typed NULL (or empty)
     throughout.  Normal for a subset; in a full dump, a field UniProt
@@ -731,7 +742,8 @@ def absent_curated_sources(schema_paths) -> list[str]:
                   if ps and not any(p in schema_paths for p in ps))
 
 
-def empty_child_arrays(con, read_clause: str, types: dict[str, object]) -> set[str]:
+def empty_child_arrays(con: duckdb.DuckDBPyConnection, read_clause: str,
+                       types: dict[str, DuckDBPyType]) -> set[str]:
     """Child arrays (features, comments, ...) present in the input but empty
     in every entry.  DuckDB infers such an array as JSON[], the type it also
     infers for elements whose types conflict; only the data tells the two
@@ -739,13 +751,15 @@ def empty_child_arrays(con, read_clause: str, types: dict[str, object]) -> set[s
     candidates = [a for a in _CHILD_ARRAYS if a in types and not _has_elements(a, types)]
     if not candidates:
         return set()
-    counts = con.sql("SELECT " + ", ".join(f"count(*) FILTER (WHERE len({_ident(a)}) > 0)"
-                                           for a in candidates)
-                     + f" FROM {read_clause}").fetchone()
-    return {a for a, n in zip(candidates, counts) if n == 0}
+    # An aggregate without GROUP BY: always exactly one row.
+    counts = cast(tuple[Any, ...], con.sql(
+        "SELECT " + ", ".join(f"count(*) FILTER (WHERE len({_ident(a)}) > 0)" for a in candidates)
+        + f" FROM {read_clause}").fetchone())
+    return {a for a, n in zip(candidates, counts, strict=True) if n == 0}
 
 
-def check_curated_sources(types: dict[str, object], empty_arrays=frozenset()) -> None:
+def check_curated_sources(types: dict[str, DuckDBPyType],
+                          empty_arrays: Collection[str] = frozenset()) -> None:
     """Abort the build if a field a shortcut column reads has an inferred
     type (inferred_types) the column cannot hold.  Sources in a child array
     that is empty in every entry (``empty_arrays``, from empty_child_arrays)
@@ -770,7 +784,10 @@ def check_curated_sources(types: dict[str, object], empty_arrays=frozenset()) ->
         parts = path.split(".")
         return [".".join(parts[:i]) for i in range(1, len(parts))]
 
-    differs, plain, shape, mapped = [], [], [], []
+    differs: list[str] = []
+    plain: list[str] = []
+    shape: list[str] = []
+    mapped: list[str] = []
     for (table, column), path, kind in _curated_sources():
         if path.split(".")[0] in empty_arrays:
             continue
@@ -840,7 +857,7 @@ _EMPTY_CHILD_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _child_source(field: str, schema_paths: set[str]) -> str:
+def _child_source(field: str, schema_paths: Collection[str]) -> str:
     """SQL for a child table's source array: the column, or an empty typed
     list when the input has no elements in it (_has_elements)."""
     if _has_elements(field, schema_paths):
@@ -848,7 +865,7 @@ def _child_source(field: str, schema_paths: set[str]) -> str:
     return _EMPTY_CHILD_SOURCE[field]
 
 
-def _child_from(table: str, schema_paths: set[str], extra: dict[str, str] | None = None) -> str:
+def _child_from(table: str, schema_paths: Collection[str], extra: dict[str, str] | None = None) -> str:
     """FROM and ORDER BY of a child table's SQL: one row per element
     (``unnest``, 1-based ``ordinality``) of the entry's source array, beside
     ``sub``'s key columns and ``extra`` {column: source expression}."""
@@ -866,7 +883,7 @@ def _child_from(table: str, schema_paths: set[str], extra: dict[str, str] | None
 ORDER BY sub.reviewed DESC, sub.organism_id, sub.accession, {index}"""
 
 
-def _build_entries_sql(schema_paths, json_paths: set[str]) -> str:
+def _build_entries_sql(schema_paths: Collection[str], json_paths: set[str]) -> str:
     """Build the entries SQL: the shortcut columns, then the entry's source
     columns (every top-level key except the four arrays that are child
     tables).
@@ -933,7 +950,8 @@ def _build_entries_sql(schema_paths, json_paths: set[str]) -> str:
     if _submitted_name_field:
         protein_name_parts.append(f"e.proteinDescription.{_submitted_name_field}[1].fullName.value")
     if has("proteinDescription.alternativeNames.fullName.value"):
-        protein_name_parts.append("(list_extract(COALESCE(e.proteinDescription.alternativeNames, []), 1)).fullName.value")
+        protein_name_parts.append(
+            "(list_extract(COALESCE(e.proteinDescription.alternativeNames, []), 1)).fullName.value")
     if protein_name_parts:
         protein_name_expr = (f"CAST(COALESCE({', '.join(protein_name_parts)}) AS "
                              f"{COLUMN_TYPES[('entries', 'protein_name_primary')]})")
@@ -945,13 +963,14 @@ def _build_entries_sql(schema_paths, json_paths: set[str]) -> str:
                                    "x.geneName.value", schema_paths)
     gene_synonyms_expr = _typed(
         "entries", "gene_synonym",
-        "flatten(list_transform(COALESCE(e.genes, []), g -> list_transform(COALESCE(g.synonyms, []), s -> s.value)))",
+        "flatten(list_transform(COALESCE(e.genes, []), "
+        "g -> list_transform(COALESCE(g.synonyms, []), s -> s.value)))",
         schema_paths)
     alt_protein_names_expr = _per_element(
         "entries", "alt_protein_names", "e.proteinDescription.alternativeNames",
         "proteinDescription.alternativeNames", "x.fullName.value", schema_paths)
 
-    def _keyword_list(field):
+    def _keyword_list(field: str) -> str:
         if not has("keywords"):
             return "[]"
         if not has(f"keywords.{field}"):        # one NULL per keyword, as in the JSON
@@ -995,7 +1014,7 @@ def _build_entries_sql(schema_paths, json_paths: set[str]) -> str:
         IF x.database = 'Proteomes'
     ]))""" if xrefs_present else "[]")
 
-    def _count(field):
+    def _count(field: str) -> str:
         return f'len(COALESCE(e."{field}", []))' if has(field) else "0"
 
     # go_terms: GO xrefs carry properties GoTerm ('F:ATP binding')
@@ -1090,13 +1109,13 @@ ORDER BY reviewed DESC, e.organism.taxonId, e.primaryAccession
 """
 
 
-def _child_sources_sql(table: str, schema_paths, json_paths: set[str]) -> str:
+def _child_sources_sql(table: str, schema_paths: Collection[str], json_paths: set[str]) -> str:
     """The source columns of a child table's SELECT, each after a comma."""
     return "".join(f",\n    {sql}" for _, sql in
                    _source_columns(table, "unnest", schema_paths, json_paths))
 
 
-def _build_features_sql(schema_paths, json_paths: set[str]) -> str:
+def _build_features_sql(schema_paths: Collection[str], json_paths: set[str]) -> str:
     """Build features SQL: the shortcuts, then the feature's source columns.
 
     Feature structs may lack ligand or evidences depending on the dataset;
@@ -1110,6 +1129,7 @@ def _build_features_sql(schema_paths, json_paths: set[str]) -> str:
     else:
         evidence_codes = "CAST([] AS VARCHAR[])"
     ligand_id = _typed("features", "ligand_id", "unnest.ligand.id", schema_paths)
+    sources = _child_sources_sql("features", schema_paths, json_paths)
 
     return f"""
 SELECT
@@ -1122,28 +1142,29 @@ SELECT
     {_cast("features", "start_pos", "unnest.location.start.value")} AS start_pos,
     {_cast("features", "end_pos", "unnest.location.end.value")} AS end_pos,
     {ligand_id}                                     AS ligand_id,
-    {evidence_codes}                                AS evidence_codes{_child_sources_sql("features", schema_paths, json_paths)}
+    {evidence_codes}                                AS evidence_codes{sources}
 
 {_child_from("features", schema_paths, {"organism_scientific_name": "e.organism.scientificName",
                                                 "length": "e.sequence.length"})}
 """
 
 
-def _build_xrefs_sql(schema_paths, json_paths: set[str]) -> str:
+def _build_xrefs_sql(schema_paths: Collection[str], json_paths: set[str]) -> str:
     """Build xrefs SQL: the keys, then the cross-reference's source columns
     (database, id, properties, isoformId, evidences, ...)."""
+    sources = _child_sources_sql("xrefs", schema_paths, json_paths)
     return f"""
 SELECT
     sub.accession,
     sub.reviewed,
     sub.organism_id,
-    {_cast("xrefs", "xref_index", "ordinality - 1")} AS xref_index{_child_sources_sql("xrefs", schema_paths, json_paths)}
+    {_cast("xrefs", "xref_index", "ordinality - 1")} AS xref_index{sources}
 
 {_child_from("xrefs", schema_paths)}
 """
 
 
-def _build_comments_sql(schema_paths, json_paths: set[str]) -> str:
+def _build_comments_sql(schema_paths: Collection[str], json_paths: set[str]) -> str:
     """Build comments SQL: the keys, text_value, then the comment's source
     columns.  ``comments`` is read as a STRUCT list, so its columns are the
     union of every comment type's keys (commentType, texts, note, reaction,
@@ -1160,6 +1181,7 @@ def _build_comments_sql(schema_paths, json_paths: set[str]) -> str:
         list_transform(unnest.texts, t -> t.value), chr(10) || chr(10)), '')""")
     else:
         text_value = _null("comments", "text_value")
+    sources = _child_sources_sql("comments", schema_paths, json_paths)
 
     return f"""
 SELECT
@@ -1168,28 +1190,29 @@ SELECT
     sub.organism_id,
     {_cast("comments", "comment_index", "ordinality - 1")} AS comment_index,
     -- All text values of the comment, paragraphs joined by a blank line
-    {text_value}                                    AS text_value{_child_sources_sql("comments", schema_paths, json_paths)}
+    {text_value}                                    AS text_value{sources}
 
 {_child_from("comments", schema_paths)}
 """
 
 
-def _build_publications_sql(schema_paths, json_paths: set[str]) -> str:
+def _build_publications_sql(schema_paths: Collection[str], json_paths: set[str]) -> str:
     """Build publications SQL: the keys, then the reference's source columns
     (referenceNumber, citation, referencePositions, referenceComments,
     evidences, ...)."""
+    sources = _child_sources_sql("publications", schema_paths, json_paths)
     return f"""
 SELECT
     sub.accession,
     sub.reviewed,
     sub.organism_id,
-    {_cast("publications", "reference_index", "ordinality - 1")} AS reference_index{_child_sources_sql("publications", schema_paths, json_paths)}
+    {_cast("publications", "reference_index", "ordinality - 1")} AS reference_index{sources}
 
 {_child_from("publications", schema_paths)}
 """
 
 
-def _build_accession_map_sql(schema_paths: set[str], json_paths: set[str]) -> str:
+def _build_accession_map_sql(schema_paths: Collection[str], json_paths: set[str]) -> str:
     """One row per primary *and* secondary accession → current primary.
     Reads the staged Parquet like the other builders so it works under
     --skip-existing.  Sorted reviewed DESC first so the partitioned writer
@@ -1227,7 +1250,7 @@ PARTITION_VALUES = {True: "swissprot", False: "trembl"}   # ... derived from the
 # (name, sort_order, partition_column).  Every table names its
 # partition column explicitly so a future table cannot be written
 # unpartitioned by accident.
-TABLE_DEFS = [
+TABLE_DEFS: list[tuple[str, list[str], str]] = [
     ("entries",      ["reviewed DESC", "organism_id ASC", "accession ASC"], "reviewed"),
     # Child tables: the entry order, then the element's position in the
     # entry's source array, so rows appear in UniProt's own order and a
@@ -1243,7 +1266,7 @@ TABLE_DEFS = [
 # All table SQL is built dynamically to handle optional fields. schema_paths
 # is the single source of truth — no field is referenced without first
 # checking that it exists in the staged Parquet schema.
-_SQL_BUILDERS = {
+_SQL_BUILDERS: dict[str, Callable[[Collection[str], set[str]], str]] = {
     "entries":      _build_entries_sql,
     "features":     _build_features_sql,
     "xrefs":        _build_xrefs_sql,
@@ -1259,7 +1282,7 @@ _SQL_BUILDERS = {
 # column of a table is a source column (the manifest lists both kinds, as
 # built).  "element" names what one row's source columns hold.
 
-TABLE_META = {
+TABLE_META: dict[str, dict[str, Any]] = {
     "entries": {
         "description": "One row per protein. Primary table for most queries.",
         "element": "entry",
@@ -1280,7 +1303,9 @@ TABLE_META = {
         },
     },
     "features": {
-        "description": "One row per positional annotation (domain, signal, transmembrane, etc). Sorted by (reviewed DESC, organism_id ASC, accession ASC, feature_index ASC): within a protein, features appear in UniProt's order; use ORDER BY start_pos for position order.",
+        "description": "One row per positional annotation (domain, signal, transmembrane, etc). Sorted by (reviewed "
+                       "DESC, organism_id ASC, accession ASC, feature_index ASC): within a protein, features appear "
+                       "in UniProt's order; use ORDER BY start_pos for position order.",
         "element": "feature",
         "primary_key": ["accession", "feature_index"],
         "foreign_keys": {"accession": "entries.accession", "organism_id": "entries.organism_id"},
@@ -1313,7 +1338,8 @@ TABLE_META = {
         "columns": {"shortcut": ["accession", "reviewed", "organism_id", "reference_index"]},
     },
     "accession_map": {
-        "description": "One row per primary or secondary accession, mapping to the current primary accession. The lookup table for point queries and for resolving retired accessions.",
+        "description": "One row per primary or secondary accession, mapping to the current primary accession. The "
+                       "lookup table for point queries and for resolving retired accessions.",
         "element": None,
         "primary_key": ["accession", "primary_accession"],
         "foreign_keys": {"primary_accession": "entries.accession"},
@@ -1322,7 +1348,7 @@ TABLE_META = {
 }
 
 
-def column_categories(table: str, names) -> dict[str, list[str]]:
+def column_categories(table: str, names: Collection[str]) -> dict[str, list[str]]:
     """{"shortcut": [...], "source": [...]}: ``names`` (a table's columns, as
     built or as a reader sees them) split by kind, each in column order.  The
     Hive partition column a reader may add is neither."""
@@ -1340,7 +1366,7 @@ def column_description(table: str, column: str) -> str:
             f"(new upstream; not yet described).")
 
 
-def undescribed_source_columns(table: str, names) -> list[str]:
+def undescribed_source_columns(table: str, names: Collection[str]) -> list[str]:
     """Source columns among ``names`` with no COLUMN_DESCRIPTIONS entry:
     fields UniProt added since this code was written."""
     return [n for n in column_categories(table, names)["source"]
@@ -1374,7 +1400,7 @@ def _annotate_schema(schema: pa.Schema, label: str, file_meta: dict[str, str]) -
     return pa.schema(fields, metadata=file_meta)
 
 
-def _file_metadata(release) -> dict[str, str]:
+def _file_metadata(release: str | None) -> dict[str, str]:
     """Key/value metadata written into every Parquet footer."""
     return {"uniprot_release": release or "", "schema_version": SCHEMA_VERSION,
             "license": DATA_LICENSE, "generator": GENERATOR, "zstd_level": str(ZSTD_LEVEL)}
@@ -1461,7 +1487,7 @@ def _to_regular_types(tbl: pa.Table) -> pa.Table:
     if target == tbl.schema:
         return tbl
 
-    def slices(t):
+    def slices(t: pa.Table) -> list[pa.Table]:
         if t.nbytes <= MAX_CHUNK_BYTES or t.num_rows <= 1:
             return [t]
         half = t.num_rows // 2
@@ -1469,17 +1495,17 @@ def _to_regular_types(tbl: pa.Table) -> pa.Table:
 
     return pa.concat_tables([
         pa.Table.from_arrays([pa.chunked_array([_regular_array(c) for c in col.chunks], f.type)
-                              for col, f in zip(s.columns, target)], schema=target)
+                              for col, f in zip(s.columns, target, strict=True)], schema=target)
         for s in slices(tbl)])
 
 
-def _json_schema(schema: pa.Schema, names) -> pa.Schema:
+def _json_schema(schema: pa.Schema, names: Collection[str]) -> pa.Schema:
     """``schema`` with the ``names`` columns typed arrow.json."""
     return pa.schema([f.with_type(pa.json_()) if f.name in names else f for f in schema],
                      metadata=schema.metadata)
 
 
-def _as_json_columns(tbl: pa.Table, names) -> pa.Table:
+def _as_json_columns(tbl: pa.Table, names: Collection[str]) -> pa.Table:
     """``tbl`` with the ``names`` columns (JSON text, which DuckDB hands over
     as plain strings) typed arrow.json, which Parquet stores as its JSON
     logical type: every reader can tell a JSON column from a string one."""
@@ -1487,13 +1513,15 @@ def _as_json_columns(tbl: pa.Table, names) -> pa.Table:
         return tbl
     cols = [pa.chunked_array([pa.ExtensionArray.from_storage(pa.json_(), c) for c in col.chunks],
                              pa.json_()) if name in names else col
-            for name, col in zip(tbl.column_names, tbl.columns)]
+            for name, col in zip(tbl.column_names, tbl.columns, strict=True)]
     return pa.Table.from_arrays(cols, schema=_json_schema(tbl.schema, names))
 
 
-def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order=None,
-                      partition_column="reviewed", release=None, sentinel_path=None,
-                      source=None, json_columns=frozenset()):
+def stream_to_parquet(con: duckdb.DuckDBPyConnection, sql: str, table_dir: str, batch_size: int,
+                      label: str = "table", sort_order: list[str] | None = None,
+                      partition_column: str = "reviewed", release: str | None = None,
+                      sentinel_path: str | None = None, source: dict[str, int] | None = None,
+                      json_columns: Collection[str] = frozenset()) -> tuple[int, list[str], pa.Schema]:
     """Stream DuckDB result → Hive-partitioned Parquet files in bounded-memory batches.
 
     DuckDB executes the query lazily and yields Arrow record batches of
@@ -1555,29 +1583,29 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
 
     total_rows = 0
     arrow_schema = None
-    sorting_columns = None
-    pending = []                       # (tmp_path, final_path, relative_path)
-    st = {"side": None, "writer": None, "file_num": 0, "path": None}
+    sorting_columns: list[Any] | None = None
+    pending: list[tuple[str, str, str]] = []           # (tmp_path, final_path, relative_path)
+    st: dict[str, Any] = {"side": None, "writer": None, "file_num": 0, "path": None}
 
-    def part_dir(side):
+    def part_dir(side: str) -> str:
         return os.path.join(table_dir, f"{PARTITION_KEY}={side}")
 
-    def remove_tmp_dirs():
+    def remove_tmp_dirs() -> None:
         for side in PARTITION_VALUES.values():
             shutil.rmtree(os.path.join(part_dir(side), ".tmp"), ignore_errors=True)
 
-    def open_writer():
+    def open_writer() -> None:
         st["file_num"] += 1
         tmp = os.path.join(part_dir(st["side"]), ".tmp")
         os.makedirs(tmp, exist_ok=True)
         st["path"] = os.path.join(tmp, f"{label}_{st['file_num']:05d}.parquet")
-        kwargs = {"compression": "zstd", "compression_level": ZSTD_LEVEL,
+        kwargs: dict[str, Any] = {"compression": "zstd", "compression_level": ZSTD_LEVEL,
                   "write_page_index": True}
         if sorting_columns:
             kwargs["sorting_columns"] = sorting_columns
         st["writer"] = pq.ParquetWriter(st["path"], arrow_schema, **kwargs)
 
-    def close_writer():
+    def close_writer() -> None:
         if st["writer"] is None:
             return
         st["writer"].close()
@@ -1585,7 +1613,7 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
         final = os.path.join(part_dir(st["side"]), os.path.basename(st["path"]))
         pending.append((st["path"], final, os.path.relpath(final, table_dir)))
 
-    def write_part(tbl):
+    def write_part(tbl: pa.Table) -> None:
         # One row group at a time, the size checked after each: a file ends
         # at most one row group past TARGET_FILE_BYTES, whatever the batch size.
         for start in range(0, tbl.num_rows, ROW_GROUP_SIZE):
@@ -1682,38 +1710,40 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
 # the only thing --skip-existing trusts: a kill during the publish window
 # leaves files on disk but no sentinel, so the table is rebuilt.
 
-def _sentinel_path(outdir, table_name):
+def _sentinel_path(outdir: str, table_name: str) -> str:
     return os.path.join(outdir, ".complete", f"{table_name}.json")
 
 
-def _input_fingerprint(jsonl_path):
+def _input_fingerprint(jsonl_path: str) -> dict[str, int]:
     """Size and mtime of the input (through symlinks, as Nextflow stages it):
     a sentinel vouches for its table only when rebuilt from the same input."""
     st = os.stat(jsonl_path)
     return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
 
 
-def _write_sentinel(path, table_name, files, row_count, release, source=None):
+def _write_sentinel(path: str, table_name: str, files: Iterable[str], row_count: int,
+                    release: str | None, source: dict[str, int] | None = None) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump({"table": table_name, "files": list(files), "row_count": row_count,
                    "release": release, "input": source,
-                   "completed_at": datetime.now(timezone.utc).isoformat()},
+                   "completed_at": datetime.now(UTC).isoformat()},
                   f, indent=2)
     os.replace(tmp, path)              # the sentinel itself appears atomically
 
 
-def _read_sentinel(path):
+def _read_sentinel(path: str) -> dict[str, Any] | None:
     """The sentinel's contents, or None if absent or unreadable."""
     try:
         with open(path) as f:
-            return json.load(f)
+            return cast(dict[str, Any] | None, json.load(f))
     except (OSError, ValueError):
         return None
 
 
-def _table_is_complete(outdir, table_name, table_dir, source, release):
+def _table_is_complete(outdir: str, table_name: str, table_dir: str, source: dict[str, int],
+                       release: str | None) -> tuple[bool, str | None]:
     """(complete, reason): complete only if the sentinel exists, lists exactly
     the files on disk, and was written for this input and release."""
     sentinel = _read_sentinel(_sentinel_path(outdir, table_name))
@@ -1728,28 +1758,29 @@ def _table_is_complete(outdir, table_name, table_dir, source, release):
     return True, None
 
 
-def _list_table_files(table_dir):
+def _list_table_files(table_dir: str) -> list[str]:
     """Parquet files of a table, relative to table_dir, in partition order."""
     from glob import glob
     return sorted(os.path.relpath(p, table_dir)
                   for p in glob(os.path.join(table_dir, f"{PARTITION_KEY}=*", "*.parquet")))
 
 
-def _partition_row_counts(table_dir, files):
-    counts = {}
+def _partition_row_counts(table_dir: str, files: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
     for rel in files:
         side = rel.split("/")[0].split("=", 1)[1]
         counts[side] = counts.get(side, 0) + pq.read_metadata(os.path.join(table_dir, rel)).num_rows
     return counts
 
 
-def _file_details(table_dir, rel_path):
+def _file_details(table_dir: str, rel_path: str) -> dict[str, Any]:
     """Size, SHA-256, MD5 and organism_id range of one Parquet file.  One streamed
     pass while the file is still in page cache."""
     path = os.path.join(table_dir, rel_path)
     sha, md5 = hash_file(path)
     meta = pq.read_metadata(path)
-    mins, maxs = [], []
+    mins: list[Any] = []
+    maxs: list[Any] = []
     if "organism_id" in meta.schema.names:
         col = meta.schema.names.index("organism_id")        # top-level scalar: index is exact
         for i in range(meta.num_row_groups):
@@ -1761,7 +1792,7 @@ def _file_details(table_dir, rel_path):
             "organism_id_min": min(mins) if mins else None, "organism_id_max": max(maxs) if maxs else None}
 
 
-def hash_file(path, chunk_size=8 << 20):
+def hash_file(path: str | os.PathLike[str], chunk_size: int = 8 << 20) -> tuple[str, str]:
     """(sha256, md5) hex digests of a file in one streamed pass.  The one
     hashing routine of the lake: the manifest, SHA256SUMS.txt, provenance
     (release_manifest.py) and validation (validate_lake.py) all use it."""
@@ -1773,13 +1804,13 @@ def hash_file(path, chunk_size=8 << 20):
     return sha.hexdigest(), md5.hexdigest()
 
 
-def _write_checksums(outdir, manifest, extra_files):
+def _write_checksums(outdir: str, manifest: dict[str, Any], extra_files: Iterable[str]) -> None:
     """lake/SHA256SUMS.txt (sha256sum -c format) and RELEASE.metalink (Metalink 4,
     RFC 5854) at the lake root.
     ``extra_files`` are lake-root files hashed after the Parquet files."""
     import xml.etree.ElementTree as ET
 
-    entries = []                                 # (rel path from outdir, size, sha256, md5)
+    entries: list[tuple[str, int, str, str]] = []  # (rel path from outdir, size, sha256, md5)
     for table, info in manifest["tables"].items():
         for rel in info["files"]:
             d = info["file_details"][rel]
@@ -1795,10 +1826,10 @@ def _write_checksums(outdir, manifest, extra_files):
             f.write(f"{sha}  {rel}\n")
     eprint(f"  Wrote {sums_path} ({len(entries)} files)")
 
-    def metalink(items, path):
+    def metalink(items: Iterable[tuple[str, int, str, str]], path: str) -> None:
         ns = "urn:ietf:params:xml:ns:metalink"
         root = ET.Element("metalink", xmlns=ns)
-        ET.SubElement(root, "published").text = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ET.SubElement(root, "published").text = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         for rel, size, sha, md5 in items:
             fe = ET.SubElement(root, "file", name=rel)
             ET.SubElement(fe, "size").text = str(size)
@@ -1815,13 +1846,14 @@ def _write_checksums(outdir, manifest, extra_files):
     eprint("  Wrote RELEASE.metalink")
 
 
-def _add_file_details(table_info, table_dir):
+def _add_file_details(table_info: dict[str, Any], table_dir: str) -> None:
     """Fill file_details (per file) and size_bytes (sum) on a manifest table entry."""
     table_info["file_details"] = {rel: _file_details(table_dir, rel) for rel in table_info["files"]}
     table_info["size_bytes"] = sum(d["size_bytes"] for d in table_info["file_details"].values())
 
 
-def _partitioning_block(name, files, table_dir, partition_column):
+def _partitioning_block(name: str, files: Collection[str], table_dir: str,
+                       partition_column: str) -> dict[str, Any]:
     """The manifest's per-table partitioning descriptor."""
     return {
         "scheme": "hive",
@@ -1834,7 +1866,7 @@ def _partitioning_block(name, files, table_dir, partition_column):
     }
 
 
-def _schema_to_dict(arrow_schema):
+def _schema_to_dict(arrow_schema: pa.Schema) -> list[dict[str, Any]]:
     """Convert Arrow schema to a JSON-serializable dict for the manifest."""
     columns = []
     for field in arrow_schema:
@@ -1851,7 +1883,8 @@ def _split_top(s: str) -> list[str]:
     outside brackets: the fields of a struct<...> body.  Parameters such as
     timestamp[us, tz=UTC] or decimal128(10, 2) stay whole.  Field names are
     not quoted, so one containing ", " or a bracket splits wrongly."""
-    parts, depth, cur = [], 0, ""
+    parts: list[str] = []
+    depth, cur = 0, ""
     for ch in s:
         depth += (ch in "<([") - (ch in ">)]")
         if ch == "," and depth == 0:
@@ -1859,7 +1892,7 @@ def _split_top(s: str) -> list[str]:
             cur = ""
         else:
             cur += ch
-    return [p.strip() for p in parts + [cur]]
+    return [p.strip() for p in [*parts, cur]]
 
 
 # ─── Column semantic descriptions ───────────────────────────────────────
@@ -1874,98 +1907,135 @@ _KEY_DESCRIPTIONS = {
     "organism_id": "NCBI taxonomy ID of the parent entry. Foreign key → entries.organism_id.",
 }
 
-COLUMN_DESCRIPTIONS = {
+COLUMN_DESCRIPTIONS: dict[tuple[str, str], str] = {
     # ── entries: shortcuts ──
-    ("entries", "accession"):                "UniProtKB primary accession (e.g. P05067). Stable identifier; unique per entry.",
+    ("entries", "accession"):                "UniProtKB primary accession (e.g. P05067). Stable identifier; unique "
+                                             "per entry.",
     ("entries", "id"):                 "UniProtKB mnemonic entry name (e.g. A4_HUMAN). May change between releases.",
-    ("entries", "reviewed"):           "True for Swiss-Prot (manually reviewed); false for TrEMBL (automated annotation).",
+    ("entries", "reviewed"):           "True for Swiss-Prot (manually reviewed); false for TrEMBL (automated "
+                                       "annotation).",
     ("entries", "organism_id"):              "NCBI taxonomy ID of the source organism (e.g. 9606 for Homo sapiens).",
     ("entries", "organism_scientific_name"):      "Scientific name of the source organism.",
-    ("entries", "gene_primary"):         "Primary gene name of each gene of the entry, in the genes array's order; NULL for a gene with no geneName (ORF or ordered locus names only).",
+    ("entries", "gene_primary"):         "Primary gene name of each gene of the entry, in the genes array's order; "
+                                         "NULL for a gene with no geneName (ORF or ordered locus names only).",
     ("entries", "protein_name_primary"):       "Recommended (Swiss-Prot) or submitted (TrEMBL) full protein name.",
     ("entries", "length"):         "Sequence length in amino acids.",
     ("entries", "gene_synonym"):      "Flattened list of gene name synonyms across all genes.",
-    ("entries", "alt_protein_names"):  "List of alternative full protein names from proteinDescription.alternativeNames.",
+    ("entries", "alt_protein_names"):  "List of alternative full protein names from "
+                                       "proteinDescription.alternativeNames.",
     ("entries", "ec"):         "Distinct EC (Enzyme Commission) numbers from every naming block (recommended, "
                                  "alternative, submission names) of the entry and of its domains (includes) "
                                  "and chains (contains).",
-    ("entries", "division"):           "UniProt taxonomic division (archaea, bacteria, fungi, human, invertebrates, mammals, plants, rodents, vertebrates, viruses, unclassified), derived from lineage and organism_id.",
+    ("entries", "division"):           "UniProt taxonomic division (archaea, bacteria, fungi, human, invertebrates, "
+                                       "mammals, plants, rodents, vertebrates, viruses, unclassified), derived from "
+                                       "lineage and organism_id.",
     ("entries", "go_id"):             "Distinct Gene Ontology term IDs (e.g. GO:0005634) from cross-references.",
-    ("entries", "go_terms"):           "GO annotations as {id, aspect (P/F/C), term, evidence_type}; go_id is the flat id list.",
+    ("entries", "go_terms"):           "GO annotations as {id, aspect (P/F/C), term, evidence_type}; go_id is the "
+                                       "flat id list.",
     ("entries", "xref_dbs"):           "Distinct database names referenced in cross-references (e.g. PDB, Ensembl).",
     ("entries", "proteome_id"):       "Distinct UniProt proteome ids (UP…) from cross-references, sorted.",
     ("entries", "keywordid"):        "UniProt keyword IDs (e.g. KW-0418).",
     ("entries", "keyword"):      "UniProt keyword names (e.g. 'Kinase').",
-    ("entries", "keyword_categories"): "Keyword categories aligned with keywordid (e.g. Molecular function, Biological process).",
-    ("entries", "date_created"):       "Date the entry was first made public in UniProtKB (entryAudit.firstPublicDate as a DATE).",
-    ("entries", "date_modified"):      "Date of the last annotation update (entryAudit.lastAnnotationUpdateDate as a DATE).",
-    ("entries", "date_sequence_modified"):  "Date of the last sequence update (entryAudit.lastSequenceUpdateDate as a DATE).",
+    ("entries", "keyword_categories"): "Keyword categories aligned with keywordid (e.g. Molecular function, "
+                                       "Biological process).",
+    ("entries", "date_created"):       "Date the entry was first made public in UniProtKB (entryAudit.firstPublicDate "
+                                       "as a DATE).",
+    ("entries", "date_modified"):      "Date of the last annotation update (entryAudit.lastAnnotationUpdateDate as a "
+                                       "DATE).",
+    ("entries", "date_sequence_modified"):  "Date of the last sequence update (entryAudit.lastSequenceUpdateDate as a "
+                                            "DATE).",
     ("entries", "feature_count"):      "Number of positional features (rows in features).",
     ("entries", "xref_count"):         "Number of cross-references to external databases (rows in xrefs).",
     ("entries", "comment_count"):      "Number of comment annotations (rows in comments).",
     ("entries", "reference_count"):    "Number of literature/submission references (rows in publications).",
-    ("entries", "lit_pubmed_id"):         "Distinct PubMed ids cited by the entry, as strings: numeric ids in numeric order, then any non-numeric id.",
+    ("entries", "lit_pubmed_id"):         "Distinct PubMed ids cited by the entry, as strings: numeric ids in numeric "
+                                          "order, then any non-numeric id.",
     # ── entries: source columns (the entry's keys) ──
     ("entries", "entryType"):          "Entry type, e.g. 'UniProtKB reviewed (Swiss-Prot)'. Type follows the input.",
-    ("entries", "primaryAccession"):   "Primary accession, as shipped (the accession shortcut holds the same value). Type follows the input.",
-    ("entries", "secondaryAccessions"): "Secondary (merged/demerged) accessions that resolve to this entry. Type follows the input.",
+    ("entries", "primaryAccession"):   "Primary accession, as shipped (the accession shortcut holds the same value). "
+                                       "Type follows the input.",
+    ("entries", "secondaryAccessions"): "Secondary (merged/demerged) accessions that resolve to this entry. Type "
+                                        "follows the input.",
     ("entries", "uniProtkbId"):        "Mnemonic entry name (the same value as id). Type follows the input.",
-    ("entries", "entryAudit"):         "Dates and versions: firstPublicDate, lastAnnotationUpdateDate, lastSequenceUpdateDate, entryVersion, sequenceVersion. Type follows the input.",
+    ("entries", "entryAudit"):         "Dates and versions: firstPublicDate, lastAnnotationUpdateDate, "
+                                       "lastSequenceUpdateDate, entryVersion, sequenceVersion. Type follows the input.",
     ("entries", "annotationScore"):    "UniProt annotation score (1-5). Type follows the input.",
-    ("entries", "organism"):           "Source organism: scientificName, commonName, synonyms, taxonId, lineage, evidences. Type follows the input.",
+    ("entries", "organism"):           "Source organism: scientificName, commonName, synonyms, taxonId, lineage, "
+                                       "evidences. Type follows the input.",
     ("entries", "organismHosts"):      "Host organisms (of viruses). Type follows the input.",
-    ("entries", "proteinExistence"):   "Protein existence evidence level (e.g. '1: Evidence at protein level'). Type follows the input.",
-    ("entries", "proteinDescription"): "Protein names: recommendedName, alternativeNames, submissionNames, flag, contains, includes, ... Type follows the input.",
-    ("entries", "sequence"):           "The sequence: value (amino acids, one-letter codes), length, molWeight, crc64, md5. Read sequence.value for the amino acids. Type follows the input.",
-    ("entries", "genes"):              "Genes: geneName, synonyms, orfNames, orderedLocusNames (with evidences). Type follows the input.",
+    ("entries", "proteinExistence"):   "Protein existence evidence level (e.g. '1: Evidence at protein level'). Type "
+                                       "follows the input.",
+    ("entries", "proteinDescription"): "Protein names: recommendedName, alternativeNames, submissionNames, flag, "
+                                       "contains, includes, ... Type follows the input.",
+    ("entries", "sequence"):           "The sequence: value (amino acids, one-letter codes), length, molWeight, "
+                                       "crc64, md5. Read sequence.value for the amino acids. Type follows the input.",
+    ("entries", "genes"):              "Genes: geneName, synonyms, orfNames, orderedLocusNames (with evidences). Type "
+                                       "follows the input.",
     ("entries", "geneLocations"):      "Gene locations (mitochondrion, plastid, plasmid, ...). Type follows the input.",
     ("entries", "keywords"):           "Keywords: id, category, name, evidences. Type follows the input.",
     ("entries", "extraAttributes"):    "countByCommentType, countByFeatureType, uniParcId, ... Type follows the input.",
 
     # ── features ──
     **{("features", k): v for k, v in _KEY_DESCRIPTIONS.items()},
-    ("features", "organism_scientific_name"):     "Scientific name of the parent entry's organism (denormalized for convenience).",
+    ("features", "organism_scientific_name"):     "Scientific name of the parent entry's organism (denormalized for "
+                                                  "convenience).",
     ("features", "length"):        "Sequence length of the parent entry (denormalized for coverage calculations).",
-    ("features", "feature_index"):     "Position of this feature in the entry's features array (0-based). ORDER BY feature_index gives UniProt's order.",
+    ("features", "feature_index"):     "Position of this feature in the entry's features array (0-based). ORDER BY "
+                                       "feature_index gives UniProt's order.",
     ("features", "start_pos"):         "Start position in the sequence (1-based, inclusive): location.start.value.",
     ("features", "end_pos"):           "End position in the sequence (1-based, inclusive): location.end.value.",
     ("features", "ligand_id"):         "ChEBI or other identifier of the bound ligand (ligand.id). May be null.",
     ("features", "evidence_codes"):    "Evidence codes (e.g. ECO:0000269) of evidences, in order.",
-    ("features", "type"):              "Feature type (e.g. 'Domain', 'Signal peptide', 'Natural variant'). Type follows the input.",
-    ("features", "location"):          "Location: start and end ({value, modifier}), and sequence (an isoform) when not the canonical one. Type follows the input.",
+    ("features", "type"):              "Feature type (e.g. 'Domain', 'Signal peptide', 'Natural variant'). Type "
+                                       "follows the input.",
+    ("features", "location"):          "Location: start and end ({value, modifier}), and sequence (an isoform) when "
+                                       "not the canonical one. Type follows the input.",
     ("features", "description"):       "Free-text description of the feature. Type follows the input.",
     ("features", "featureId"):         "UniProt feature identifier (e.g. PRO_0000001234). Type follows the input.",
     ("features", "evidences"):         "Evidence records (evidenceCode, source, id). Type follows the input.",
     ("features", "featureCrossReferences"): "Cross-references of the feature (e.g. dbSNP). Type follows the input.",
     ("features", "ligand"):            "Bound ligand of a binding site: name, id, label, note. Type follows the input.",
     ("features", "ligandPart"):        "Part of the ligand that binds: name, id, label, note. Type follows the input.",
-    ("features", "alternativeSequence"): "Variant sequences: originalSequence and alternativeSequences. Type follows the input.",
+    ("features", "alternativeSequence"): "Variant sequences: originalSequence and alternativeSequences. Type follows "
+                                         "the input.",
 
     # ── xrefs ──
     **{("xrefs", k): v for k, v in _KEY_DESCRIPTIONS.items()},
-    ("xrefs", "xref_index"):          "Position of this cross-reference in the entry's uniProtKBCrossReferences array (0-based).",
-    ("xrefs", "database"):            "External database name (e.g. 'PDB', 'Ensembl', 'GO', 'InterPro'). Type follows the input.",
-    ("xrefs", "id"):                  "Identifier in the external database (e.g. '1ABC' for PDB). Type follows the input.",
+    ("xrefs", "xref_index"):          "Position of this cross-reference in the entry's uniProtKBCrossReferences array "
+                                      "(0-based).",
+    ("xrefs", "database"):            "External database name (e.g. 'PDB', 'Ensembl', 'GO', 'InterPro'). Type follows "
+                                      "the input.",
+    ("xrefs", "id"):                  "Identifier in the external database (e.g. '1ABC' for PDB). Type follows the "
+                                      "input.",
     ("xrefs", "properties"):          "Database-specific properties, a list of {key, value}. Type follows the input.",
-    ("xrefs", "isoformId"):           "Isoform accession when the cross-reference is specific to an isoform. Type follows the input.",
+    ("xrefs", "isoformId"):           "Isoform accession when the cross-reference is specific to an isoform. Type "
+                                      "follows the input.",
     ("xrefs", "evidences"):           "Evidence records supporting this cross-reference. Type follows the input.",
 
     # ── comments ──
     **{("comments", k): v for k, v in _KEY_DESCRIPTIONS.items()},
     ("comments", "comment_index"):    "Position of this comment in the entry's comments array (0-based).",
-    ("comments", "text_value"):       "The texts' values joined by a blank line. Null for comments without texts (structured types, and DISEASE / SUBCELLULAR LOCATION, whose prose is in note).",
-    ("comments", "commentType"):      "Comment type (e.g. 'FUNCTION', 'DISEASE', 'SUBCELLULAR LOCATION'). Type follows the input.",
+    ("comments", "text_value"):       "The texts' values joined by a blank line. Null for comments without texts "
+                                      "(structured types, and DISEASE / SUBCELLULAR LOCATION, whose prose is in note).",
+    ("comments", "commentType"):      "Comment type (e.g. 'FUNCTION', 'DISEASE', 'SUBCELLULAR LOCATION'). Type "
+                                      "follows the input.",
     ("comments", "texts"):            "Free-text paragraphs ({value, evidences}). Type follows the input.",
     ("comments", "note"):             "Note of the comment (texts). Type follows the input.",
     ("comments", "molecule"):         "Isoform or chain the comment applies to. Type follows the input.",
-    ("comments", "reaction"):         "Catalysed reaction (CATALYTIC ACTIVITY): name, reactionCrossReferences, ecNumber. Type follows the input.",
-    ("comments", "physiologicalReactions"): "Physiological direction of the reaction (CATALYTIC ACTIVITY). Type follows the input.",
+    ("comments", "reaction"):         "Catalysed reaction (CATALYTIC ACTIVITY): name, reactionCrossReferences, "
+                                      "ecNumber. Type follows the input.",
+    ("comments", "physiologicalReactions"): "Physiological direction of the reaction (CATALYTIC ACTIVITY). Type "
+                                            "follows the input.",
     ("comments", "cofactors"):        "Cofactors (COFACTOR). Type follows the input.",
     ("comments", "interactions"):     "Binary interactions (INTERACTION). Type follows the input.",
-    ("comments", "subcellularLocations"): "Subcellular locations, topologies and orientations (SUBCELLULAR LOCATION). Type follows the input.",
-    ("comments", "events"):           "Alternative-products events, e.g. 'Alternative splicing' (ALTERNATIVE PRODUCTS). Type follows the input.",
-    ("comments", "isoforms"):         "Isoforms: name, isoformIds, isoformSequenceStatus, sequenceIds (ALTERNATIVE PRODUCTS). Type follows the input.",
-    ("comments", "disease"):          "Disease: diseaseId, acronym, description, diseaseCrossReference (DISEASE). Type follows the input.",
+    ("comments", "subcellularLocations"): "Subcellular locations, topologies and orientations (SUBCELLULAR LOCATION). "
+                                          "Type follows the input.",
+    ("comments", "events"):           "Alternative-products events, e.g. 'Alternative splicing' (ALTERNATIVE "
+                                      "PRODUCTS). Type follows the input.",
+    ("comments", "isoforms"):         "Isoforms: name, isoformIds, isoformSequenceStatus, sequenceIds (ALTERNATIVE "
+                                      "PRODUCTS). Type follows the input.",
+    ("comments", "disease"):          "Disease: diseaseId, acronym, description, diseaseCrossReference (DISEASE). "
+                                      "Type follows the input.",
     ("comments", "resourceName"):     "Name of an online resource (WEB RESOURCE). Type follows the input.",
     ("comments", "resourceUrl"):      "URL of an online resource (WEB RESOURCE). Type follows the input.",
     ("comments", "ftp"):              "Whether the web resource is an FTP site (WEB RESOURCE). Type follows the input.",
@@ -1977,7 +2047,8 @@ COLUMN_DESCRIPTIONS = {
     ("comments", "molWeightError"):   "Error of the measured weight (MASS SPECTROMETRY). Type follows the input.",
     ("comments", "kineticParameters"): "Kinetic parameters (BIOPHYSICOCHEMICAL PROPERTIES). Type follows the input.",
     ("comments", "phDependence"):     "pH dependence (BIOPHYSICOCHEMICAL PROPERTIES). Type follows the input.",
-    ("comments", "temperatureDependence"): "Temperature dependence (BIOPHYSICOCHEMICAL PROPERTIES). Type follows the input.",
+    ("comments", "temperatureDependence"): "Temperature dependence (BIOPHYSICOCHEMICAL PROPERTIES). Type follows the "
+                                           "input.",
     ("comments", "redoxPotential"):   "Redox potential (BIOPHYSICOCHEMICAL PROPERTIES). Type follows the input.",
     ("comments", "absorption"):       "Absorption (BIOPHYSICOCHEMICAL PROPERTIES). Type follows the input.",
     ("comments", "locationType"):     "Location type of an RNA editing site (RNA EDITING). Type follows the input.",
@@ -1986,14 +2057,19 @@ COLUMN_DESCRIPTIONS = {
     # ── publications ──
     **{("publications", k): v for k, v in _KEY_DESCRIPTIONS.items()},
     ("publications", "reference_index"): "Position of this reference in the entry's references array (0-based).",
-    ("publications", "referenceNumber"): "Number of the reference in the entry's reference list. Type follows the input.",
-    ("publications", "citation"):      "The citation: citationType, id, title, authors, authoringGroup, publicationDate, journal, volume, firstPage, lastPage, submissionDatabase, citationCrossReferences, ... Type follows the input.",
-    ("publications", "referencePositions"): "What the reference is cited for (e.g. 'NUCLEOTIDE SEQUENCE'). Type follows the input.",
+    ("publications", "referenceNumber"): "Number of the reference in the entry's reference list. Type follows the "
+                                         "input.",
+    ("publications", "citation"):      "The citation: citationType, id, title, authors, authoringGroup, "
+                                       "publicationDate, journal, volume, firstPage, lastPage, submissionDatabase, "
+                                       "citationCrossReferences, ... Type follows the input.",
+    ("publications", "referencePositions"): "What the reference is cited for (e.g. 'NUCLEOTIDE SEQUENCE'). Type "
+                                            "follows the input.",
     ("publications", "referenceComments"): "Reference comments (strain, tissue, plasmid, ...). Type follows the input.",
     ("publications", "evidences"):    "Evidence records of this reference. Type follows the input.",
 
     # accession_map
-    ("accession_map", "accession"):         "Primary or secondary accession (the lookup key). A secondary accession can map to more than one primary (split entries).",
+    ("accession_map", "accession"):         "Primary or secondary accession (the lookup key). A secondary accession "
+                                            "can map to more than one primary (split entries).",
     ("accession_map", "primary_accession"): "Current primary accession the key resolves to (FK → entries.accession).",
     ("accession_map", "is_primary"):  "True when accession == primary_accession.",
     ("accession_map", "reviewed"):    "True if the primary entry is Swiss-Prot (copied from entries.reviewed).",
@@ -2003,7 +2079,7 @@ COLUMN_DESCRIPTIONS = {
 
 # ─── Arrow → Frictionless type mapping ──────────────────────────────────
 
-def _arrow_type_to_frictionless(arrow_type_str: str) -> dict:
+def _arrow_type_to_frictionless(arrow_type_str: str) -> dict[str, str]:
     """Map an Arrow type string to a Frictionless Data Package field type + format.
 
     Returns a dict with 'type' and optionally 'format' and 'arrayItem'.
@@ -2040,7 +2116,7 @@ def _arrow_type_to_frictionless(arrow_type_str: str) -> dict:
     return {"type": "string", "format": "default"}
 
 
-def _frictionless_foreign_keys(foreign_keys: dict[str, str]) -> list[dict]:
+def _frictionless_foreign_keys(foreign_keys: dict[str, str]) -> list[dict[str, Any]]:
     """Frictionless foreignKeys from {column: "table.column"}: one composite
     key per referenced table (features' accession and organism_id together
     reference entries), as uniprot_parquet._join_hint joins them.  Separate
@@ -2056,7 +2132,7 @@ def _frictionless_foreign_keys(foreign_keys: dict[str, str]) -> list[dict]:
             for ref_table, (fields, ref_fields) in by_target.items()]
 
 
-def _build_datapackage(manifest: dict, release: str) -> dict:
+def _build_datapackage(manifest: dict[str, Any], release: str | None) -> dict[str, Any]:
     """Build a Frictionless Data Package descriptor from a manifest.
 
     The descriptor follows https://specs.frictionlessdata.io/data-package/
@@ -2066,7 +2142,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
     This makes the lake self-describing and machine-readable per FAIR
     principles (Findable, Accessible, Interoperable, Reusable).
     """
-    resources = []
+    resources: list[dict[str, Any]] = []
 
     for table_name, table_info in manifest["tables"].items():
         meta = TABLE_META.get(table_name, {})
@@ -2077,7 +2153,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
             col_name = col["name"]
             frictionless = _arrow_type_to_frictionless(col["type"])
 
-            field = {
+            field: dict[str, Any] = {
                 "name": col_name,
                 "type": frictionless["type"],
                 "description": column_description(table_name, col_name),
@@ -2097,7 +2173,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
             fields.append(field)
 
         # Build the resource descriptor
-        resource = {
+        resource: dict[str, Any] = {
             "name": table_name,
             "description": meta.get("description", table_info.get("description", "")),
             "path": [f"{table_name}/{f}" for f in table_info.get("files", [])],
@@ -2119,7 +2195,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
 
         resources.append(resource)
 
-    datapackage = {
+    datapackage: dict[str, Any] = {
         "$schema": "https://specs.frictionlessdata.io/schemas/data-package.json",
         "name": "uniprot-parquet",
         "title": "UniProtKB Parquet Data Lake",
@@ -2170,7 +2246,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
 
 # ─── Main ───────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     global TARGET_FILE_BYTES, ZSTD_LEVEL, ROW_GROUP_SIZE
     parser = argparse.ArgumentParser(
         description="Transform UniProtKB JSONL → sorted Parquet tables "
@@ -2257,7 +2333,7 @@ def main():
 
     try:
         # ── Determine which tables to write ──
-        skip_set = set()
+        skip_set: set[str] = set()
         source = _input_fingerprint(jsonl_path)
         if args.skip_existing:
             for name, _, _ in table_defs:
@@ -2275,6 +2351,7 @@ def main():
         tables_to_write = {name for name, _, _ in table_defs} - skip_set
 
         # ── Stage JSONL → Parquet (parse JSON once, read Parquet 5× faster) ──
+        staged_bytes: int | None
         if tables_to_write:
             eprint("\n--- PARQUET STAGING ---")
             os.makedirs(staging_dir, exist_ok=True)
@@ -2287,6 +2364,8 @@ def main():
 
         # ── Discover schema (single source of truth for all SQL generation) ──
         # Only needed when we have tables to write (staging must have occurred).
+        schema_paths: Collection[str]
+        json_paths: set[str]
         if tables_to_write:
             schema_paths = discover_schema_paths(staging_path)
             eprint(f"  Schema: {len(schema_paths)} field paths discovered")
@@ -2322,7 +2401,8 @@ def main():
             schema_paths, json_paths = set(), set()
         if ("proteinDescription.submittedNames" not in schema_paths
                 and "proteinDescription.submissionNames" not in schema_paths):
-            eprint("  Note: proteinDescription.submittedNames/submissionNames absent (normal for Swiss-Prot-only data)")
+            eprint("  Note: proteinDescription.submittedNames/submissionNames absent "
+                   "(normal for Swiss-Prot-only data)")
         ec_sources = [s for s in ["recommendedName", "alternativeNames", "submittedNames", "submissionNames"]
                       if f"proteinDescription.{s}.ecNumbers" in schema_paths]
         if ec_sources:
@@ -2332,7 +2412,7 @@ def main():
 
         # ── Write tables ──
         t_total = time.time()
-        manifest_tables = {}
+        manifest_tables: dict[str, dict[str, Any]] = {}
 
         for name, sort_order, partition_column in table_defs:
             eprint(f"\n--- {name.upper()} ---")
@@ -2385,12 +2465,12 @@ def main():
                 _add_file_details(manifest_tables[name], table_dir)
 
         # ── Write manifest.json ──
-        manifest = {
+        manifest: dict[str, Any] = {
             "format": "uniprot-parquet",
             "version": MANIFEST_FORMAT_VERSION,
             "schema_version": SCHEMA_VERSION,
             "release": args.release,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
             "tables": manifest_tables,
             "total_rows": sum(t["row_count"] for t in manifest_tables.values()),
             "compression": {"codec": "zstd", "level": ZSTD_LEVEL},

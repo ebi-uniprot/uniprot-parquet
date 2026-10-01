@@ -16,8 +16,14 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+    import pyarrow.dataset as ds
 
 # Make bin/ importable
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
@@ -31,14 +37,14 @@ SMALL_JSON_GZ = os.path.join(FIXTURE_DIR, "small.json.gz")
 FETCH_SCRIPT = os.path.join(os.path.dirname(__file__), "fetch_fixtures.py")
 
 
-def pytest_addoption(parser):
+def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--stress", action="store_true", default=False,
         help="Use ~13K-entry stress dataset instead of ~4K default",
     )
 
 
-def _ensure_fixture(scale="default"):
+def _ensure_fixture(scale: str = "default") -> str:
     """Download test fixtures from UniProtKB REST API if not already present."""
     target = STRESS_JSON_GZ if scale == "stress" else DIVERSE_JSON_GZ
     if os.path.exists(target):
@@ -53,13 +59,13 @@ def _ensure_fixture(scale="default"):
 
 
 @pytest.fixture(scope="session")
-def fixture_json_gz(request):
+def fixture_json_gz(request: pytest.FixtureRequest) -> str:
     """Path to the fixture. Uses stress dataset when running with --stress."""
     scale = "stress" if request.config.getoption("--stress") else "default"
     return _ensure_fixture(scale)
 
 
-def write_jsonl_zst(entries, dst):
+def write_jsonl_zst(entries: Iterable[Any], dst: str) -> str:
     """Write ``entries`` to ``dst`` as JSONL.zst; ``dst``."""
     import orjson
     import zstandard as zstd
@@ -70,20 +76,21 @@ def write_jsonl_zst(entries, dst):
     return dst
 
 
-def _json_gz_to_jsonl_zst(src, dst):
+def _json_gz_to_jsonl_zst(src: str, dst: str) -> str:
     """Convert a {"results": [...]} JSON.gz fixture to JSONL.zst."""
     with gzip.open(src, "rt") as f:
         return write_jsonl_zst(json.load(f)["results"], dst)
 
 
-def run_bin(script, *args):
+def run_bin(script: str, *args: object) -> subprocess.CompletedProcess[str]:
     """Run bin/``script`` with ``args`` (bin/ importable); the CompletedProcess."""
     env = {**os.environ, "PYTHONPATH": BIN_DIR + ":" + os.environ.get("PYTHONPATH", "")}
     return subprocess.run([sys.executable, os.path.join(BIN_DIR, script), *map(str, args)],
                           env=env, capture_output=True, text=True)
 
 
-def run_transform(jsonl_path, outdir, release="test_2026", extra_args=()):
+def run_transform(jsonl_path: str, outdir: str, release: str = "test_2026",
+                  extra_args: Sequence[str] = ()) -> subprocess.CompletedProcess[str]:
     """Run bin/parquet_transform.py as a subprocess; fail the test on error."""
     result = run_bin("parquet_transform.py", jsonl_path, "--outdir", outdir,
                      "--memory-limit", "4GB", "--batch-size", "500", "--release", release,
@@ -94,14 +101,14 @@ def run_transform(jsonl_path, outdir, release="test_2026", extra_args=()):
 
 
 @pytest.fixture(scope="session")
-def small_jsonl(fixture_json_gz, tmp_path_factory):
+def small_jsonl(fixture_json_gz: str, tmp_path_factory: pytest.TempPathFactory) -> str:
     """Convert fixture JSON → JSONL.zst once for the entire test session."""
     out_dir = tmp_path_factory.mktemp("jsonl")
     return _json_gz_to_jsonl_zst(fixture_json_gz, str(out_dir / "diverse.jsonl.zst"))
 
 
 @pytest.fixture(scope="session")
-def parquet_lake(small_jsonl, tmp_path_factory):
+def parquet_lake(small_jsonl: str, tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     """Run the full parquet_transform pipeline once, return lake directory path."""
     lake_dir = tmp_path_factory.mktemp("lake")
     outdir = str(lake_dir / "output")
@@ -113,7 +120,7 @@ def parquet_lake(small_jsonl, tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
-def small_lake(tmp_path_factory):
+def small_lake(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     """A lake built from tests/fixtures/small.json.gz (52 entries, no
     geneLocations); exercises the typed-NULL fallbacks."""
     out_dir = tmp_path_factory.mktemp("small")
@@ -129,75 +136,75 @@ def small_lake(tmp_path_factory):
 # subprocess (test_validate.py) has memory to run.
 
 
-def load_original_entries(fixture_path):
+def load_original_entries(fixture_path: str) -> dict[str, dict[str, Any]]:
     """Load the original JSON entries from the fixture, keyed by accession."""
     with gzip.open(fixture_path, "rt") as f:
         data = json.load(f)
     return {e["primaryAccession"]: e for e in data["results"]}
 
 
-def table_files(lake_dir, name):
+def table_files(lake_dir: str, name: str) -> list[str]:
     """Every Parquet file of a table (recursive over the Hive partition dirs),
     sorted so review_status=swissprot files precede review_status=trembl."""
     import glob
     return sorted(glob.glob(os.path.join(lake_dir, name, "**", "*.parquet"), recursive=True))
 
 
-def open_table(lake_dir, name):
+def open_table(lake_dir: str, name: str) -> ds.Dataset:
     """PyArrow dataset over the explicit file list: no Hive column is added,
     so tests see exactly the stored schema (validate_lake.open_table does the same)."""
     import pyarrow.dataset as ds
     return ds.dataset(table_files(lake_dir, name), format="parquet")
 
 
-def group_by_acc(table):
+def group_by_acc(table: pa.Table) -> dict[str, list[dict[str, Any]]]:
     """An Arrow table's rows as dicts (reconstruct.rows_from_arrow: JSON
     columns decoded), grouped by accession: {accession: [row, ...]}."""
     from reconstruct import rows_from_arrow
-    grouped = {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows_from_arrow(table):
         grouped.setdefault(row["accession"], []).append(row)
     return grouped
 
 
-def _rows_by_acc(lake_dir, name):
+def _rows_by_acc(lake_dir: str, name: str) -> dict[str, list[dict[str, Any]]]:
     """All rows of a table as dicts, grouped by accession."""
     return group_by_acc(open_table(lake_dir, name).to_table())
 
 
 @pytest.fixture(scope="module")
-def originals(fixture_json_gz):
+def originals(fixture_json_gz: str) -> dict[str, dict[str, Any]]:
     """Original JSON entries keyed by accession."""
     return load_original_entries(fixture_json_gz)
 
 
 @pytest.fixture(scope="module")
-def lake(parquet_lake):
+def lake(parquet_lake: dict[str, str]) -> str:
     return parquet_lake["lake_dir"]
 
 
 @pytest.fixture(scope="module")
-def lake_entries(lake):
+def lake_entries(lake: str) -> dict[str, dict[str, Any]]:
     """All entries from the Parquet lake, keyed by accession."""
     from reconstruct import rows_from_arrow
     return {row["accession"]: row for row in rows_from_arrow(open_table(lake, "entries").to_table())}
 
 
 @pytest.fixture(scope="module")
-def lake_features(lake):
+def lake_features(lake: str) -> dict[str, list[dict[str, Any]]]:
     return _rows_by_acc(lake, "features")
 
 
 @pytest.fixture(scope="module")
-def lake_xrefs(lake):
+def lake_xrefs(lake: str) -> dict[str, list[dict[str, Any]]]:
     return _rows_by_acc(lake, "xrefs")
 
 
 @pytest.fixture(scope="module")
-def lake_comments(lake):
+def lake_comments(lake: str) -> dict[str, list[dict[str, Any]]]:
     return _rows_by_acc(lake, "comments")
 
 
 @pytest.fixture(scope="module")
-def lake_publications(lake):
+def lake_publications(lake: str) -> dict[str, list[dict[str, Any]]]:
     return _rows_by_acc(lake, "publications")

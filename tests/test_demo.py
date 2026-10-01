@@ -5,18 +5,18 @@ import ast
 import json
 import os
 import shutil
+from typing import Any, cast
 
 import pytest
-
 from conftest import PROJECT_ROOT
 
 NOTEBOOK = os.path.join(PROJECT_ROOT, "demo", "demo.ipynb")
 
 
-def _run_cell(src, ns, name):
+def _run_cell(src: str, ns: dict[str, Any], name: str) -> Any:
     """Execute a cell; the value of its last expression, as Jupyter shows it."""
     tree = ast.parse(src)
-    last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
+    last = cast(ast.Expr, tree.body.pop()) if tree.body and isinstance(tree.body[-1], ast.Expr) else None
     exec(compile(tree, name, "exec"), ns)
     if last is not None:
         return eval(compile(ast.Expression(last.value), name, "eval"), ns)
@@ -24,7 +24,8 @@ def _run_cell(src, ns, name):
 
 
 @pytest.fixture(scope="module")
-def cell_results(small_lake, tmp_path_factory):
+def cell_results(small_lake: dict[str, str],
+                 tmp_path_factory: pytest.TempPathFactory) -> dict[int, tuple[str, Any]]:
     """{cell index: (source, value of its last expression)} for every code
     cell; plot cells are skipped when matplotlib is not installed."""
     try:
@@ -36,7 +37,8 @@ def cell_results(small_lake, tmp_path_factory):
     shutil.copytree(small_lake["lake_dir"], demo / "lake" / "2026_03" / "lake")
     with open(NOTEBOOK) as f:
         cells = json.load(f)["cells"]
-    ns, results = {}, {}
+    ns: dict[str, Any] = {}
+    results: dict[int, tuple[str, Any]] = {}
     cwd = os.getcwd()
     os.chdir(demo)
     try:
@@ -52,15 +54,15 @@ def cell_results(small_lake, tmp_path_factory):
     return results
 
 
-def test_every_code_cell_runs(cell_results):
+def test_every_code_cell_runs(cell_results: dict[int, tuple[str, Any]]) -> None:
     assert cell_results
 
 
-def _cell(cell_results, marker):
+def _cell(cell_results: dict[int, tuple[str, Any]], marker: str) -> Any:
     return next(value for src, value in cell_results.values() if src.startswith(marker))
 
 
-def test_feature_coverage_cell(cell_results):
+def test_feature_coverage_cell(cell_results: dict[int, tuple[str, Any]]) -> None:
     """The coverage cell shows proteins, and counts each residue once, so no
     coverage exceeds 100%."""
     df = _cell(cell_results, "# Feature coverage")
@@ -68,19 +70,21 @@ def test_feature_coverage_cell(cell_results):
     assert (df["coverage_pct"] <= 100).all(), df
 
 
-def test_isoform_cell_shows_its_table(cell_results):
+def test_isoform_cell_shows_its_table(cell_results: dict[int, tuple[str, Any]]) -> None:
     df = _cell(cell_results, "# Unnest isoforms")
     assert df is not None and len(df) > 0
 
 
-def test_isoform_census_counts_isoforms_per_protein(cell_results, small_lake):
+def test_isoform_census_counts_isoforms_per_protein(cell_results: dict[int, tuple[str, Any]],
+                                                     small_lake: dict[str, str]) -> None:
     """The census ranks proteins by their number of isoforms (one row per
     protein), not by the isoform IDs of a single isoform."""
     import uniprot_parquet as up
     df = _cell(cell_results, "# Proteome-wide isoform census")
     con = up.connect(small_lake["lake_dir"])
-    most = con.sql("SELECT max(len(isoforms)) FROM comments "
-                   "WHERE commentType = 'ALTERNATIVE PRODUCTS'").fetchone()[0]
+    # an aggregate: always one row
+    most = cast(tuple[int], con.sql("SELECT max(len(isoforms)) FROM comments "
+                                    "WHERE commentType = 'ALTERNATIVE PRODUCTS'").fetchone())[0]
     assert most > 1                                          # precondition
     assert df["n_isoforms"].iloc[0] == most
     assert df["accession"].is_unique

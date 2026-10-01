@@ -19,13 +19,14 @@ Output:
 import argparse
 import json
 import os
-import sys
-import time
 import statistics
 import subprocess
+import sys
 import tempfile
-from datetime import datetime, timezone
+import time
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pyarrow.parquet as pq
@@ -34,7 +35,7 @@ import pyarrow.parquet as pq
 # Utilities
 # ---------------------------------------------------------------------------
 
-def _human_size(nbytes):
+def _human_size(nbytes: float) -> str:
     """Return a human-readable size string."""
     for unit in ("bytes", "KB", "MB", "GB", "TB"):
         if abs(nbytes) < 1024 or unit == "TB":
@@ -45,13 +46,13 @@ def _human_size(nbytes):
     return f"{nbytes:.2f} TB"
 
 
-def _time_query(con, sql, warmup=1, runs=5):
+def _time_query(con: duckdb.DuckDBPyConnection, sql: str, warmup: int = 1, runs: int = 5) -> dict[str, Any]:
     """Run a query multiple times and return timing stats in milliseconds."""
     # Warmup
     for _ in range(warmup):
         con.sql(sql).fetchall()
 
-    times = []
+    times: list[float] = []
     for _ in range(runs):
         t0 = time.perf_counter()
         result = con.sql(sql).fetchall()
@@ -123,7 +124,8 @@ QUERY_SUITE = [
         "name": "count_by_organism",
         "description": "Entry count per organism (top 10)",
         "table": "entries",
-        "sql": "SELECT organism_id, organism_scientific_name, count(*) AS n FROM entries GROUP BY organism_id, organism_scientific_name ORDER BY n DESC LIMIT 10",
+        "sql": ("SELECT organism_id, organism_scientific_name, count(*) AS n FROM entries "
+                "GROUP BY organism_id, organism_scientific_name ORDER BY n DESC LIMIT 10"),
     },
     {
         "name": "feature_type_distribution",
@@ -170,13 +172,15 @@ QUERY_SUITE = [
         "name": "nested_organism_access",
         "description": "Access nested organism struct directly",
         "table": "entries",
-        "sql": "SELECT accession, organism_id, organism_scientific_name, organism.synonyms FROM entries WHERE organism_id = 9606",
+        "sql": ("SELECT accession, organism_id, organism_scientific_name, organism.synonyms FROM entries "
+                "WHERE organism_id = 9606"),
     },
     {
         "name": "nested_protein_desc_access",
         "description": "Access nested proteinDescription struct",
         "table": "entries",
-        "sql": "SELECT accession, proteinDescription.recommendedName.fullName.value FROM entries WHERE proteinDescription.recommendedName IS NOT NULL LIMIT 50",
+        "sql": ("SELECT accession, proteinDescription.recommendedName.fullName.value FROM entries "
+                "WHERE proteinDescription.recommendedName IS NOT NULL LIMIT 50"),
     },
 
     # ── Comment / publication queries ──
@@ -195,9 +199,10 @@ QUERY_SUITE = [
 ]
 
 
-def run_query_benchmarks(con, lake_path):
+def run_query_benchmarks(con: duckdb.DuckDBPyConnection,
+                         lake_path: str) -> tuple[dict[str, Any], duckdb.DuckDBPyConnection]:
     """Run all query benchmarks and return results."""
-    results = {}
+    results: dict[str, Any] = {}
 
     # Setup views and macros via the client library
     sys.path.insert(0, str(Path(lake_path).resolve().parents[2]))
@@ -244,9 +249,9 @@ def run_query_benchmarks(con, lake_path):
 # 2. Storage Analysis
 # ---------------------------------------------------------------------------
 
-def analyze_storage(lake_path):
+def analyze_storage(lake_path: str) -> dict[str, Any]:
     """Analyze Parquet file sizes and column-level storage breakdown."""
-    results = {"tables": {}, "totals": {}}
+    results: dict[str, Any] = {"tables": {}, "totals": {}}
     total_bytes = 0
     total_rows = 0
 
@@ -257,7 +262,7 @@ def analyze_storage(lake_path):
         if not os.path.isdir(table_dir):
             continue
 
-        table_info = {"files": [], "columns": []}
+        table_info: dict[str, Any] = {"files": [], "columns": []}
         table_bytes = 0
         table_rows = 0
         # Every Parquet file under the table, Hive partitions included
@@ -285,7 +290,7 @@ def analyze_storage(lake_path):
             # Column-level breakdown (from the first file only): one entry
             # per column, summed over the file's row groups.
             if not table_info["columns"]:
-                sizes = {}
+                sizes: dict[str, tuple[int, int]] = {}
                 for rg_idx in range(meta.num_row_groups):
                     rg = meta.row_group(rg_idx)
                     for col_idx in range(rg.num_columns):
@@ -326,13 +331,13 @@ def analyze_storage(lake_path):
 # 3. Pipeline Throughput
 # ---------------------------------------------------------------------------
 
-def benchmark_pipeline(input_path, repo_root):
+def benchmark_pipeline(input_path: str, repo_root: str) -> dict[str, Any]:
     """Re-run the pipeline on the test fixture and measure throughput."""
     transform_script = os.path.join(repo_root, "bin", "parquet_transform.py")
     if not os.path.exists(transform_script):
         return {"error": f"Transform script not found: {transform_script}"}
 
-    results = {"runs": []}
+    results: dict[str, Any] = {"runs": []}
     n_runs = 3
 
     for run_idx in range(n_runs):
@@ -354,7 +359,7 @@ def benchmark_pipeline(input_path, repo_root):
             t1 = time.perf_counter()
             elapsed_s = t1 - t0
 
-            run_info = {
+            run_info: dict[str, Any] = {
                 "run": run_idx + 1,
                 "elapsed_s": round(elapsed_s, 3),
                 "returncode": proc.returncode,
@@ -370,7 +375,7 @@ def benchmark_pipeline(input_path, repo_root):
 
                 # Measure output size
                 total_output = 0
-                for root, dirs, files in os.walk(outdir):
+                for root, _dirs, files in os.walk(outdir):
                     for f in files:
                         total_output += os.path.getsize(os.path.join(root, f))
                 run_info["output_bytes"] = total_output
@@ -401,16 +406,16 @@ def benchmark_pipeline(input_path, repo_root):
 # 4. Schema Complexity Metrics
 # ---------------------------------------------------------------------------
 
-def analyze_schema_complexity(lake_path, repo_root):
+def analyze_schema_complexity(lake_path: str, repo_root: str) -> dict[str, Any]:
     """Measure schema complexity: column counts, shortcut vs source columns, LOC."""
-    results = {}
+    results: dict[str, Any] = {}
 
     # Column classification comes from the lake's manifest (source columns
     # are the input's keys, so only a build knows them).
     with open(os.path.join(lake_path, "manifest.json")) as f:
         categories = {t: info["column_categories"] for t, info in json.load(f)["tables"].items()}
 
-    table_metrics = {}
+    table_metrics: dict[str, dict[str, Any]] = {}
     for table in ["entries", "features", "xrefs", "comments", "publications"]:
         conv = categories.get(table, {}).get("shortcut", [])
         nest = categories.get(table, {}).get("source", [])
@@ -418,7 +423,8 @@ def analyze_schema_complexity(lake_path, repo_root):
             "total_columns": len(conv) + len(nest),
             "shortcut_columns": len(conv),
             "source_columns": len(nest),
-            "shortcut_ratio": round(len(conv) / (len(conv) + len(nest)), 2) if (len(conv) + len(nest)) > 0 else 0,
+            "shortcut_ratio": (round(len(conv) / (len(conv) + len(nest)), 2)
+                               if (len(conv) + len(nest)) > 0 else 0),
             "shortcut_list": conv,
             "source_list": nest,
         }
@@ -441,7 +447,7 @@ def analyze_schema_complexity(lake_path, repo_root):
         builder_lines = 0
         in_builder = False
         current_indent = 0
-        for i, line in enumerate(lines):
+        for line in lines:
             stripped = line.rstrip()
             if any(f"def {fn}(" in stripped for fn in builder_funcs):
                 in_builder = True
@@ -450,7 +456,8 @@ def analyze_schema_complexity(lake_path, repo_root):
             elif in_builder:
                 if stripped == "":
                     builder_lines += 1
-                elif len(line) - len(line.lstrip()) <= current_indent and stripped and not stripped.startswith("#"):
+                elif (len(line) - len(line.lstrip()) <= current_indent and stripped
+                      and not stripped.startswith("#")):
                     # Check if this is a new top-level def or class
                     if stripped.startswith("def ") or stripped.startswith("class "):
                         in_builder = False
@@ -492,9 +499,9 @@ def analyze_schema_complexity(lake_path, repo_root):
 # Report Generation
 # ---------------------------------------------------------------------------
 
-def format_report(all_results):
+def format_report(all_results: dict[str, Any]) -> str:
     """Generate a human-readable text report."""
-    lines = []
+    lines: list[str] = []
     lines.append("=" * 72)
     lines.append("  UNIPROT-PARQUET BASELINE BENCHMARK")
     lines.append(f"  Generated: {all_results['metadata']['timestamp']}")
@@ -616,7 +623,7 @@ def format_report(all_results):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark uniprot-parquet baseline")
     parser.add_argument("--lake", default="demo/lake/2026_01/lake",
                         help="Path to existing lake directory")
@@ -631,12 +638,12 @@ def main():
     repo_root = str(Path(__file__).resolve().parents[1])
     os.chdir(repo_root)
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    all_results = {
+    all_results: dict[str, Any] = {
         "metadata": {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "duckdb_version": duckdb.__version__,
             "lake_path": str(Path(args.lake).resolve()),
             "input_path": str(Path(args.input).resolve()) if os.path.exists(args.input) else None,

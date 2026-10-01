@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import sys
+from typing import Any
 
 # Files under this size are always hashed: the lake's metadata, never Parquet data.
 SMALL_FILE_BYTES = 16 << 20
@@ -51,7 +52,7 @@ def sha256(path: str) -> str:
 
 def read_sums(path: str) -> dict[str, str]:
     """{relative path: sha256} from a sha256sum-format file."""
-    sums = {}
+    sums: dict[str, str] = {}
     with open(path) as f:
         for line in f:
             line = line.rstrip("\n")
@@ -63,14 +64,14 @@ def read_sums(path: str) -> dict[str, str]:
 
 def verify(release_dir: str, full: bool = False, marker: str | None = None) -> list[str]:
     """Every way ``release_dir`` differs from its metadata; [] if none."""
-    problems = []
+    problems: list[str] = []
     lake = os.path.join(release_dir, "lake")
     sums_path = os.path.join(lake, "SHA256SUMS.txt")
     if not os.path.isfile(sums_path):
         return [f"missing {sums_path}"]
     sums = read_sums(sums_path)
 
-    sizes = {}
+    sizes: dict[str, Any] = {}
     try:
         with open(os.path.join(lake, "manifest.json")) as f:
             manifest = json.load(f)
@@ -95,9 +96,9 @@ def verify(release_dir: str, full: bool = False, marker: str | None = None) -> l
             problems.append(f"lake/{name}: SHA-256 differs from SHA256SUMS.txt")
 
     for root, _, files in os.walk(lake):
-        for f in files:
-            rel = os.path.relpath(os.path.join(root, f), lake)
-            if f.endswith(".parquet") and rel not in sums:
+        for fname in files:
+            rel = os.path.relpath(os.path.join(root, fname), lake)
+            if fname.endswith(".parquet") and rel not in sums:
                 problems.append(f"lake/{rel}: not listed in SHA256SUMS.txt")
     if not os.path.isfile(os.path.join(lake, "RELEASE.metalink")):
         problems.append("lake/RELEASE.metalink: missing")
@@ -107,7 +108,7 @@ def verify(release_dir: str, full: bool = False, marker: str | None = None) -> l
         with open(provenance_path) as f:
             provenance = json.load(f)
     except (OSError, ValueError) as e:
-        return problems + [f"provenance.json unreadable: {e}"]
+        return [*problems, f"provenance.json unreadable: {e}"]
     published = provenance.get("published") or {}
     if not published:
         problems.append("provenance.json records no published files")
@@ -126,7 +127,7 @@ def verify(release_dir: str, full: bool = False, marker: str | None = None) -> l
             with open(marker) as f:
                 fields = dict(line.split(": ", 1) for line in f.read().splitlines() if ": " in line)
         except OSError as e:
-            return problems + [f"marker unreadable: {e}"]
+            return [*problems, f"marker unreadable: {e}"]
         if fields.get("sha256sums_sha256") != sha256(sums_path):
             problems.append("lake/SHA256SUMS.txt: SHA-256 differs from the marker's sha256sums_sha256")
         if fields.get("release") != provenance.get("release"):
@@ -135,7 +136,7 @@ def verify(release_dir: str, full: bool = False, marker: str | None = None) -> l
     return problems
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Verify a published release directory")
     parser.add_argument("release_dir", help="<outdir>/<release>: holds lake/ and provenance.json")
     parser.add_argument("--full", action="store_true",

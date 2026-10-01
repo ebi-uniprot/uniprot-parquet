@@ -4,7 +4,6 @@ import re
 
 import pyarrow as pa
 import pytest
-
 from gen_schema_md import _display_type
 from parquet_transform import CHILD_TABLES
 
@@ -16,10 +15,10 @@ class TestDisplayType:
     """A nested type too long for a table cell is shortened to its top-level
     field names, never cut off mid-token, whoever wrote the list type."""
 
-    def test_short_type_unchanged(self):
+    def test_short_type_unchanged(self) -> None:
         assert _display_type("list<l: int32>") == "list<l: int32>"
 
-    def test_struct(self):
+    def test_struct(self) -> None:
         assert _display_type(str(WIDE)) == WIDE_SHORT
 
     @pytest.mark.parametrize("list_type, head", [
@@ -29,7 +28,7 @@ class TestDisplayType:
         (pa.large_list(WIDE), "large_list"),
         (pa.list_(pa.list_(WIDE)), "list<list"),
     ])
-    def test_list_of_struct(self, list_type, head):
+    def test_list_of_struct(self, list_type: pa.DataType, head: str) -> None:
         closing = ">" * head.count("list")
         assert _display_type(str(list_type)) == f"{head}<{WIDE_SHORT}{closing}"
 
@@ -46,7 +45,8 @@ def _rendered_rows(columns: dict[str, list[str]]) -> dict[tuple[str, str], list[
     manifest = {"release": "r", "version": 1, "tables": {
         t: {"row_count": 1, "description": "", "columns": [{"name": c, "type": "int32"} for c in cols]}
         for t, cols in columns.items()}}
-    rows, table = {}, None
+    rows: dict[tuple[str, str], list[str]] = {}
+    table: str | None = None
     for line in render(manifest).splitlines():
         if line.startswith("## `"):
             table = line[4:-1]
@@ -59,7 +59,7 @@ def _rendered_rows(columns: dict[str, list[str]]) -> dict[tuple[str, str], list[
 class TestColumnRows:
     """Every column row has exactly the table's five cells."""
 
-    def test_source_with_pipe_is_escaped(self):
+    def test_source_with_pipe_is_escaped(self) -> None:
         """accession_map.accession reads 'primaryAccession | secondaryAccessions'."""
         cells = _rendered_rows({"accession_map": ["accession"]})[("accession_map", "accession")]
         assert len(cells) == 5, cells
@@ -67,7 +67,7 @@ class TestColumnRows:
 
     @pytest.mark.parametrize("table, column",
                              [(table, index) for table, (_, index, _) in CHILD_TABLES.items()])
-    def test_array_position_is_derived(self, table, column):
+    def test_array_position_is_derived(self, table: str, column: str) -> None:
         """An array position has no source path in the input."""
         cells = _rendered_rows({table: [column]})[(table, column)]
         assert len(cells) == 5, cells
@@ -75,7 +75,7 @@ class TestColumnRows:
         assert "position" in cells[4].lower()
 
 
-def test_column_sources_are_paths():
+def test_column_sources_are_paths() -> None:
     """A COLUMN_SOURCES value is '<top level>' or ' | '-joined dotted input
     paths; a column with no input path belongs in DERIVED_SOURCES."""
     from parquet_transform import COLUMN_SOURCES
@@ -86,7 +86,7 @@ def test_column_sources_are_paths():
             assert re.fullmatch(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*", path), (key, source)
 
 
-def test_foreign_keys_are_listed_per_referenced_table():
+def test_foreign_keys_are_listed_per_referenced_table() -> None:
     """features' accession and organism_id reference entries together:
     SCHEMA.md lists them as one composite key, not organism_id on its own."""
     from gen_schema_md import render

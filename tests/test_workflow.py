@@ -10,12 +10,14 @@ each test only re-runs what its params change.
 
 import json
 import os
+import pathlib
+import re
 import shutil
 import subprocess
 import sys
+from typing import cast
 
 import pytest
-
 from conftest import PROJECT_ROOT, SMALL_JSON_GZ
 
 WORKFLOW = os.path.join(PROJECT_ROOT, "upjson2lake.nf")
@@ -24,7 +26,8 @@ pytestmark = pytest.mark.skipif(shutil.which("nextflow") is None and not os.envi
                                 reason="nextflow not on PATH")
 
 
-def _launch(launch_dir, release, *extra, workflow=WORKFLOW):
+def _launch(launch_dir: pathlib.Path, release: str, *extra: str,
+            workflow: str | pathlib.Path = WORKFLOW) -> subprocess.CompletedProcess[str]:
     """Run ``workflow`` from ``launch_dir`` into ``launch_dir/out/<release>``;
     the CompletedProcess."""
     # The bin/ scripts resolve python3 from PATH: use the interpreter running the tests.
@@ -36,7 +39,7 @@ def _launch(launch_dir, release, *extra, workflow=WORKFLOW):
     return subprocess.run(cmd, cwd=launch_dir, env=env, capture_output=True, text=True)
 
 
-def _run(launch_dir, release, *extra, workflow=WORKFLOW):
+def _run(launch_dir: pathlib.Path, release: str, *extra: str, workflow: str | pathlib.Path = WORKFLOW) -> str:
     """As _launch, which must succeed; the validation report text."""
     result = _launch(launch_dir, release, *extra, workflow=workflow)
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
@@ -45,7 +48,7 @@ def _run(launch_dir, release, *extra, workflow=WORKFLOW):
 
 
 @pytest.fixture(scope="module")
-def launch_dir(tmp_path_factory):
+def launch_dir(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
     """A launch directory holding a baseline release ``prev`` built from the
     small fixture, to diff later runs against."""
     d = tmp_path_factory.mktemp("nf_launch")
@@ -57,7 +60,7 @@ def launch_dir(tmp_path_factory):
     return d
 
 
-def _copy_manifest(launch_dir, subdir):
+def _copy_manifest(launch_dir: pathlib.Path, subdir: str) -> pathlib.Path:
     dst = launch_dir / subdir / "manifest.json"
     dst.parent.mkdir()
     shutil.copy(launch_dir / "out" / "prev" / "lake" / "manifest.json", dst)
@@ -68,18 +71,18 @@ class TestPreviousManifest:
     """--previous_manifest reaches VALIDATE however it is given, so the
     report's schema diff is never silently skipped."""
 
-    def test_relative_path(self, launch_dir):
+    def test_relative_path(self, launch_dir: pathlib.Path) -> None:
         text = _run(launch_dir, "rel", "--previous_manifest", "out/prev/lake/manifest.json")
         assert "schema diff skipped" not in text
         assert "previous: release prev" in text
 
-    def test_path_with_spaces(self, launch_dir):
+    def test_path_with_spaces(self, launch_dir: pathlib.Path) -> None:
         manifest = _copy_manifest(launch_dir, "prev release")
         text = _run(launch_dir, "spaced", "--previous_manifest", str(manifest))
         assert "schema diff skipped" not in text
         assert "previous: release prev" in text
 
-    def test_resume_rereads_changed_manifest(self, launch_dir):
+    def test_resume_rereads_changed_manifest(self, launch_dir: pathlib.Path) -> None:
         manifest = _copy_manifest(launch_dir, "editable")
         _run(launch_dir, "resumed", "--previous_manifest", str(manifest))
         data = json.loads(manifest.read_text())
@@ -88,7 +91,7 @@ class TestPreviousManifest:
         text = _run(launch_dir, "resumed", "--previous_manifest", str(manifest))
         assert "previous: release prev-edited" in text
 
-    def test_manifest_of_the_release_being_built_is_refused(self, launch_dir):
+    def test_manifest_of_the_release_being_built_is_refused(self, launch_dir: pathlib.Path) -> None:
         """PARQUET_TRANSFORM republishes that file while VALIDATE reads it,
         so the schema diff would compare the release with itself."""
         result = _launch(launch_dir, "prev", "--previous_manifest", "out/prev/lake/manifest.json")
@@ -96,7 +99,7 @@ class TestPreviousManifest:
         assert "inside the release being built" in result.stdout + result.stderr
 
 
-def _spill_dir_name(release_dir, process):
+def _spill_dir_name(release_dir: pathlib.Path, process: str) -> str:
     """spill_setup's directory for a release directory and process:
     <release>.<process>.<first 8 hex digits of md5(absolute release dir)>."""
     import hashlib
@@ -104,7 +107,12 @@ def _spill_dir_name(release_dir, process):
     return f"{release_dir.name}.{process}.{digest}"
 
 
-def test_stale_spill_of_a_killed_attempt_is_reclaimed(launch_dir, tmp_path):
+def _group(pattern: str, text: str) -> str:
+    # re.search(pattern, text).group(1), typed: still an AttributeError if nothing matches
+    return cast(re.Match[str], re.search(pattern, text)).group(1)
+
+
+def test_stale_spill_of_a_killed_attempt_is_reclaimed(launch_dir: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """An attempt killed by the OOM killer never runs its cleanup, so its
     spill stays in --duckdb_temp; the next attempt of the same release and
     process removes it before spilling, and nothing else there is touched:
@@ -130,7 +138,7 @@ def test_stale_spill_of_a_killed_attempt_is_reclaimed(launch_dir, tmp_path):
         assert f.exists(), f
 
 
-def test_published_lake_has_no_build_sentinels(launch_dir):
+def test_published_lake_has_no_build_sentinels(launch_dir: pathlib.Path) -> None:
     """The transform's .complete/ sentinels are build bookkeeping for manual
     --skip-existing re-runs: not listed in SHA256SUMS.txt, not published."""
     lake = launch_dir / "out" / "prev" / "lake"
@@ -138,7 +146,7 @@ def test_published_lake_has_no_build_sentinels(launch_dir):
     assert not (lake / ".complete").exists()
 
 
-def test_validate_duckdb_is_sized_to_its_task(launch_dir):
+def test_validate_duckdb_is_sized_to_its_task(launch_dir: pathlib.Path) -> None:
     """VALIDATE hands DuckDB the task's memory share and cpus, not the node's."""
     with open(launch_dir / "out" / "prev" / "validation_report.txt") as f:
         assert "DuckDB: memory_limit 3072MB, threads " in f.read()   # 75% of 4 GB, in MB
@@ -148,7 +156,7 @@ def test_validate_duckdb_is_sized_to_its_task(launch_dir):
 
 
 @pytest.fixture(scope="module")
-def project_copy(tmp_path_factory):
+def project_copy(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
     """A copy of the pipeline (workflow, config, bin/) whose scripts a test
     may change without touching the checkout."""
     d = tmp_path_factory.mktemp("project")
@@ -163,12 +171,12 @@ class TestReleaseMarker:
     """RELEASE_COMPLETE appears only for a release whose published copy is
     whole, and never survives a failed re-run."""
 
-    def test_success_leaves_only_the_marker(self, launch_dir):
+    def test_success_leaves_only_the_marker(self, launch_dir: pathlib.Path) -> None:
         release = launch_dir / "out" / "prev"
         assert (release / "RELEASE_COMPLETE").exists()
         assert not (release / ".RELEASE_COMPLETE.pending").exists()
 
-    def test_failed_run_leaves_no_marker_and_removes_a_stale_one(self, launch_dir):
+    def test_failed_run_leaves_no_marker_and_removes_a_stale_one(self, launch_dir: pathlib.Path) -> None:
         release = launch_dir / "out" / "failing"
         release.mkdir(parents=True)
         (release / "RELEASE_COMPLETE").write_text("stale\n")
@@ -177,7 +185,7 @@ class TestReleaseMarker:
         assert not (release / "RELEASE_COMPLETE").exists()
         assert not (release / ".RELEASE_COMPLETE.pending").exists()
 
-    def test_resume_republishes_a_damaged_release(self, launch_dir):
+    def test_resume_republishes_a_damaged_release(self, launch_dir: pathlib.Path) -> None:
         """A head job killed mid-publish is recovered with -resume: every task
         is cached, the published copy is rewritten whole, and the marker is
         written only after verify_release.py passed on it."""
@@ -195,7 +203,7 @@ class TestReleaseMarker:
         result = run_bin("verify_release.py", release, "--full")
         assert result.returncode == 0, result.stdout
 
-    def test_failed_verification_writes_no_marker(self, launch_dir, project_copy):
+    def test_failed_verification_writes_no_marker(self, launch_dir: pathlib.Path, project_copy: pathlib.Path) -> None:
         stub = project_copy / "bin" / "verify_release.py"
         original = stub.read_text()
         stub.write_text("#!/usr/bin/env python3\nimport sys\nprint('FAIL: stub')\nsys.exit(1)\n")
@@ -212,7 +220,7 @@ class TestReleaseMarker:
         assert "FAIL: stub" in result.stdout + result.stderr
 
 
-def test_changed_bin_module_reruns_validate(launch_dir, project_copy):
+def test_changed_bin_module_reruns_validate(launch_dir: pathlib.Path, project_copy: pathlib.Path) -> None:
     """VALIDATE imports reconstruct.py, which Nextflow does not hash: a change
     to any bin/ script must still re-run VALIDATE and PROVENANCE under
     -resume, never republish the old verdict.  The transform is cached."""
@@ -231,11 +239,10 @@ def test_changed_bin_module_reruns_validate(launch_dir, project_copy):
     assert "completed=2 failed=0 cached=3" in out, out[-1000:]
 
 
-def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir, tmp_path):
+def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """--process_memory 2.5 GB gives DuckDB 1920MB at attempt 1, too little
     to sort or transform the small fixture: each exits 75 and is re-submitted
     at 5 GB (DuckDB 3840MB), and the run succeeds."""
-    import re
     # An input of its own, so -resume cannot reuse the baseline's SORT_JSONL.
     inputfile = tmp_path / "input.json.gz"
     shutil.copy(SMALL_JSON_GZ, inputfile)
@@ -250,13 +257,13 @@ def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir, tmp_path):
         assert f"Re-submitted process > {process}" in log, process
         attempts = re.findall(rf"name: {process} \(\w+\); status: COMPLETED; exit: (\d+); "
                               rf"error: -; workDir: (\S+)\]", log)
-        limits = [re.search(r"--memory-limit (\S+)", open(os.path.join(d, ".command.sh")).read()).group(1)
+        limits = [_group(r"--memory-limit (\S+)", (pathlib.Path(d) / ".command.sh").read_text())
                   for _, d in attempts]
-        assert [(e, m) for (e, _), m in zip(attempts, limits)] == [("75", "1920MB"), ("0", "3840MB")]
+        assert [(e, m) for (e, _), m in zip(attempts, limits, strict=True)] == [("75", "1920MB"), ("0", "3840MB")]
     assert (launch_dir / "out" / "oom" / "RELEASE_COMPLETE").exists()
 
 
-def test_provenance_identifies_the_source_dump(launch_dir):
+def test_provenance_identifies_the_source_dump(launch_dir: pathlib.Path) -> None:
     """provenance.json names the dump the release was built from (its
     SHA-256), the tool versions and the run parameters."""
     import hashlib
@@ -274,14 +281,13 @@ def test_provenance_identifies_the_source_dump(launch_dir):
 # ─── The SLURM profiles, on the stand-in tests/fake_slurm ──────────────
 
 
-def test_prod_profile_on_stand_in_slurm(tmp_path):
+def test_prod_profile_on_stand_in_slurm(tmp_path: pathlib.Path) -> None:
     """The prod profile through Nextflow's slurm executor (sbatch, squeue and
     scancel stood in by tests/fake_slurm): every process is submitted with
     the requests RUNBOOK 8a lists; DuckDB's out-of-memory error is retried
     with twice the memory and the time, capped at --max_time; the job's
     output lands in .command.log with beforeScript's job id; and the log
     names each submitted task's work directory (the RUNBOOK's wd helper)."""
-    import re
     launch = tmp_path / "launch"
     launch.mkdir()
     (launch / "no_reports.config").write_text(
@@ -299,9 +305,9 @@ def test_prod_profile_on_stand_in_slurm(tmp_path):
     assert result.returncode == 0, result.stdout[-3000:]
     assert (launch / "out" / "slurm" / "RELEASE_COMPLETE").exists()
 
-    def requests(job):
+    def requests(job: pathlib.Path) -> tuple[str, str | None, str, str, str]:
         text = job.read_text()
-        name = re.search(r"#SBATCH -J nf-([A-Z_]+)", text).group(1).rstrip("_")
+        name = _group(r"#SBATCH -J nf-([A-Z_]+)", text).rstrip("_")
         opts = dict(re.findall(r"#SBATCH (-c|-t|--mem|-p) (\S+)", text))
         return name, opts.get("-c"), opts["-t"], opts["--mem"], opts["-p"]
     jobs = [requests(j) for j in sorted(state.glob("*.sbatch"), key=lambda p: int(p.stem))]
@@ -318,4 +324,4 @@ def test_prod_profile_on_stand_in_slurm(tmp_path):
 
     log = (launch / ".nextflow.log").read_text()
     workdir = re.findall(r"submitted process VALIDATE.*workDir: (\S+)", log)[-1]
-    assert "SLURM Job ID: " in open(os.path.join(workdir, ".command.log")).read()
+    assert "SLURM Job ID: " in (pathlib.Path(workdir) / ".command.log").read_text()

@@ -2,15 +2,18 @@
 array order included."""
 
 import random
+from typing import Any
 
 import pyarrow as pa
 import pytest
+from reconstruct import entries_match, first_diff, normalize_value, reconstruct_entry, rows_from_arrow
 
-from reconstruct import (reconstruct_entry, entries_match, normalize_value, first_diff,
-                         rows_from_arrow)
+# conftest.py's originals / lake_entries, and a child table's rows grouped by accession (lake_features etc.).
+Entries = dict[str, dict[str, Any]]
+Rows = dict[str, list[dict[str, Any]]]
 
 
-def test_entry_is_its_source_columns():
+def test_entry_is_its_source_columns() -> None:
     """A row's source columns are its JSON element; shortcut columns and the
     Hive partition column are never read, and NULL columns are left out."""
     entry = {"accession": "P1", "reviewed": True, "gene_primary": ["X"], "review_status": "swissprot",
@@ -24,7 +27,7 @@ def test_entry_is_its_source_columns():
         "features": [{"type": "Chain", "location": {"start": {"value": 1}, "end": {"value": 3}}}]}
 
 
-def test_rows_from_arrow_decodes_json_columns():
+def test_rows_from_arrow_decodes_json_columns() -> None:
     """arrow.json columns (and those named, for DuckDB results) are decoded;
     a string column that happens to hold JSON-looking text is not."""
     json_col = pa.ExtensionArray.from_storage(pa.json_(), pa.array(['{"b": 1}', None, '"a"']))
@@ -35,14 +38,14 @@ def test_rows_from_arrow_decodes_json_columns():
     assert rows_from_arrow(tbl, json_columns={"t"})[0]["t"] == [1]
 
 
-def test_array_order_is_compared():
+def test_array_order_is_compared() -> None:
     """Reordered arrays do not match; reordered object keys do."""
     assert entries_match({"a": [1, 2], "b": {"x": 1, "y": 2}}, {"b": {"y": 2, "x": 1}, "a": [1, 2]})[0]
     ok, diff = entries_match({"a": [1, 2]}, {"a": [2, 1]})
-    assert not ok and diff.startswith("$.a[0]")
+    assert not ok and diff is not None and diff.startswith("$.a[0]")
 
 
-def test_numbers_compare_by_value_but_bools_are_not_numbers():
+def test_numbers_compare_by_value_but_bools_are_not_numbers() -> None:
     """A field mixing integers and decimals is stored as DOUBLE, so 5 and 5.0
     are equal (README: the normalisations); True is never 1, at any depth."""
     assert entries_match({"x": 5.0}, {"x": 5})[0]
@@ -50,11 +53,11 @@ def test_numbers_compare_by_value_but_bools_are_not_numbers():
     for a, b in (({"x": True}, {"x": 1}), ({"x": 0}, {"x": False}),
                  ({"x": [{"y": 1.0}]}, {"x": [{"y": True}]})):
         ok, diff = entries_match(a, b)
-        assert not ok and diff.startswith("$.x"), (a, b, diff)
+        assert not ok and diff is not None and diff.startswith("$.x"), (a, b, diff)
     assert entries_match({"x": True}, {"x": True})[0]
 
 
-def test_empty_child_array_matches_absent():
+def test_empty_child_array_matches_absent() -> None:
     """An empty child-table array and an absent one are both zero child rows,
     so they compare equal; other empty arrays, and non-empty ones, do not."""
     assert entries_match({"accession": "P1"}, {"accession": "P1", "features": [], "references": []})[0]
@@ -63,20 +66,18 @@ def test_empty_child_array_matches_absent():
     assert not entries_match({"accession": "P1"}, {"accession": "P1", "keywords": []})[0]
 
 
-def test_swapped_positions_do_not_match(originals, lake_entries, lake_features, lake_xrefs,
-                                        lake_comments, lake_publications):
+def test_swapped_positions_do_not_match(originals: Entries, lake_entries: Entries, lake_features: Rows,
+                                        lake_xrefs: Rows, lake_comments: Rows, lake_publications: Rows) -> None:
     """Swapping two features' positions breaks reconstruction: array order is
     part of the lossless guarantee (the validator's check 16 uses the same
     reconstruct_entry / entries_match)."""
-    for accession, rows in lake_features.items():
-        pair = next(((a, b) for a in rows for b in rows
-                     if a["feature_index"] < b["feature_index"]
-                     and (a["type"], a["start_pos"]) != (b["type"], b["start_pos"])), None)
-        if pair:
-            break
-    else:
+    found = next(((accession, rows, (a, b)) for accession, rows in lake_features.items()
+                  for a in rows for b in rows
+                  if a["feature_index"] < b["feature_index"]
+                  and (a["type"], a["start_pos"]) != (b["type"], b["start_pos"])), None)
+    if found is None:
         pytest.skip("no entry with two distinct features")
-    a, b = pair
+    accession, rows, (a, b) = found
     swapped = [dict(r, feature_index=b["feature_index"]) if r is a else
                dict(r, feature_index=a["feature_index"]) if r is b else r for r in rows]
     others = [t.get(accession, []) for t in (lake_xrefs, lake_comments, lake_publications)]
@@ -85,8 +86,8 @@ def test_swapped_positions_do_not_match(originals, lake_entries, lake_features, 
     assert not ok, f"{accession}: swapping feature positions went unnoticed"
 
 
-def test_child_rows_are_placed_by_index(originals, lake_entries, lake_features, lake_xrefs,
-                                        lake_comments, lake_publications):
+def test_child_rows_are_placed_by_index(originals: Entries, lake_entries: Entries, lake_features: Rows,
+                                        lake_xrefs: Rows, lake_comments: Rows, lake_publications: Rows) -> None:
     """Rows handed over in any order rebuild arrays in source order (*_index)."""
     rng = random.Random(0)
     accession = max(originals, key=lambda a: len(lake_features.get(a, [])))
@@ -99,7 +100,7 @@ def test_child_rows_are_placed_by_index(originals, lake_entries, lake_features, 
 
 
 @pytest.mark.parametrize("source", [{}, {"FUNCTION": 2, "SUBUNIT": 1}])
-def test_map_columns_round_trip_through_arrow(source):
+def test_map_columns_round_trip_through_arrow(source: dict[str, int]) -> None:
     """An empty Parquet MAP must come back as {} — the source's {} — not [] (the
     validator's reconstruction check would otherwise report 'type list != dict')."""
     tbl = pa.table({"m": pa.array([source], type=pa.map_(pa.string(), pa.int64()))})
@@ -108,9 +109,9 @@ def test_map_columns_round_trip_through_arrow(source):
     assert first_diff(normalize_value(row["m"]), source) is None
 
 
-def test_every_entry_reconstructs(originals, lake_entries, lake_features, lake_xrefs,
-                                  lake_comments, lake_publications):
-    failures = []
+def test_every_entry_reconstructs(originals: Entries, lake_entries: Entries, lake_features: Rows,
+                                  lake_xrefs: Rows, lake_comments: Rows, lake_publications: Rows) -> None:
+    failures: list[str] = []
     for accession, orig in originals.items():
         rebuilt = reconstruct_entry(
             lake_entries[accession],
@@ -125,7 +126,7 @@ def test_every_entry_reconstructs(originals, lake_entries, lake_features, lake_x
     assert not failures, f"{len(failures)} entries differ; first: {failures[0]}"
 
 
-def test_reconstruction_has_no_extra_keys(originals, lake_entries):
+def test_reconstruction_has_no_extra_keys(originals: Entries, lake_entries: Entries) -> None:
     """Top-level keys of the rebuilt entry are a subset of the original's."""
     for accession, orig in list(originals.items())[:50]:
         rebuilt = reconstruct_entry(lake_entries[accession])

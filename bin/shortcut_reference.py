@@ -20,10 +20,12 @@ for one accession:
 """
 
 import re
+from collections.abc import Callable, Iterable
+from typing import Any
 
 # Swiss-Prot / TrEMBL as UniProt writes entryType.  Any other value has no
 # expected `reviewed`: the transform refuses it, and here it is a mismatch.
-ENTRY_TYPES = {
+ENTRY_TYPES: dict[str | None, bool] = {
     "UniProtKB reviewed (Swiss-Prot)": True,
     "UniProtKB unreviewed (TrEMBL)": False,
 }
@@ -50,7 +52,7 @@ _CHILDREN = {
 _INT = re.compile(r"[+-]?[0-9]+")
 
 
-def _get(obj, *path):
+def _get(obj: Any, *path: str) -> Any:
     """obj[path[0]][path[1]]..., None where any step is missing."""
     for key in path:
         if not isinstance(obj, dict):
@@ -59,12 +61,12 @@ def _get(obj, *path):
     return obj
 
 
-def _distinct(values):
+def _distinct(values: Iterable[Any]) -> list[Any]:
     """Non-null values, first occurrence kept."""
     return list(dict.fromkeys(v for v in values if v is not None))
 
 
-def _ec_numbers(names: dict) -> list:
+def _ec_numbers(names: dict[str, Any]) -> list[Any]:
     """EC numbers of one proteinDescription-shaped dict's naming blocks."""
     blocks = [names.get("recommendedName") or {}]
     for key in ("alternativeNames", "submissionNames", "submittedNames"):
@@ -72,7 +74,7 @@ def _ec_numbers(names: dict) -> list:
     return [x.get("value") for b in blocks for x in b.get("ecNumbers") or []]
 
 
-def _protein_name_primary(desc: dict):
+def _protein_name_primary(desc: dict[str, Any]) -> Any:
     """Recommended name, else the first submitted name, else the first
     alternative name."""
     submitted = desc.get("submissionNames") or desc.get("submittedNames") or []
@@ -85,7 +87,7 @@ def _protein_name_primary(desc: dict):
     return None
 
 
-def _division(entry: dict) -> str:
+def _division(entry: dict[str, Any]) -> str:
     if _get(entry, "organism", "taxonId") == 9606:
         return "human"
     lineage = _get(entry, "organism", "lineage") or []
@@ -93,12 +95,12 @@ def _division(entry: dict) -> str:
                 "unclassified")
 
 
-def _property(xref: dict, key: str):
+def _property(xref: dict[str, Any], key: str) -> Any:
     """The value of a cross-reference's first property named ``key``."""
     return next((p.get("value") for p in xref.get("properties") or [] if p.get("key") == key), None)
 
 
-def _go_term(xref: dict) -> dict:
+def _go_term(xref: dict[str, Any]) -> dict[str, Any]:
     """{id, aspect, term, evidence_type} of a GO cross-reference: GoTerm
     'F:ATP binding' gives aspect 'F' and term 'ATP binding'."""
     go_term = _property(xref, "GoTerm")
@@ -108,13 +110,13 @@ def _go_term(xref: dict) -> dict:
             "evidence_type": _property(xref, "GoEvidenceType")}
 
 
-def _pubmed_order(pmid: str):
+def _pubmed_order(pmid: str) -> tuple[bool, int, str]:
     """Numeric ids in numeric order, then any other id in text order."""
     numeric = bool(_INT.fullmatch(pmid.strip())) and -2**63 <= int(pmid) < 2**63
     return (not numeric, int(pmid) if numeric else 0, pmid)
 
 
-def _text_value(comment: dict):
+def _text_value(comment: dict[str, Any]) -> str | None:
     """A comment's texts[].value joined by a blank line; None when empty."""
     texts = comment.get("texts")
     if texts is None:
@@ -122,7 +124,7 @@ def _text_value(comment: dict):
     return "\n\n".join(t.get("value") for t in texts if t.get("value") is not None) or None
 
 
-def expected_shortcuts(entry: dict) -> dict[str, list[dict]]:
+def expected_shortcuts(entry: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     """Every table's shortcut columns for one JSON entry, as plain Python."""
     accession = entry.get("primaryAccession")
     reviewed = ENTRY_TYPES.get(entry.get("entryType"))
@@ -147,7 +149,7 @@ def expected_shortcuts(entry: dict) -> dict[str, list[dict]]:
         for part in desc.get(nested) or []:
             ec += _ec_numbers(part)
 
-    entries_row = {
+    entries_row: dict[str, Any] = {
         **keys,
         "id": entry.get("uniProtkbId"),
         "organism_scientific_name": organism_scientific_name,
@@ -176,12 +178,12 @@ def expected_shortcuts(entry: dict) -> dict[str, list[dict]]:
         "lit_pubmed_id": sorted(pubmed, key=_pubmed_order),
     }
 
-    def children(table, extra):
+    def children(table: str, extra: Callable[[Any], dict[str, Any]]) -> list[dict[str, Any]]:
         array, index = _CHILDREN[table]
         return [{**keys, index: i, **extra(element)}
                 for i, element in enumerate(entry.get(array) or [])]
 
-    out = {
+    out: dict[str, list[dict[str, Any]]] = {
         "entries": [entries_row],
         "features": children("features", lambda f: {
             "organism_scientific_name": organism_scientific_name,
@@ -204,7 +206,7 @@ def expected_shortcuts(entry: dict) -> dict[str, list[dict]]:
     return out
 
 
-def _comparable(table: str, column: str, value):
+def _comparable(table: str, column: str, value: Any) -> Any:
     """A lake or reference value in a form both sides share: dates as ISO
     strings, NULL lists as empty (a list shortcut whose source is absent from
     the whole input is a typed NULL rather than []), unordered lists sorted."""
@@ -225,15 +227,15 @@ _LIST_COLUMNS = {
 }
 
 
-def compare_rows(table: str, accession: str, expected: list[dict],
-                 actual: list[dict]) -> list[str]:
+def compare_rows(table: str, accession: str, expected: list[dict[str, Any]],
+                 actual: list[dict[str, Any]]) -> list[str]:
     """Mismatches between the expected shortcut rows of one accession and
     the lake's rows (each a dict holding at least the shortcut columns), as
     "table.column accession[row]: expected …, got …" strings."""
     if len(expected) != len(actual):
         return [f"{table} {accession}: expected {len(expected)} rows, got {len(actual)}"]
-    problems = []
-    for i, (want, got) in enumerate(zip(expected, actual)):
+    problems: list[str] = []
+    for i, (want, got) in enumerate(zip(expected, actual, strict=True)):  # lengths checked above
         where = accession if table == "entries" else f"{accession}[{i}]"
         for column, value in want.items():
             if column not in got:
@@ -245,7 +247,7 @@ def compare_rows(table: str, accession: str, expected: list[dict],
     return problems
 
 
-def lake_order(table: str, rows: list[dict]) -> list[dict]:
+def lake_order(table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """One accession's lake rows in the order expected_shortcuts lists them."""
     if table in _CHILDREN:
         return sorted(rows, key=lambda r: r[_CHILDREN[table][1]])

@@ -26,22 +26,23 @@ Usage:
         [-o provenance.json]
 """
 
-import os
-import sys
-import json
-import platform
 import argparse
+import json
+import os
+import platform
 import subprocess
-from datetime import datetime, timezone
+import sys
+from datetime import UTC, datetime
+from typing import Any
 
 from parquet_transform import hash_file
 
 
-def eprint(*args, **kwargs):
+def eprint(*args: object, **kwargs: Any) -> None:
     print(*args, file=sys.stderr, **kwargs)
 
 
-def git_info():
+def git_info() -> dict[str, Any] | None:
     """Git commit and dirty status of the pipeline checkout this script lives
     in, or None if it is not a git repo.  Resolved from __file__, not the
     working directory: Nextflow runs this in a task work dir that may be
@@ -62,7 +63,7 @@ def git_info():
         return None
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate a release manifest for provenance tracking"
     )
@@ -100,9 +101,9 @@ def main():
 
     eprint("Generating release manifest...")
 
-    manifest = {
+    manifest: dict[str, Any] = {
         "release": args.release,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
     }
 
     # ── Input checksums ──
@@ -157,9 +158,9 @@ def main():
         with open(lake_manifest_path) as f:
             lake_manifest = json.load(f)
 
-        tables_info = {}
+        tables_info: dict[str, dict[str, Any]] = {}
         for table_name, table_data in lake_manifest.get("tables", {}).items():
-            info = {
+            info: dict[str, Any] = {
                 "row_count": table_data.get("row_count", 0),
                 "data_files": len(table_data.get("files", [])),
                 "columns": len(table_data.get("columns", [])),
@@ -206,7 +207,7 @@ def main():
     write_complete_marker(args, lake_manifest if os.path.exists(lake_manifest_path) else {})
 
 
-def write_complete_marker(args, lake_manifest):
+def write_complete_marker(args: argparse.Namespace, lake_manifest: dict[str, Any]) -> None:
     """Write RELEASE_COMPLETE after provenance.json.  Content: release,
     schema_version, sha256 of lake/SHA256SUMS.txt, UTC timestamp — one key
     per line.  This runs only after validation passed (the PROVENANCE
@@ -220,7 +221,7 @@ def write_complete_marker(args, lake_manifest):
     marker = args.complete_marker or os.path.join(
         os.path.dirname(os.path.abspath(args.output)), "RELEASE_COMPLETE")
     sums = os.path.join(args.lake, "SHA256SUMS.txt")
-    missing = []
+    missing: list[str] = []
     if not lake_manifest:
         missing.append("manifest.json")
     elif not lake_manifest.get("schema_version"):
@@ -233,7 +234,7 @@ def write_complete_marker(args, lake_manifest):
         f"release: {args.release}",
         f"schema_version: {lake_manifest['schema_version']}",
         f"sha256sums_sha256: {hash_file(sums)[0]}",
-        f"completed_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        f"completed_at: {datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}",
     ]
     with open(marker, "w") as f:
         f.write("\n".join(lines) + "\n")

@@ -26,16 +26,16 @@ test suite normalise identically.
 """
 
 import json
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 import pyarrow as pa
-
 from parquet_transform import CHILD_TABLES, PARTITION_KEY, TABLE_META
-
 
 # ─── Normalisation (shared by tests and validator) ──────────────────────
 
 
-def normalize_value(val):
+def normalize_value(val: Any) -> Any:
     """Normalise a value for comparison: drop None-valued dict fields (a
     STRUCT holds every key any entry has, NULL where this one has none),
     keep numbers, stringify everything else.
@@ -60,12 +60,12 @@ def normalize_value(val):
 CHILD_ARRAYS = tuple(array for array, _, _ in CHILD_TABLES.values())
 
 
-def drop_empty_child_arrays(entry: dict) -> dict:
+def drop_empty_child_arrays(entry: dict[str, Any]) -> dict[str, Any]:
     """``entry`` without its empty child-table arrays (see CHILD_ARRAYS)."""
     return {k: v for k, v in entry.items() if not (k in CHILD_ARRAYS and v == [])}
 
 
-def first_diff(a, b, path="$"):
+def first_diff(a: Any, b: Any, path: str = "$") -> str | None:
     """Return the first differing key path between two normalised objects, or None."""
     if type(a) is not type(b) and not (isinstance(a, (int, float)) and isinstance(b, (int, float))):
         return f"{path}: type {type(a).__name__} != {type(b).__name__}"
@@ -82,7 +82,7 @@ def first_diff(a, b, path="$"):
     if isinstance(a, list):
         if len(a) != len(b):
             return f"{path}: list length {len(a)} != {len(b)}"
-        for i, (x, y) in enumerate(zip(a, b)):
+        for i, (x, y) in enumerate(zip(a, b, strict=True)):  # lengths checked above
             d = first_diff(x, y, f"{path}[{i}]")
             if d:
                 return d
@@ -95,13 +95,13 @@ def first_diff(a, b, path="$"):
 # ─── Arrow rows ─────────────────────────────────────────────────────────
 
 
-def rows_from_arrow(table: pa.Table, json_columns=()) -> list[dict]:
+def rows_from_arrow(table: pa.Table, json_columns: Iterable[str] = ()) -> list[dict[str, Any]]:
     """``table``'s rows as dicts, MAPs as dicts and every JSON column
     decoded: those typed arrow.json (as read from the Parquet files) and
     those named in ``json_columns`` (a query result, where DuckDB hands JSON
     over as plain strings)."""
     decode = {f.name for f in table.schema if isinstance(f.type, pa.JsonType)} | set(json_columns)
-    rows = table.to_pylist(maps_as_pydicts="strict")
+    rows: list[dict[str, Any]] = table.to_pylist(maps_as_pydicts="strict")
     if decode:
         for row in rows:
             for name in decode & row.keys():
@@ -113,13 +113,13 @@ def rows_from_arrow(table: pa.Table, json_columns=()) -> list[dict]:
 # ─── Reconstruction ─────────────────────────────────────────────────────
 
 
-def _element(row: dict, table: str) -> dict:
+def _element(row: dict[str, Any], table: str) -> dict[str, Any]:
     """The JSON element a row holds: its source columns, NULL ones left out."""
     skip = set(TABLE_META[table]["columns"]["shortcut"]) | {PARTITION_KEY}
     return {k: v for k, v in row.items() if k not in skip and v is not None}
 
 
-def _in_order(rows, index_column):
+def _in_order(rows: Iterable[dict[str, Any]], index_column: str) -> list[dict[str, Any]]:
     """Child rows in source-array order (by their *_index column when present)."""
     rows = list(rows)
     if rows and rows[0].get(index_column) is not None:
@@ -127,8 +127,9 @@ def _in_order(rows, index_column):
     return rows
 
 
-def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
-                      publication_rows=()) -> dict:
+def reconstruct_entry(entry_row: dict[str, Any], feature_rows: Sequence[dict[str, Any]] = (),
+                      xref_rows: Sequence[dict[str, Any]] = (), comment_rows: Sequence[dict[str, Any]] = (),
+                      publication_rows: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
     """Rebuild the UniProtKB JSON entry from lake rows.
 
     ``entry_row`` is one ``entries`` row as ``{column: python value}``; the
@@ -140,28 +141,29 @@ def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
     array with no rows is left out.
     """
     out = _element(entry_row, "entries")
-    for table, rows in zip(CHILD_TABLES, (feature_rows, xref_rows, comment_rows, publication_rows)):
+    for table, rows in zip(CHILD_TABLES, (feature_rows, xref_rows, comment_rows, publication_rows), strict=False):
         array, index, _ = CHILD_TABLES[table]
         if rows:
             out[array] = [_element(r, table) for r in _in_order(rows, index)]
-    return normalize_value(out)
+    entry: dict[str, Any] = normalize_value(out)
+    return entry
 
 
 class _Bool:
     """A JSON boolean for comparison: Python's True == 1, a JSON true is not a 1."""
     __slots__ = ("value",)
 
-    def __init__(self, value: bool):
+    def __init__(self, value: bool) -> None:
         self.value = value
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return isinstance(other, _Bool) and other.value == self.value
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return repr(self.value)
 
 
-def _strict_bools(val):
+def _strict_bools(val: Any) -> Any:
     """``val`` with every bool wrapped in _Bool, so it never equals a number."""
     if isinstance(val, bool):
         return _Bool(val)
@@ -172,7 +174,7 @@ def _strict_bools(val):
     return val
 
 
-def entries_match(reconstructed, original):
+def entries_match(reconstructed: dict[str, Any], original: dict[str, Any]) -> tuple[bool, str | None]:
     """(bool, first differing path) for a reconstructed vs original entry.
     Numbers compare by value (5 == 5.0: a field mixing integers and decimals
     is stored as DOUBLE); a boolean equals only the same boolean."""

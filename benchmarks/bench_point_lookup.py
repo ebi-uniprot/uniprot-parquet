@@ -33,30 +33,41 @@ Usage:
     python benchmarks/bench_point_lookup.py --lake slice/lake --url https://host/release/lake --label remote
 """
 
-import os
-import sys
-import json
-import time
-import random
 import argparse
+import os
+import random
+import sys
+import time
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, cast
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _bench_common import (  # noqa: E402
-    eprint, human_size, time_query, write_results, serve_directory, duckdb_http_connection,
+from _bench_common import (
+    duckdb_http_connection,
+    eprint,
+    human_size,
     read_parquet_source,
+    serve_directory,
+    time_query,
+    write_results,
 )
 
-HOT = "accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary, length, sequence"
+if TYPE_CHECKING:
+    import duckdb
+
+HOT = ("accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary, length, "
+       "sequence")
 DEFAULT7 = "accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary"
 SIZES = (1, 37, 1000)
 TABLES = ("entries", "features", "xrefs")
 
 
-def q(s):
+def q(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
 
-def candidate_row_groups(con, source, col, values, is_string=True):
+def candidate_row_groups(con: duckdb.DuckDBPyConnection, source: str, col: str, values: Sequence[Any],
+                         is_string: bool = True) -> tuple[int, int]:
     """Row groups whose [min_value, max_value] on `col` admit any value (total, candidates).
     stats_min_value / stats_max_value, not stats_min / stats_max: the latter are the legacy
     Parquet fields, which PyArrow omits for strings."""
@@ -79,7 +90,8 @@ def candidate_row_groups(con, source, col, values, is_string=True):
     return total, cand
 
 
-def two_step_candidates(con, source, keys):
+def two_step_candidates(con: duckdb.DuckDBPyConnection, source: str,
+                        keys: Sequence[tuple[Any, ...]]) -> tuple[int, int]:
     """Row groups of a data table that admit any (reviewed, organism_id, accession) key."""
     rows = con.sql(f"""
         SELECT r.file_name, r.row_group_id, r.stats_min_value, r.stats_max_value,
@@ -87,9 +99,10 @@ def two_step_candidates(con, source, keys):
         FROM parquet_metadata({source}) r
         JOIN parquet_metadata({source}) t USING (file_name, row_group_id)
         JOIN parquet_metadata({source}) a USING (file_name, row_group_id)
-        WHERE r.path_in_schema = 'reviewed' AND t.path_in_schema = 'organism_id' AND a.path_in_schema = 'accession'
+        WHERE r.path_in_schema = 'reviewed' AND t.path_in_schema = 'organism_id'
+          AND a.path_in_schema = 'accession'
     """).fetchall()
-    def admits(lo, hi, v):
+    def admits(lo: Any, hi: Any, v: Any) -> bool:
         return lo is None or hi is None or lo <= v <= hi
 
     cand = 0
@@ -104,35 +117,41 @@ def two_step_candidates(con, source, keys):
     return len(rows), cand
 
 
-def run_workloads(con, lake, base, accessions, label, stats=None):
+def run_workloads(con: duckdb.DuckDBPyConnection, lake: str, base: str | None, accessions: Sequence[str], label: str,
+                  stats: dict[str, int] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     src = {t: read_parquet_source(lake, t, base) for t in ("entries", "features", "xrefs", "accession_map")}
-    results = []
+    results: list[dict[str, Any]] = []
     for n in SIZES:
         accs = accessions[:n]
         in_list = ",".join(q(a) for a in accs)
         # step 1 of the two-step form
         t0 = time.perf_counter()
-        keys = con.sql(f"SELECT reviewed, organism_id, primary_accession FROM read_parquet({src['accession_map']}, hive_partitioning = true) "
+        keys = con.sql(f"SELECT reviewed, organism_id, primary_accession "
+                       f"FROM read_parquet({src['accession_map']}, hive_partitioning = true) "
                        f"WHERE accession IN ({in_list})").fetchall()
         step1_ms = (time.perf_counter() - t0) * 1000
         amap_total, amap_cand = candidate_row_groups(con, src["accession_map"], "accession", accs)
         for table in TABLES:
             cols = HOT if table == "entries" else "*"
-            single = f"SELECT {cols} FROM read_parquet({src[table]}, hive_partitioning = true) WHERE accession IN ({in_list})"
-            preds = " OR ".join(f"(reviewed = {str(r).lower()} AND organism_id = {t} AND accession = {q(a)})" for r, t, a in keys)
-            two = f"SELECT {cols} FROM read_parquet({src[table]}, hive_partitioning = true) WHERE {preds}" if keys else single
+            single = (f"SELECT {cols} FROM read_parquet({src[table]}, hive_partitioning = true) "
+                      f"WHERE accession IN ({in_list})")
+            preds = " OR ".join(f"(reviewed = {str(r).lower()} AND organism_id = {t} AND accession = {q(a)})"
+                                for r, t, a in keys)
+            two = (f"SELECT {cols} FROM read_parquet({src[table]}, hive_partitioning = true) WHERE {preds}"
+                   if keys else single)
             for form, sql in (("single", single), ("two_step", two)):
                 con.sql(sql).fetchall()                  # warm-up, outside the counted window
                 if stats is not None:
                     stats["requests"] = 0
                     stats["bytes"] = 0
                 timing = time_query(con, sql, warmup=0, runs=5)
-                row = {"n": n, "table": table, "form": form, **timing}
+                row: dict[str, Any] = {"n": n, "table": table, "form": form, **timing}
                 if stats is not None:
                     row["requests_per_run"] = round(stats["requests"] / 5)
                     row["bytes_per_run"] = round(stats["bytes"] / 5)
                 if form == "single":
-                    row["row_groups_total"], row["candidate_row_groups"] = candidate_row_groups(con, src[table], "accession", accs)
+                    row["row_groups_total"], row["candidate_row_groups"] = candidate_row_groups(
+                        con, src[table], "accession", accs)
                 else:
                     total, cand = two_step_candidates(con, src[table], keys)
                     row["row_groups_total"], row["candidate_row_groups"] = total, cand
@@ -143,25 +162,30 @@ def run_workloads(con, lake, base, accessions, label, stats=None):
                 eprint(f"  [{label}] n={n:5d} {table:8s} {form:8s} {timing['median_ms']:9.2f} ms "
                        f"rg {row['candidate_row_groups']}/{row['row_groups_total']}")
     # Organism workload: default seven columns for one organism
-    organism_id = con.sql(f"SELECT organism_id FROM read_parquet({src['entries']}, hive_partitioning = true) "
-                    f"WHERE accession = {q(accessions[0])}").fetchone()[0]
-    sql = f"SELECT {DEFAULT7} FROM read_parquet({src['entries']}, hive_partitioning = true) WHERE organism_id = {organism_id}"
+    # fetchone() is None only if accessions[0] is not in entries (then TypeError, as before)
+    organism_id = cast(tuple[Any, ...], con.sql(
+        f"SELECT organism_id FROM read_parquet({src['entries']}, hive_partitioning = true) "
+        f"WHERE accession = {q(accessions[0])}").fetchone())[0]
+    sql = (f"SELECT {DEFAULT7} FROM read_parquet({src['entries']}, hive_partitioning = true) "
+           f"WHERE organism_id = {organism_id}")
     con.sql(sql).fetchall()                              # warm-up, outside the counted window
     if stats is not None:
         stats["requests"] = 0
         stats["bytes"] = 0
     timing = time_query(con, sql, warmup=0, runs=3)
-    c3 = {"organism_id": organism_id, **timing}
+    c3: dict[str, Any] = {"organism_id": organism_id, **timing}
     if stats is not None:
         c3["requests_per_run"] = round(stats["requests"] / 3)
         c3["bytes_per_run"] = round(stats["bytes"] / 3)
     return results, c3
 
 
-def pass_criteria(results, c3, baseline_ms=None):
+def pass_criteria(results: Sequence[dict[str, Any]], c3: dict[str, Any],
+                  baseline_ms: float | None = None) -> list[tuple[str, bool | None, str]]:
     """Pass criteria, PASS/FAIL each (bloom-filter criterion is N/A: none written)."""
-    out = []
-    two_entries_1 = next((r for r in results if r["n"] == 1 and r["table"] == "entries" and r["form"] == "two_step"), None)
+    out: list[tuple[str, bool | None, str]] = []
+    two_entries_1 = next((r for r in results if r["n"] == 1 and r["table"] == "entries" and r["form"] == "two_step"),
+                         None)
     if two_entries_1:
         total = two_entries_1["candidate_row_groups"] + two_entries_1["accession_map_row_groups"]
         out.append(("two-step entries lookup reads <= 3 row groups (accession_map + entries)", total <= 3, f"{total}"))
@@ -171,19 +195,21 @@ def pass_criteria(results, c3, baseline_ms=None):
     single_37 = next((r for r in results if r["n"] == 37 and r["table"] == "entries" and r["form"] == "single"), None)
     if two_37 and single_37:
         speedup = single_37["median_ms"] / max(two_37["median_ms"] + two_37["step1_ms"], 1e-6)
-        out.append(("37-accession batch, two-step >= 10x faster than single-step baseline", speedup >= 10, f"{speedup:.1f}x"))
+        out.append(("37-accession batch, two-step >= 10x faster than single-step baseline", speedup >= 10,
+                    f"{speedup:.1f}x"))
     if two_entries_1 and "requests_per_run" in two_entries_1:
         out.append(("over httpfs the two-step form issues < 20 range requests", two_entries_1["requests_per_run"] < 20,
                     f"{two_entries_1['requests_per_run']}"))
     return out
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="Point-lookup benchmark")
     ap.add_argument("--lake", required=True, help="Local lake directory (manifest.json is read from here)")
     ap.add_argument("--url", default=None, help="Optional httpfs base URL of the same lake")
     ap.add_argument("--serve", action="store_true", help="Serve --lake over a local counting HTTP server")
-    ap.add_argument("--accessions", default=None, help="File with one accession per line (default: 1,000 sampled from accession_map)")
+    ap.add_argument("--accessions", default=None,
+                    help="File with one accession per line (default: 1,000 sampled from accession_map)")
     ap.add_argument("--label", default="point_lookup")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "results"))
     ap.add_argument("--seed", type=int, default=1)
@@ -193,15 +219,16 @@ def main():
     con = duckdb.connect()
     if args.accessions:
         with open(args.accessions) as f:
-            accessions = [l.strip() for l in f if l.strip()]
+            accessions = [line.strip() for line in f if line.strip()]
     else:
         src = read_parquet_source(args.lake, "accession_map")
-        accs = [r[0] for r in con.sql(f"SELECT accession FROM read_parquet({src}, hive_partitioning = true)").fetchall()]
+        accs = [r[0] for r in
+                con.sql(f"SELECT accession FROM read_parquet({src}, hive_partitioning = true)").fetchall()]
         random.Random(args.seed).shuffle(accs)
         accessions = accs[:1000]
     eprint(f"{len(accessions)} accessions")
 
-    results = {"lake": os.path.abspath(args.lake), "label": args.label, "n_accessions": len(accessions),
+    results: dict[str, Any] = {"lake": os.path.abspath(args.lake), "label": args.label, "n_accessions": len(accessions),
                "note": "candidate row groups are counted from parquet_metadata min/max statistics; "
                        "DuckDB 1.5.5 does not report row groups scanned, and no bloom filters are written. "
                        "Wall times from --serve (local http.server) include a ~1 s connection artefact; "
@@ -219,7 +246,8 @@ def main():
     elif args.url:
         hcon = duckdb_http_connection()
         eprint(f"[remote {args.url}]")
-        results["remote"], results["remote_c3"] = run_workloads(hcon, args.lake, args.url.rstrip("/"), accessions, "remote")
+        results["remote"], results["remote_c3"] = run_workloads(hcon, args.lake, args.url.rstrip("/"), accessions,
+                                                                "remote")
         results["criteria_remote"] = pass_criteria(results["remote"], results["remote_c3"])
 
     lines = [f"Point-lookup benchmark — {args.label}", "", results["note"], ""]
@@ -235,7 +263,8 @@ def main():
                          f"{human_size(r['bytes_per_run']) if 'bytes_per_run' in r else ''} |")
         c3 = results[f"{scope}_c3"]
         lines.append(f"Default-7-column organism query (organism_id {c3['organism_id']}): {c3['median_ms']} ms"
-                     + (f", {c3['requests_per_run']} requests/run, {human_size(c3['bytes_per_run'])}/run" if "requests_per_run" in c3 else ""))
+                     + (f", {c3['requests_per_run']} requests/run, {human_size(c3['bytes_per_run'])}/run"
+                        if "requests_per_run" in c3 else ""))
         lines.append("")
         lines.append("Pass criteria:")
         for name, ok, detail in results[f"criteria_{scope}"]:

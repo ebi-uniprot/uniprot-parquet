@@ -4,20 +4,21 @@ they must measure the partitioned lake the pipeline writes."""
 import json
 import os
 import sys
+from typing import Any
 
 import pyarrow.parquet as pq
-
 from conftest import PROJECT_ROOT
 
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "benchmarks"))
 
 
-def _manifest(lake_dir):
+def _manifest(lake_dir: str) -> dict[str, Any]:
     with open(os.path.join(lake_dir, "manifest.json")) as f:
-        return json.load(f)
+        manifest: dict[str, Any] = json.load(f)
+        return manifest
 
 
-def test_analyze_storage_reads_every_partition(small_lake):
+def test_analyze_storage_reads_every_partition(small_lake: dict[str, str]) -> None:
     """Every table's bytes and rows, under its review_status= partitions,
     with one column entry per column (not one per row group)."""
     from bench_baseline import analyze_storage
@@ -34,7 +35,7 @@ def test_analyze_storage_reads_every_partition(small_lake):
     assert storage["totals"]["total_parquet_bytes"] > 0
 
 
-def test_extrapolated_file_count_follows_the_target(small_lake):
+def test_extrapolated_file_count_follows_the_target(small_lake: dict[str, str]) -> None:
     """A full release's file count scales with bytes per row and the target,
     one partial file per partition at most, not with the sample's file count."""
     from _bench_common import table_files

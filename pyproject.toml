@@ -22,3 +22,38 @@ Repository = "https://github.com/ebi-uniprot/uniprot-parquet.git"
 
 [tool.setuptools]
 py-modules = ["uniprot_parquet"]
+
+# ─── Linting and type checking (CI runs both: `ruff check .` and `mypy`) ───
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+extend-exclude = ["demo/work", "work", "datalake", "benchmarks/variant_lake"]
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, isort, pyupgrade, bugbear, simplify, ruff-specific
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "RUF001", "RUF002", "RUF003",   # en dashes, arrows and × in strings, docstrings and comments are intended
+    "SIM108",                       # if/else blocks are often clearer than a long ternary
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["uniprot_parquet"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+files = ["bin", "uniprot_parquet.py", "benchmarks", "tests"]
+# bin/ scripts import each other, and tests/ and benchmarks/ import them, by bare module name
+mypy_path = ["bin", "tests", "benchmarks"]
+explicit_package_bases = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+# Treated as untyped (Any) whether or not installed, so a local run and CI's
+# lint job (which installs only duckdb, orjson and pytest) agree.
+module = ["pyarrow", "pyarrow.*", "ijson", "ijson.*", "zstandard", "frictionless", "frictionless.*",
+          "polars", "polars.*", "pandas", "pandas.*", "matplotlib", "matplotlib.*"]
+ignore_missing_imports = true
+follow_imports = "skip"

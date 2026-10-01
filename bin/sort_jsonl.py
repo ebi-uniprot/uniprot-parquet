@@ -21,17 +21,18 @@ Usage:
         [--temp-dir /path/to/scratch]
 """
 
+import argparse
 import os
 import sys
-import argparse
 import time
+from typing import Any
 
 # Allow importing from the same bin/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from duckdb_util import run_main, init_duckdb, _sql_escape
+from duckdb_util import _sql_escape, init_duckdb, run_main
 
 
-def eprint(*args, **kwargs):
+def eprint(*args: object, **kwargs: Any) -> None:
     print(*args, file=sys.stderr, **kwargs)
 
 
@@ -47,7 +48,7 @@ ORDER BY
 """
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Sort UniProtKB JSONL by reviewed status then taxon ID"
     )

@@ -13,22 +13,30 @@ Usage:
     python benchmarks/bench_zstd.py --jsonl slice.sorted.jsonl.zst --out benchmarks/results/
 """
 
+import argparse
 import os
 import sys
-import argparse
 import tempfile
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _bench_common import (  # noqa: E402
-    eprint, human_size, build_lake, table_files, table_bytes, time_query, write_results,
+from _bench_common import (
+    build_lake,
+    eprint,
+    human_size,
+    table_bytes,
+    table_files,
+    time_query,
+    write_results,
 )
 
 LEVELS = (1, 3, 9, 15)
-QUERY = ("SELECT accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary, length "
+QUERY = ("SELECT accession, id, reviewed, organism_id, organism_scientific_name, "
+         "gene_primary, protein_name_primary, length "
          "FROM read_parquet('{lake}/entries/**/*.parquet', hive_partitioning = true) WHERE organism_id = {organism_id}")
 
 
-def measure(jsonl, level, organism_id, memory, tmp_root):
+def measure(jsonl: str, level: int, organism_id: int, memory: str, tmp_root: str) -> dict[str, Any]:
     import duckdb
     outdir = os.path.join(tmp_root, f"zstd_{level}")
     wall = build_lake(jsonl, outdir, only="entries,xrefs", memory=memory,
@@ -41,19 +49,19 @@ def measure(jsonl, level, organism_id, memory, tmp_root):
             "write_s": round(wall, 1), "read_ms_median": timing["median_ms"]}
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="zstd level sweep (entries + xrefs)")
     ap.add_argument("--jsonl", required=True)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "results"))
     ap.add_argument("--organism_id", type=int, default=9606)
     ap.add_argument("--memory", default="4GB")
-    ap.add_argument("--levels", default=",".join(str(l) for l in LEVELS))
+    ap.add_argument("--levels", default=",".join(str(lv) for lv in LEVELS))
     ap.add_argument("--label", default="zstd")
     args = ap.parse_args()
 
-    results = {"jsonl": os.path.abspath(args.jsonl), "rows": []}
+    results: dict[str, Any] = {"jsonl": os.path.abspath(args.jsonl), "rows": []}
     with tempfile.TemporaryDirectory(prefix="bench_zstd_") as tmp:
-        for level in (int(l) for l in args.levels.split(",")):
+        for level in (int(lv) for lv in args.levels.split(",")):
             eprint(f"[level {level}] building entries + xrefs…")
             results["rows"].append(measure(args.jsonl, level, args.organism_id, args.memory, tmp))
 
@@ -62,7 +70,8 @@ def main():
     lines.append("| Level | entries bytes | xrefs bytes | Write time | Read time (organism query) |")
     lines.append("| --- | --- | --- | --- | --- |")
     for r in results["rows"]:
-        lines.append(f"| {r['level']} | {human_size(r['entries_bytes'])} ({r['entries_bytes']/base['entries_bytes']:.2f}×) "
+        lines.append(f"| {r['level']} | {human_size(r['entries_bytes'])} "
+                     f"({r['entries_bytes']/base['entries_bytes']:.2f}×) "
                      f"| {human_size(r['xrefs_bytes'])} ({r['xrefs_bytes']/base['xrefs_bytes']:.2f}×) "
                      f"| {r['write_s']} s ({r['write_s']/base['write_s']:.2f}×) | {r['read_ms_median']} ms |")
     lines.append("")

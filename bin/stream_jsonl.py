@@ -39,6 +39,7 @@ Usage (with sidecar count file for post-hoc verification):
     pigz -dc input.json.gz | python3 stream_jsonl.py --count-file entry_count.txt | ...
 """
 
+import argparse
 import hashlib
 import json
 import os
@@ -46,8 +47,9 @@ import re
 import sys
 import threading
 import time
-import argparse
+from collections.abc import Callable
 from decimal import Decimal
+from typing import BinaryIO
 
 try:
     import ijson.backends.yajl2_c as ijson
@@ -64,7 +66,7 @@ WRITE = sys.stdout.buffer.write
 LOG_INTERVAL = 1_000_000  # log progress every N entries
 
 
-def _exact_number(value):
+def _exact_number(value: object) -> orjson.Fragment:
     """orjson default: a Decimal (ijson, use_float=False) written with its
     own digits."""
     if isinstance(value, Decimal):
@@ -91,7 +93,7 @@ class _SurrogateGuard:
     CONTEXT = 64        # bytes of the previous chunk kept for the next scan
     LOOKAHEAD = 12      # a high surrogate is judged with the escape after it
 
-    def __init__(self, raw):
+    def __init__(self, raw: BinaryIO) -> None:
         self.raw = raw
         self.tail = b""
         self.tail_offset = 0      # stream offset of tail[0]
@@ -99,7 +101,7 @@ class _SurrogateGuard:
         self.paired_low = -1      # stream offset of the low escape after a judged high
 
     @staticmethod
-    def _is_escape(buf, i):
+    def _is_escape(buf: bytes, i: int) -> bool:
         """True if the backslash at buf[i] starts an escape (is not itself
         escaped by an odd run of backslashes before it)."""
         run = 0
@@ -107,7 +109,7 @@ class _SurrogateGuard:
             run += 1
         return run % 2 == 0
 
-    def read(self, n=-1):
+    def read(self, n: int = -1) -> bytes:
         if n == 0:
             return b""
         chunk = self.raw.read(n)
@@ -130,13 +132,13 @@ class _SurrogateGuard:
         return chunk
 
 
-def _sha256_in_thread(path: str):
+def _sha256_in_thread(path: str) -> Callable[[], str]:
     """Start hashing ``path`` in a thread (hashlib releases the GIL on large
     buffers, so it runs beside the parse); the returned function joins it
     and gives the hex digest."""
-    result = {}
+    result: dict[str, str] = {}
 
-    def run():
+    def run() -> None:
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(8 << 20), b""):
@@ -154,7 +156,7 @@ def _sha256_in_thread(path: str):
     return finish
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Streaming UniProtKB JSON → JSONL converter"
     )
@@ -230,6 +232,7 @@ def main():
               file=sys.stderr)
 
     if args.input_manifest:
+        assert source_sha256 is not None   # --source came with --input-manifest (checked above)
         source = {"filename": os.path.basename(args.source),
                   "size_bytes": os.path.getsize(args.source),
                   "sha256": source_sha256(),

@@ -1,27 +1,33 @@
 """Shared helpers for the benchmark scripts (file size, zstd level, point lookup)."""
 
+import glob
+import http.server
+import json
 import os
 import re
-import sys
-import time
-import glob
-import json
 import socket
 import statistics
 import subprocess
+import sys
 import threading
-import http.server
+import time
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, AnyStr, ClassVar, cast
+
+if TYPE_CHECKING:
+    import duckdb
+    from _typeshed import SupportsRead, SupportsWrite
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BIN_DIR = os.path.join(REPO_ROOT, "bin")
 
 
-def eprint(*a, **k):
+def eprint(*a: Any, **k: Any) -> None:
     print(*a, file=sys.stderr, **k)
 
 
-def human_size(nbytes):
+def human_size(nbytes: float) -> str:
     for unit in ("bytes", "KB", "MB", "GB", "TB"):
         if abs(nbytes) < 1024 or unit == "TB":
             return f"{int(nbytes)} bytes" if unit == "bytes" else f"{nbytes:.2f} {unit}"
@@ -29,11 +35,11 @@ def human_size(nbytes):
     return f"{nbytes:.2f} TB"
 
 
-def time_query(con, sql, warmup=1, runs=5):
+def time_query(con: duckdb.DuckDBPyConnection, sql: str, warmup: int = 1, runs: int = 5) -> dict[str, Any]:
     """Run a query several times; timing stats in ms (mirrors bench_baseline._time_query)."""
     for _ in range(warmup):
         con.sql(sql).fetchall()
-    times = []
+    times: list[float] = []
     for _ in range(runs):
         t0 = time.perf_counter()
         result = con.sql(sql).fetchall()
@@ -42,7 +48,8 @@ def time_query(con, sql, warmup=1, runs=5):
             "mean_ms": round(statistics.mean(times), 3), "runs": runs, "row_count": len(result)}
 
 
-def build_lake(jsonl, outdir, only=None, extra=(), memory="4GB", batch_size=None):
+def build_lake(jsonl: str, outdir: str, only: str | None = None, extra: Sequence[str] = (), memory: str = "4GB",
+               batch_size: int | None = None) -> float:
     """Run bin/parquet_transform.py; returns wall seconds."""
     cmd = [sys.executable, os.path.join(BIN_DIR, "parquet_transform.py"), jsonl,
            "--outdir", outdir, "--memory-limit", memory, "--release", "bench", *extra]
@@ -56,11 +63,11 @@ def build_lake(jsonl, outdir, only=None, extra=(), memory="4GB", batch_size=None
     return time.perf_counter() - t0
 
 
-def table_files(lake, table):
+def table_files(lake: str, table: str) -> list[str]:
     return sorted(glob.glob(os.path.join(lake, table, "**", "*.parquet"), recursive=True))
 
 
-def read_parquet_source(lake, table, base=None):
+def read_parquet_source(lake: str, table: str, base: str | None = None) -> str:
     """SQL source for a table: an explicit file list from manifest.json (works
     over plain HTTP, where DuckDB cannot expand a glob), rooted at `base`
     (a URL) or at `lake` (local)."""
@@ -70,35 +77,36 @@ def read_parquet_source(lake, table, base=None):
     return "[" + ", ".join(f"'{root}/{table}/{rel}'" for rel in rels) + "]"
 
 
-def footer_bytes(files):
+def footer_bytes(files: Iterable[str]) -> int:
     import pyarrow.parquet as pq
-    return sum(pq.read_metadata(f).serialized_size for f in files)
+    total: int = sum(pq.read_metadata(f).serialized_size for f in files)
+    return total
 
 
-def table_bytes(files):
+def table_bytes(files: Iterable[str]) -> int:
     return sum(os.path.getsize(f) for f in files)
 
 
 class _CountingHandler(http.server.SimpleHTTPRequestHandler):
     """Static file server with HTTP Range support (DuckDB httpfs reads byte
     ranges) that counts requests and bytes served."""
-    stats = {"requests": 0, "bytes": 0}
+    stats: ClassVar[dict[str, int]] = {"requests": 0, "bytes": 0}
     lock = threading.Lock()
     protocol_version = "HTTP/1.1"      # keep-alive: DuckDB reuses one connection per file
 
-    def log_message(self, *a):
+    def log_message(self, *a: Any) -> None:
         pass
 
-    def _count(self, n=0):
+    def _count(self, n: int = 0) -> None:
         with self.lock:
             self.stats["requests"] += 1 if n == 0 else 0
             self.stats["bytes"] += n
 
-    def do_HEAD(self):
+    def do_HEAD(self) -> None:
         self._count()
         super().do_HEAD()
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         self._count()
         path = self.translate_path(self.path)
         rng = self.headers.get("Range")
@@ -124,7 +132,7 @@ class _CountingHandler(http.server.SimpleHTTPRequestHandler):
         with self.lock:
             self.stats["bytes"] += length
 
-    def copyfile(self, source, outputfile):
+    def copyfile(self, source: SupportsRead[AnyStr], outputfile: SupportsWrite[AnyStr]) -> None:
         data = source.read()
         with self.lock:
             self.stats["bytes"] += len(data)
@@ -132,10 +140,11 @@ class _CountingHandler(http.server.SimpleHTTPRequestHandler):
 
 
 @contextmanager
-def serve_directory(directory):
+def serve_directory(directory: str) -> Iterator[tuple[str, dict[str, int]]]:
     """Serve `directory` over HTTP on a free port; yields (base_url, stats dict)."""
-    handler = type("H", (_CountingHandler,), {"stats": {"requests": 0, "bytes": 0},
-                                              "lock": threading.Lock()})
+    handler = cast(type[_CountingHandler],
+                   type("H", (_CountingHandler,), {"stats": {"requests": 0, "bytes": 0},
+                                                   "lock": threading.Lock()}))
     handler_cls = lambda *a, **k: handler(*a, directory=directory, **k)  # noqa: E731
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -149,7 +158,7 @@ def serve_directory(directory):
         server.shutdown()
 
 
-def duckdb_http_connection():
+def duckdb_http_connection() -> duckdb.DuckDBPyConnection:
     import duckdb
     con = duckdb.connect()
     con.sql("INSTALL httpfs; LOAD httpfs;")
@@ -158,7 +167,7 @@ def duckdb_http_connection():
     return con
 
 
-def write_results(prefix, results, out_dir, text):
+def write_results(prefix: str, results: dict[str, Any], out_dir: str, text: str) -> str:
     os.makedirs(out_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     with open(os.path.join(out_dir, f"{prefix}_{ts}.json"), "w") as f:

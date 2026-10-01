@@ -32,11 +32,12 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import duckdb
 
 
-def _human_size(nbytes):
+def _human_size(nbytes: float) -> str:
     for unit in ("bytes", "KB", "MB", "GB", "TB"):
         if abs(nbytes) < 1024 or unit == "TB":
             if unit == "bytes":
@@ -46,7 +47,12 @@ def _human_size(nbytes):
     return f"{nbytes:.2f} TB"
 
 
-def build_layout_a(con, read_clause, outdir):
+def _row_count(con: duckdb.DuckDBPyConnection, path: str) -> int:
+    # count(*) always returns one row, so fetchone() is never None
+    return cast(tuple[int], con.sql(f"SELECT count(*) FROM read_parquet('{path}')").fetchone())[0]
+
+
+def build_layout_a(con: duckdb.DuckDBPyConnection, read_clause: str, outdir: str) -> float:
     """Layout A: single entries table with full VARIANT."""
     os.makedirs(os.path.join(outdir, "entries"), exist_ok=True)
     out = os.path.join(outdir, "entries", "entries_00001.parquet")
@@ -67,13 +73,13 @@ def build_layout_a(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
 
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout A entries: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
     return elapsed
 
 
-def build_layout_b(con, read_clause, outdir):
+def build_layout_b(con: duckdb.DuckDBPyConnection, read_clause: str, outdir: str) -> float:
     """Layout B: star schema with VARIANT instead of convenience columns."""
     total_elapsed = 0.0
 
@@ -96,7 +102,7 @@ def build_layout_b(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout B entries: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
@@ -121,7 +127,7 @@ def build_layout_b(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout B features: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
@@ -146,7 +152,7 @@ def build_layout_b(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout B xrefs: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
@@ -171,7 +177,7 @@ def build_layout_b(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout B comments: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
@@ -195,14 +201,14 @@ def build_layout_b(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout B publications: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
     return total_elapsed
 
 
-def build_layout_c(con, read_clause, outdir):
+def build_layout_c(con: duckdb.DuckDBPyConnection, read_clause: str, outdir: str) -> float:
     """Layout C: star schema + VARIANT, but big arrays STRIPPED from entries.
 
     The entries VARIANT only contains scalar/small-nested fields (organism,
@@ -249,7 +255,7 @@ def build_layout_c(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout C entries: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
@@ -275,7 +281,7 @@ def build_layout_c(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout C features: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
@@ -300,7 +306,7 @@ def build_layout_c(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout C xrefs: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
@@ -325,7 +331,7 @@ def build_layout_c(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout C comments: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
@@ -349,14 +355,15 @@ def build_layout_c(con, read_clause, outdir):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(out)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    rows = _row_count(con, out)
     print(f"  Layout C publications: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
     return total_elapsed
 
 
-def build_layout_d(con, read_clause, outdir, baseline_entries_path):
+def build_layout_d(con: duckdb.DuckDBPyConnection, read_clause: str, outdir: str,
+                   baseline_entries_path: str) -> float:
     """Layout D: baseline entries (typed columns) + VARIANT child tables.
 
     The hybrid approach — entries keep all 37 convenience columns for fast
@@ -374,7 +381,7 @@ def build_layout_d(con, read_clause, outdir, baseline_entries_path):
     elapsed = time.perf_counter() - t0
     total_elapsed += elapsed
     size = os.path.getsize(dest)
-    rows = con.sql(f"SELECT count(*) FROM read_parquet('{dest}')").fetchone()[0]
+    rows = _row_count(con, dest)
     print(f"  Layout D entries (baseline copy): {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
           file=sys.stderr)
 
@@ -415,14 +422,14 @@ def build_layout_d(con, read_clause, outdir, baseline_entries_path):
         elapsed = time.perf_counter() - t0
         total_elapsed += elapsed
         size = os.path.getsize(out)
-        rows = con.sql(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+        rows = _row_count(con, out)
         print(f"  Layout D {table_name}: {rows:,} rows, {_human_size(size)}, {elapsed:.2f}s",
               file=sys.stderr)
 
     return total_elapsed
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Build VARIANT Parquet lakes")
     parser.add_argument("--input", default="demo/lake/2026_01/sorted.jsonl.zst",
                         help="Path to sorted JSONL(.zst) input")
@@ -478,7 +485,7 @@ def main():
     time_d = build_layout_d(con, read_clause, outdir_d, baseline_entries)
 
     # Summary
-    totals = {}
+    totals: dict[str, int] = {}
     for key, path in [("a", outdir_a), ("b", outdir_b),
                       ("c", outdir_c), ("d", outdir_d)]:
         totals[key] = sum(

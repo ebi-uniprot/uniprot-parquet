@@ -6,7 +6,8 @@ For each target in (256, 512, 1024) MB: build `entries` only from a JSONL
 into a temp dir, serve it over HTTP, run the default-column organism query
 (`WHERE organism_id = 9606`) through DuckDB httpfs, and record files opened, footer
 bytes of those files, data bytes fetched (bytes served by the HTTP server),
-request count and wall time; plus the file bytes the page index adds.  Prints a Markdown table and writes JSON + text under --out.
+request count and wall time; plus the file bytes the page index adds.  Prints
+a Markdown table and writes JSON + text under --out.
 
 Meant for the measurement slice.  On the test fixtures every build is one
 file per side, so the table only shows the mechanics.
@@ -15,33 +16,47 @@ Usage:
     python benchmarks/bench_file_size.py --jsonl slice.sorted.jsonl.zst --out benchmarks/results/
 """
 
+import argparse
+import math
 import os
 import sys
-import math
-import argparse
 import tempfile
+from collections.abc import Sequence
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _bench_common import (  # noqa: E402
-    BIN_DIR, eprint, human_size, build_lake, table_files, footer_bytes, table_bytes,
-    serve_directory, duckdb_http_connection, time_query, write_results, read_parquet_source,
+from _bench_common import (
+    BIN_DIR,
+    build_lake,
+    duckdb_http_connection,
+    eprint,
+    footer_bytes,
+    human_size,
+    read_parquet_source,
+    serve_directory,
+    table_bytes,
+    table_files,
+    time_query,
+    write_results,
 )
-sys.path.insert(0, BIN_DIR)
-from parquet_transform import ROW_GROUP_SIZE  # noqa: E402
 
-QUERY = ("SELECT accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary, length "
+sys.path.insert(0, BIN_DIR)
+from parquet_transform import ROW_GROUP_SIZE
+
+QUERY = ("SELECT accession, id, reviewed, organism_id, organism_scientific_name, "
+         "gene_primary, protein_name_primary, length "
          "FROM read_parquet({source}, hive_partitioning = true) WHERE organism_id = {organism_id}")
 TARGETS_MB = (256, 512, 1024)
 FULL_ENTRIES = 248_000_000
 
 
-def extrapolate_files(files, target_bytes, full_rows=FULL_ENTRIES):
+def extrapolate_files(files: Sequence[str], target_bytes: int, full_rows: int = FULL_ENTRIES) -> int:
     """Files a full release would have at ``target_bytes``: each partition's
     bytes per row scaled to its share of ``full_rows``, in files of the
     target size.  Not the sample's own file count scaled by rows: a sample
     smaller than the target holds one partial file per partition."""
     import pyarrow.parquet as pq
-    by_part = {}
+    by_part: dict[str, tuple[int, int]] = {}
     for f in files:
         size, rows = by_part.get(os.path.dirname(f), (0, 0))
         by_part[os.path.dirname(f)] = (size + os.path.getsize(f), rows + pq.read_metadata(f).num_rows)
@@ -52,13 +67,13 @@ def extrapolate_files(files, target_bytes, full_rows=FULL_ENTRIES):
                for size, _ in by_part.values())
 
 
-def measure(jsonl, target_mb, organism_id, memory, tmp_root):
+def measure(jsonl: str, target_mb: int, organism_id: int, memory: str, tmp_root: str) -> dict[str, Any]:
     outdir = os.path.join(tmp_root, f"target_{target_mb}")
     build_s = build_lake(jsonl, outdir, only="entries", memory=memory,
                          extra=["--target-file-bytes", str(target_mb * 1024 * 1024)])
     files = table_files(outdir, "entries")
-    row = {"target_mb": target_mb, "build_s": round(build_s, 1), "files": len(files),
-           "entries_bytes": table_bytes(files), "footer_bytes_all": footer_bytes(files)}
+    row: dict[str, Any] = {"target_mb": target_mb, "build_s": round(build_s, 1), "files": len(files),
+                           "entries_bytes": table_bytes(files), "footer_bytes_all": footer_bytes(files)}
     import pyarrow.parquet as pq
     n_rows = sum(pq.read_metadata(f).num_rows for f in files)
     row["rows"] = n_rows
@@ -90,7 +105,7 @@ def measure(jsonl, target_mb, organism_id, memory, tmp_root):
     return row
 
 
-def page_index_delta(jsonl, memory, tmp_root):
+def page_index_delta(jsonl: str, memory: str, tmp_root: str) -> dict[str, int]:
     """File bytes with and without write_page_index: each built file
     rewritten both ways with the transform's row-group size, so only the
     page index differs.  File size, not the footer's serialized_size: the
@@ -112,7 +127,7 @@ def page_index_delta(jsonl, memory, tmp_root):
             "delta": sizes[True] - sizes[False]}
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="File-size target benchmark (entries only)")
     ap.add_argument("--jsonl", required=True)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "results"))
@@ -122,7 +137,7 @@ def main():
     ap.add_argument("--label", default="file_size")
     args = ap.parse_args()
 
-    results = {"jsonl": os.path.abspath(args.jsonl), "organism_id": args.organism_id, "rows": []}
+    results: dict[str, Any] = {"jsonl": os.path.abspath(args.jsonl), "organism_id": args.organism_id, "rows": []}
     with tempfile.TemporaryDirectory(prefix="bench_file_size_") as tmp:
         for target in (int(t) for t in args.targets.split(",")):
             eprint(f"[target {target} MB] building entries…")
@@ -131,7 +146,8 @@ def main():
         results["page_index"] = page_index_delta(args.jsonl, args.memory, tmp)
 
     lines = ["File-size target (entries only, organism query over httpfs)", ""]
-    lines.append("| Target | Files (this input) | Files (extrapolated to 248M) | Footer bytes (opened files) | Data bytes (cold) | Footer / data | Requests (cold) | Wall ms (median, warm) |")
+    lines.append("| Target | Files (this input) | Files (extrapolated to 248M) | Footer bytes (opened files) "
+                 "| Data bytes (cold) | Footer / data | Requests (cold) | Wall ms (median, warm) |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for r in results["rows"]:
         lines.append(f"| {r['target_mb']} MB | {r['files']} | {r['files_extrapolated']:,} | "

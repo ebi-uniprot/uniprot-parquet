@@ -18,16 +18,18 @@ Usage:
     sample_jsonl.py [PATH|-] --n N [--where trembl|swissprot|all] [--seed S]
 """
 
-import sys
-import random
 import argparse
+import random
+import sys
+from collections.abc import Iterable, Iterator
+from typing import BinaryIO
 
 SWISSPROT_MARK = b"Swiss-Prot"
 TREMBL_MARK = b"TrEMBL"
 LOG_INTERVAL = 1_000_000
 
 
-def _open_input(path):
+def _open_input(path: str | None) -> BinaryIO:
     if path in (None, "-"):
         return sys.stdin.buffer
     if path.endswith(".zst"):
@@ -36,7 +38,7 @@ def _open_input(path):
     return open(path, "rb")
 
 
-def _line_iter(stream):
+def _line_iter(stream: BinaryIO) -> Iterator[bytes]:
     """Yield complete lines from a binary stream (works on zstd readers)."""
     buf = b""
     while True:
@@ -50,7 +52,7 @@ def _line_iter(stream):
         yield buf
 
 
-def _matches(line, where):
+def _matches(line: bytes, where: str) -> bool:
     if where == "all":
         return True
     # entryType is near the start of every line: "entryType":"UniProtKB reviewed (Swiss-Prot)"
@@ -60,9 +62,10 @@ def _matches(line, where):
     return TREMBL_MARK in head
 
 
-def reservoir_sample(lines, n, where, rng):
+def reservoir_sample(lines: Iterable[bytes], n: int, where: str,
+                     rng: random.Random) -> tuple[list[bytes], int]:
     """Algorithm R over an iterator of raw lines. Returns (sample, seen)."""
-    sample = []
+    sample: list[bytes] = []
     seen = 0
     for line in lines:
         if not line or not _matches(line, where):
@@ -79,7 +82,7 @@ def reservoir_sample(lines, n, where, rng):
     return sample, seen
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Reservoir-sample lines from JSONL(.zst)")
     parser.add_argument("path", nargs="?", default="-",
                         help="JSONL or JSONL.zst path; '-' or omitted reads stdin")

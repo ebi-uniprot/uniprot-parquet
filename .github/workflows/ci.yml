@@ -87,7 +87,7 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -97,11 +97,18 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Check all scripts compile
+      # The libraries mypy needs for their types (DuckDB, orjson and pytest
+      # ship them); the rest are untyped and configured as such in pyproject.toml.
+      - name: Install linters
         run: |
-          for f in bin/*.py benchmarks/*.py uniprot_parquet.py; do
-            python -m py_compile "$f"
-          done
+          python -m pip install --upgrade pip
+          pip install ruff==0.16.10 mypy==2.3.1 duckdb orjson pytest
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Mypy (strict)
+        run: mypy
 
   nextflow:
     runs-on: ubuntu-latest

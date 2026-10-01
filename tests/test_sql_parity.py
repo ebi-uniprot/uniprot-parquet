@@ -76,7 +76,7 @@ def _client_statements() -> dict[tuple[str, str], str]:
     return _statements(sql)
 
 
-def test_same_views_and_macros_defined():
+def test_same_views_and_macros_defined() -> None:
     file_keys = set(_file_statements())
     client_keys = set(_client_statements())
     assert file_keys == client_keys
@@ -84,7 +84,7 @@ def test_same_views_and_macros_defined():
     assert {n for k, n in file_keys if k == "MACRO"} == set(MACRO_NAMES)
 
 
-def test_statement_bodies_match():
+def test_statement_bodies_match() -> None:
     file_stmts = _file_statements()
     client_stmts = _client_statements()
     for key in sorted(file_stmts):

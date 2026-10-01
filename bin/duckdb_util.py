@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import tempfile
+from collections.abc import Callable
 
 import duckdb
 
@@ -64,7 +65,7 @@ def _is_out_of_memory(e: BaseException) -> bool:
             and str(e).startswith("Out of Memory Error"))
 
 
-def run_main(main) -> None:
+def run_main(main: Callable[[], object]) -> None:
     """Run a script's main(); a DuckDB out-of-memory error, wherever it is
     raised, exits EX_TEMPFAIL with a clear message instead of a traceback
     and exit 1."""

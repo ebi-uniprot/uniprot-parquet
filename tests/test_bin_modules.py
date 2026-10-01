@@ -8,7 +8,7 @@ from conftest import PROJECT_ROOT
 WORKFLOW = os.path.join(PROJECT_ROOT, "upjson2lake.nf")
 
 
-def _sibling_imports(script, seen=None):
+def _sibling_imports(script: str, seen: set[str] | None = None) -> set[str]:
     """The bin/ modules ``script`` imports, directly or through each other."""
     import ast
     bin_dir = os.path.join(PROJECT_ROOT, "bin")
@@ -26,7 +26,7 @@ def _sibling_imports(script, seen=None):
     return seen
 
 
-def test_bin_modules_list_every_imported_module():
+def test_bin_modules_list_every_imported_module() -> None:
     """bin_modules(<process>) names exactly the bin/ modules the process's
     scripts import, so a change to one re-runs the process under -resume."""
     import re

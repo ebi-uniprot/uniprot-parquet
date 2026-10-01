@@ -37,6 +37,7 @@ each request (VALIDATE 8, the other heavy processes 4) at the machine's count.
 ```bash
 REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q            # a few minutes; first run fetches a ~4.6K-entry fixture
 REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q --stress   # ~8 min; ~14K entries (one-time ~70 MB fetch); ~8 GB RAM
+ruff check . && mypy                                     # "All checks passed!", "Success: no issues found"
 ```
 
 `REQUIRE_NEXTFLOW=1` makes the workflow tests fail, rather than skip, when

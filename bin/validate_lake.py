@@ -125,28 +125,28 @@ Exit codes:
     1  One or more checks FAILED — do not publish this lake
 """
 
-import os
-import sys
+import argparse
 import json
+import os
 import random
 import re
-import argparse
+import sys
 import time
-from datetime import datetime, timezone
-
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
-import pyarrow.dataset as ds
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import duckdb
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+from duckdb_util import init_duckdb, run_main
+from parquet_transform import CHILD_TABLES, TABLE_DEFS, hash_file
 
-from parquet_transform import CHILD_TABLES, TABLE_DEFS, hash_file, init_duckdb
-from duckdb_util import run_main
 
-
-def eprint(*args, **kwargs):
+def eprint(*args: Any, **kwargs: Any) -> None:
     print(*args, file=sys.stderr, **kwargs)
 
 
@@ -156,14 +156,15 @@ def eprint(*args, **kwargs):
 # connection would take 80% of the node's memory and every core, and spill
 # wherever it likes.
 
-_DUCKDB = {"con": None, "settings": ("16GB", None, None)}
+_DUCKDB: dict[str, Any] = {"con": None, "settings": ("16GB", None, None)}
 
 
-def _duckdb():
+def _duckdb() -> duckdb.DuckDBPyConnection:
     """The validator's DuckDB connection (init_duckdb), opened on first use."""
     if _DUCKDB["con"] is None:
         _DUCKDB["con"] = init_duckdb(*_DUCKDB["settings"])
-    return _DUCKDB["con"]
+    con: duckdb.DuckDBPyConnection = _DUCKDB["con"]
+    return con
 
 
 # ─── Parquet reading helpers ──────────────────────────────────────────
@@ -172,7 +173,7 @@ def _duckdb():
 ALL_TABLES = [name for name, _, _ in TABLE_DEFS]
 
 
-def _table_files(lake_dir, table_name):
+def _table_files(lake_dir: str, table_name: str) -> list[str]:
     """Every Parquet file of a table, recursively (Hive partition dirs), sorted
     so review_status=swissprot files precede review_status=trembl files.
 
@@ -186,7 +187,7 @@ def _table_files(lake_dir, table_name):
                   for f in files if f.endswith(".parquet"))
 
 
-def _table_glob(lake_dir, table_name):
+def _table_glob(lake_dir: str, table_name: str) -> str:
     """DuckDB glob for a table: `**` crosses the partition directories (the
     form the README recommends, so the validator reads what users read).
 
@@ -198,12 +199,12 @@ def _table_glob(lake_dir, table_name):
     return os.path.join(lake_dir, table_name, "**", "*.parquet")
 
 
-def _sql_in_list(values):
+def _sql_in_list(values: Iterable[str]) -> str:
     """The inside of a SQL ``IN (...)``: each value as a quoted string literal."""
     return ",".join("'" + v.replace("'", "''") + "'" for v in values)
 
 
-def open_table(lake_dir, table_name):
+def open_table(lake_dir: str, table_name: str) -> ds.Dataset:
     """Open a table as a PyArrow dataset over its explicit, sorted file list
     (lazy, bounded memory).  No Hive columns are added: the validator sees
     exactly the stored schema."""
@@ -213,9 +214,10 @@ def open_table(lake_dir, table_name):
     return ds.dataset(_table_files(lake_dir, table_name), format="parquet")
 
 
-def count_rows(dataset):
+def count_rows(dataset: ds.Dataset) -> int:
     """Count total rows in a Parquet dataset."""
-    return dataset.count_rows()
+    n: int = dataset.count_rows()
+    return n
 
 
 # ─── JSONL ground truth helpers ────────────────────────────────────────
@@ -231,13 +233,12 @@ def count_jsonl_lines(jsonl_path: str) -> int:
     if jsonl_path.endswith(".zst"):
         import zstandard as zstd
         dctx = zstd.ZstdDecompressor()
-        with open(jsonl_path, "rb") as f:
-            with dctx.stream_reader(f) as reader:
-                while True:
-                    chunk = reader.read(16 * 1024 * 1024)  # 16 MB chunks
-                    if not chunk:
-                        break
-                    count += chunk.count(b"\n")
+        with open(jsonl_path, "rb") as f, dctx.stream_reader(f) as reader:
+            while True:
+                chunk = reader.read(16 * 1024 * 1024)  # 16 MB chunks
+                if not chunk:
+                    break
+                count += chunk.count(b"\n")
     else:
         with open(jsonl_path, "rb") as f:
             for _ in f:
@@ -245,18 +246,18 @@ def count_jsonl_lines(jsonl_path: str) -> int:
     return count
 
 
-def _open_jsonl_lines(jsonl_path: str):
+def _open_jsonl_lines(jsonl_path: str) -> Iterator[bytes]:
     """Yield the lines of a JSONL(.zst) file as bytes, handling
     decompression.  Bytes, not text: nearly every line of a ~1 TB stream is
     only counted, so decoding it to str would be wasted work (json.loads
     takes the bytes of a sampled line directly)."""
     if jsonl_path.endswith(".zst"):
-        import zstandard as zstd
         import io
+
+        import zstandard as zstd
         dctx = zstd.ZstdDecompressor()
-        with open(jsonl_path, "rb") as f:
-            with dctx.stream_reader(f) as reader:
-                yield from io.BufferedReader(reader, buffer_size=16 << 20)
+        with open(jsonl_path, "rb") as f, dctx.stream_reader(f) as reader:
+            yield from io.BufferedReader(reader, buffer_size=16 << 20)
     else:
         with open(jsonl_path, "rb") as f:
             yield from f
@@ -268,13 +269,13 @@ def _open_jsonl_lines(jsonl_path: str):
 _ENTRY_TYPE_RE = re.compile(rb'"entryType"\s*:\s*"([^"]*)"')
 
 
-def _is_reviewed(entry: dict) -> bool:
+def _is_reviewed(entry: dict[str, Any]) -> bool:
     """Swiss-Prot (True) or TrEMBL (False), as the sampler classifies a line."""
     return "Swiss-Prot" in (entry.get("entryType") or "")
 
 
 def sample_and_count_jsonl(jsonl_path: str, n: int, seed: int = 42,
-                           n_reviewed: int | None = None) -> tuple[list[dict], int, int]:
+                           n_reviewed: int | None = None) -> tuple[list[dict[str, Any]], int, int]:
     """Reservoir-sample parsed entries from a JSONL(.zst) file, stratified,
     and count its non-empty lines, in a single decompression pass.
 
@@ -319,25 +320,25 @@ def sample_and_count_jsonl(jsonl_path: str, n: int, seed: int = 42,
 
 
 def sample_jsonl_entries(jsonl_path: str, n: int,
-                         seed: int = 42) -> list[dict]:
+                         seed: int = 42) -> list[dict[str, Any]]:
     """Reservoir-sample N Swiss-Prot and N TrEMBL parsed entries from a JSONL(.zst) file."""
     return sample_and_count_jsonl(jsonl_path, n, seed)[0]
 
 
-def _spot_subsample(sampled: list[dict], n: int, seed: int = 42,
-                    n_reviewed: int | None = None) -> list[dict]:
+def _spot_subsample(sampled: list[dict[str, Any]], n: int, seed: int = 42,
+                    n_reviewed: int | None = None) -> list[dict[str, Any]]:
     """A deterministic subsample of the shared JSONL sample, for the checks
     that honour --spot-check-n: up to ``n_reviewed`` (default ``n``)
     Swiss-Prot and ``n`` TrEMBL entries (the shared sample holds
     max(spot_check_n, 1000) of each)."""
-    out = []
+    out: list[dict[str, Any]] = []
     for stratum, k in ((True, n if n_reviewed is None else n_reviewed), (False, n)):
         part = [e for e in sampled if _is_reviewed(e) == stratum]
         out += part if k >= len(part) else random.Random(seed).sample(part, k)
     return out
 
 
-def _strata(entries) -> str:
+def _strata(entries: Iterable[dict[str, Any]]) -> str:
     """'x Swiss-Prot + y TrEMBL' for a list of entries."""
     entries = list(entries)
     reviewed = sum(map(_is_reviewed, entries))
@@ -349,14 +350,14 @@ def _strata(entries) -> str:
 class ValidationReport:
     """Accumulates pass/fail checks and produces a report."""
 
-    def __init__(self):
-        self.checks = []          # formatted lines, including section headers
-        self.records = []         # one dict per check, for validation_report.json
-        self.warnings = []        # informational findings; never fail the lake
+    def __init__(self) -> None:
+        self.checks: list[str] = []            # formatted lines, including section headers
+        self.records: list[dict[str, Any]] = []  # one dict per check, for validation_report.json
+        self.warnings: list[dict[str, str]] = []  # informational findings; never fail the lake
         self.failures = 0
-        self.elapsed_s = None
+        self.elapsed_s: float | None = None
 
-    def warn(self, name: str, detail: str = ""):
+    def warn(self, name: str, detail: str = "") -> None:
         entry = f"  [WARN] {name}"
         if detail:
             entry += f"  —  {detail}"
@@ -364,11 +365,11 @@ class ValidationReport:
         self.warnings.append({"name": name, "detail": detail})
         eprint(entry)
 
-    def note(self, text: str):
+    def note(self, text: str) -> None:
         self.checks.append(f"  [INFO] {text}")
         eprint(f"  [INFO] {text}")
 
-    def check(self, name: str, passed: bool, detail: str = ""):
+    def check(self, name: str, passed: bool, detail: str = "") -> None:
         status = "PASS" if passed else "FAIL"
         if not passed:
             self.failures += 1
@@ -390,11 +391,11 @@ class ValidationReport:
             f"{self.failures} failed, {len(self.warnings)} warnings"
         )
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """Machine-readable form of the report (validation_report.json)."""
         return {
             "passed": self.passed(),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
             "summary": self.summary(),
             "elapsed_s": self.elapsed_s,
             "checks": list(self.records),
@@ -405,7 +406,7 @@ class ValidationReport:
         lines = [
             "=" * 70,
             "UNIPROT PARQUET DATA LAKE — PRODUCTION VALIDATION REPORT",
-            f"Generated: {datetime.now(timezone.utc).isoformat()}",
+            f"Generated: {datetime.now(UTC).isoformat()}",
             "=" * 70,
         ]
         for entry in self.checks:
@@ -421,7 +422,8 @@ class ValidationReport:
 # ─── Individual check implementations ─────────────────────────────────
 
 
-def check_completeness(report, lake_dir, jsonl_count, expected_count=None):
+def check_completeness(report: ValidationReport, lake_dir: str, jsonl_count: int,
+                       expected_count: int | None = None) -> None:
     """Verify row counts match the JSONL ground truth.
 
     ``expected_count`` is the entry count recorded upstream of the sort
@@ -470,7 +472,7 @@ def check_completeness(report, lake_dir, jsonl_count, expected_count=None):
         )
 
 
-def check_uniqueness(report, lake_dir):
+def check_uniqueness(report: ValidationReport, lake_dir: str) -> tuple[int, int]:
     """Verify entries.accession has no duplicates.  Returns (total, unique_count).
 
     Uses DuckDB aggregation instead of materializing 250M accessions into a
@@ -481,10 +483,10 @@ def check_uniqueness(report, lake_dir):
     eprint("\n--- 2. UNIQUENESS ---")
 
     entries_path = _table_glob(lake_dir, "entries")
-    row = _duckdb().sql(f"""
+    row = cast(tuple[Any, ...], _duckdb().sql(f"""
         SELECT count(*) AS total, count(DISTINCT accession) AS unique_count
         FROM read_parquet('{entries_path}', hive_partitioning = false)
-    """).fetchone()
+    """).fetchone())
     total, unique_count = row
     dupes = total - unique_count
 
@@ -496,7 +498,7 @@ def check_uniqueness(report, lake_dir):
     return total, unique_count
 
 
-def check_null_keys(report, lake_dir, jsonl_unclassified=None):
+def check_null_keys(report: ValidationReport, lake_dir: str, jsonl_unclassified: int | None = None) -> None:
     """Verify critical columns are never null and identity columns have no
     empty strings, that entryType holds only known values, and (given the
     sampler's count) that every JSONL line has an entryType."""
@@ -539,7 +541,8 @@ def check_null_keys(report, lake_dir, jsonl_unclassified=None):
 
     from parquet_transform import ENTRY_TYPES
     entry_types = [v for (v,) in _duckdb().sql(
-        f"SELECT DISTINCT entryType FROM read_parquet('{_table_glob(lake_dir, 'entries')}', hive_partitioning = false)").fetchall()]
+        f"SELECT DISTINCT entryType FROM read_parquet('{_table_glob(lake_dir, 'entries')}', "
+        f"hive_partitioning = false)").fetchall()]
     unknown = sorted((v for v in entry_types if v not in ENTRY_TYPES), key=str)
     report.check("entries.entryType values are known", not unknown,
                  f"unknown: {unknown}" if unknown else "")
@@ -567,7 +570,7 @@ def check_null_keys(report, lake_dir, jsonl_unclassified=None):
             )
 
 
-def check_referential_integrity(report, lake_dir, entry_count):
+def check_referential_integrity(report: ValidationReport, lake_dir: str, entry_count: int) -> None:
     """Verify every accession in child tables exists in entries.
 
     Uses DuckDB anti-joins instead of Python iteration for scalability
@@ -617,13 +620,13 @@ class _SortChecker:
     ``key_fn(*values) -> tuple`` builds the comparable key used at batch
     boundaries.  ``detail`` is empty until the first row out of order."""
 
-    def __init__(self, columns, key_fn):
+    def __init__(self, columns: Iterable[str], key_fn: Callable[..., tuple[Any, ...]]) -> None:
         self.columns, self.key_fn = list(columns), key_fn
         self.detail = ""
         self._row_offset = 0
-        self._prev_last = None
+        self._prev_last: tuple[Any, ...] | None = None
 
-    def feed(self, batch):
+    def feed(self, batch: pa.RecordBatch) -> None:
         n = batch.num_rows
         if self.detail or n == 0:
             return
@@ -635,7 +638,7 @@ class _SortChecker:
             if self.key_fn(*self._prev_last) > self.key_fn(*first):
                 self.detail = (
                     f"disorder at row {self._row_offset}: "
-                    + ", ".join(f"{c}={a}→{b}" for c, a, b in zip(self.columns, self._prev_last, first))
+                    + ", ".join(f"{c}={a}→{b}" for c, a, b in zip(self.columns, self._prev_last, first, strict=True))
                 )
                 return
 
@@ -646,7 +649,7 @@ class _SortChecker:
             nxt = [c.slice(1, n - 1) for c in cols]
             any_disorder = pc.and_(pc.invert(prev[0]), nxt[0])             # false → true
             prefix_equal = pc.equal(prev[0], nxt[0])
-            for p, q in zip(prev[1:], nxt[1:]):
+            for p, q in zip(prev[1:], nxt[1:], strict=True):
                 any_disorder = pc.or_(any_disorder, pc.and_(prefix_equal, pc.greater(p, q)))
                 prefix_equal = pc.and_(prefix_equal, pc.equal(p, q))
 
@@ -655,7 +658,7 @@ class _SortChecker:
                 self.detail = (
                     f"disorder at row {self._row_offset + idx + 1}: "
                     + ", ".join(f"{c}={col[idx].as_py()}→{col[idx + 1].as_py()}"
-                                for c, col in zip(self.columns, cols))
+                                for c, col in zip(self.columns, cols, strict=True))
                 )
                 return
 
@@ -663,7 +666,8 @@ class _SortChecker:
         self._row_offset += n
 
 
-def _check_sorted(dataset, columns, key_fn):
+def _check_sorted(dataset: ds.Dataset, columns: Sequence[str],
+                  key_fn: Callable[..., tuple[Any, ...]]) -> tuple[bool, str]:
     """Stream ``dataset`` through a _SortChecker; (is_sorted, detail)."""
     checker = _SortChecker(columns, key_fn)
     for batch in dataset.to_batches(columns=list(columns)):
@@ -676,8 +680,11 @@ def _check_sorted(dataset, columns, key_fn):
 # Child table → (array position column, entries count column)
 CHILD_INDEX = {table: (index, count) for table, (_, index, count) in CHILD_TABLES.items()}
 
+# An (accession, n) pair of arrays: n rows, or array elements, per accession
+_Run = tuple[pa.Array, pa.Array]
 
-def check_sort_order(report, lake_dir):
+
+def check_sort_order(report: ValidationReport, lake_dir: str) -> None:
     """Verify every table is sorted by its declared order, and that each child
     table's array positions are exactly 0..n-1 per accession.  Each child
     table is read once: the same batches feed both checks."""
@@ -689,25 +696,26 @@ def check_sort_order(report, lake_dir):
     assert all(o[0] == "reviewed DESC" and all(c.endswith(" ASC") for c in o[1:])
                for o in orders.values()), orders
 
-    def columns_of(table_name):
+    def columns_of(table_name: str) -> list[str]:
         return [c.split()[0] for c in orders[table_name]]
 
-    def key(reviewed, *rest):
+    def key(reviewed: bool, *rest: Any) -> tuple[Any, ...]:
         return (not reviewed, *rest)
 
-    def label(table_name):
+    def label(table_name: str) -> str:
         return f"{table_name} sorted by ({', '.join(orders[table_name])})"
 
     is_sorted, detail = _check_sorted(open_table(lake_dir, "entries"), columns_of("entries"), key)
     report.check(label("entries"), is_sorted, detail)
 
     entries = open_table(lake_dir, "entries")
-    positions = []
+    positions: list[tuple[str, bool, str]] = []
     for table_name, (idx, count_col) in CHILD_INDEX.items():
         columns = columns_of(table_name)
         checker = _SortChecker(columns, key)
 
-        def fed(dataset, checker=checker, columns=columns):
+        def fed(dataset: ds.Dataset, checker: _SortChecker = checker,
+                columns: list[str] = columns) -> Iterator[pa.RecordBatch]:
             for batch in dataset.to_batches(columns=columns):
                 checker.feed(batch)
                 yield batch
@@ -727,13 +735,13 @@ def check_sort_order(report, lake_dir):
         report.check(name, ok, detail)
 
 
-def _index_runs(batches, idx, problem):
+def _index_runs(batches: Iterable[pa.RecordBatch], idx: str, problem: list[str]) -> Iterator[_Run]:
     """Stream a child table's record ``batches`` (holding ``accession`` and ``idx``)
     in stored order; yield (accession, n) array pairs, one per accession in order
     (n = its row count).  Stops at the first row whose ``idx`` is not 0 on a
     new accession or the previous row's + 1, recording it in ``problem``.
     With indices contiguous from 0, n = last index + 1."""
-    carry = None                                    # (accession, idx) of the last row so far
+    carry: tuple[Any, Any] | None = None            # (accession, idx) of the last row so far
     for batch in batches:
         if batch.num_rows == 0:
             continue
@@ -742,7 +750,7 @@ def _index_runs(batches, idx, problem):
         # Row 0 is compared with the carried row; rows 1.. with the row before
         # (zero-copy slices).
         continues = carry is not None and accession[0].as_py() == carry[0]
-        first_expected = carry[1] + 1 if continues else 0
+        first_expected = carry[1] + 1 if continues and carry is not None else 0
         if pos[0].as_py() != first_expected:
             problem.append(f"{accession[0].as_py()}: {idx} {pos[0].as_py()} where "
                            f"{first_expected} was expected")
@@ -768,18 +776,19 @@ def _index_runs(batches, idx, problem):
         yield pa.array([carry[0]]), pa.array([carry[1] + 1])
 
 
-def _expected_runs(entries, count_col):
+def _expected_runs(entries: ds.Dataset, count_col: str) -> Iterator[_Run]:
     """(accession, count) array pairs of every entry with count > 0, in stored order."""
     for batch in entries.to_batches(columns=["accession", count_col]):
         keep = pc.greater(batch.column(1), 0)
         yield batch.column(0).filter(keep), batch.column(1).filter(keep)
 
 
-def _aligned(left, right):
+def _aligned(left: Iterable[_Run], right: Iterable[_Run]) -> Iterator[tuple[_Run | None, _Run | None]]:
     """Pair two streams of (accession, n) arrays as equal-length slices; the last
     pair has None on the side that ran out first (both None when both did)."""
     left, right = iter(left), iter(right)
-    x = y = None
+    x: _Run | None = None
+    y: _Run | None = None
     while True:
         while x is None or len(x[0]) == 0:
             x = next(left, None)
@@ -797,19 +806,20 @@ def _aligned(left, right):
         x, y = (x[0].slice(k), x[1].slice(k)), (y[0].slice(k), y[1].slice(k))
 
 
-def _check_array_positions(child_batches, idx, entries, count_col):
+def _check_array_positions(child_batches: Iterable[pa.RecordBatch], idx: str, entries: ds.Dataset,
+                           count_col: str) -> tuple[bool, str]:
     """Single streaming pass over a child table's record batches: every
     accession's ``idx`` runs 0..n-1 in stored order, and the accessions with
     rows, and their n, are exactly the entries with ``count_col`` > 0, in the
     same (reviewed, organism_id, accession) order.  Returns (ok, detail)."""
-    problem = []
+    problem: list[str] = []
     for got, want in _aligned(_index_runs(child_batches, idx, problem),
                               _expected_runs(entries, count_col)):
         if problem:
             return False, problem[0]
-        if got is None and want is None:
-            break
         if want is None:
+            if got is None:
+                break
             return False, f"{got[0][0].as_py()}: {got[1][0].as_py()} rows, no entry with {count_col} > 0"
         if got is None:
             return False, f"{want[0][0].as_py()}: no rows, {count_col} = {want[1][0].as_py()}"
@@ -824,7 +834,8 @@ def _check_array_positions(child_batches, idx, entries, count_col):
     return True, ""
 
 
-def check_round_trip(report, lake_dir, sampled_entries, n, n_reviewed=None):
+def check_round_trip(report: ValidationReport, lake_dir: str, sampled_entries: list[dict[str, Any]], n: int,
+                     n_reviewed: int | None = None) -> None:
     """Spot-check n TrEMBL and n_reviewed Swiss-Prot entries from the shared
     JSONL sample against the lake."""
     report.checks.append(f"\n--- 6. ROUND-TRIP SPOT CHECK (n={n}) ---")
@@ -837,7 +848,7 @@ def check_round_trip(report, lake_dir, sampled_entries, n, n_reviewed=None):
         return
 
     # Build lookup from JSONL
-    jsonl_lookup = {}
+    jsonl_lookup: dict[str, dict[str, Any]] = {}
     for entry in sampled:
         accession = entry.get("primaryAccession")
         if not accession:
@@ -867,7 +878,7 @@ def check_round_trip(report, lake_dir, sampled_entries, n, n_reviewed=None):
     # Read matching entries from lake via DuckDB (avoids scanning all 250M rows in Python)
     entries_path = _table_glob(lake_dir, "entries")
     acc_list = list(jsonl_lookup.keys())
-    lake_lookup = {}
+    lake_lookup: dict[str, dict[str, Any]] = {}
     try:
         rows = _duckdb().sql(f"""
             SELECT accession, organism_id, length, feature_count,
@@ -901,7 +912,7 @@ def check_round_trip(report, lake_dir, sampled_entries, n, n_reviewed=None):
 
     mismatches = {"organism_id": 0, "length": 0, "feature_count": 0,
                   "xref_count": 0, "comment_count": 0, "reference_count": 0}
-    mismatch_examples = {}
+    mismatch_examples: dict[str, tuple[str, Any, Any]] = {}
 
     for accession, expected in jsonl_lookup.items():
         if accession not in lake_lookup:
@@ -927,13 +938,13 @@ def check_round_trip(report, lake_dir, sampled_entries, n, n_reviewed=None):
         )
 
 
-def check_parquet_integrity(report, lake_dir):
+def check_parquet_integrity(report: ValidationReport, lake_dir: str) -> None:
     """Verify every Parquet file in the lake is readable."""
     report.checks.append("\n--- 7. PARQUET FILE INTEGRITY ---")
     eprint("\n--- 7. PARQUET FILE INTEGRITY ---")
 
     total_files = 0
-    corrupt_files = []
+    corrupt_files: list[tuple[str, str]] = []
 
     for table_name in ALL_TABLES:
         table_dir = os.path.join(lake_dir, table_name)
@@ -956,7 +967,7 @@ def check_parquet_integrity(report, lake_dir):
         report.checks.append(f"    CORRUPT: {fpath} — {err}")
 
 
-def check_manifest(report, lake_dir, workers=None):
+def check_manifest(report: ValidationReport, lake_dir: str, workers: int | None = None) -> None:
     """Verify manifest.json exists and is consistent with actual files.
     ``workers`` files are hashed at a time (hashlib releases the GIL)."""
     report.checks.append("\n--- 8. MANIFEST CONSISTENCY ---")
@@ -993,7 +1004,7 @@ def check_manifest(report, lake_dir, workers=None):
         # Per-file size, SHA-256 and MD5: "what we published is what we built".
         details = table_info.get("file_details") or {}
 
-        def problem(rel):
+        def problem(rel: str, details: dict[str, Any] = details, table_dir: str = table_dir) -> str | None:
             d = details.get(rel)
             path = os.path.join(table_dir, rel)
             if not d:
@@ -1010,7 +1021,7 @@ def check_manifest(report, lake_dir, workers=None):
         report.check(f"{table_name}: {n - len(bad)}/{n} file hashes match", not bad, "; ".join(bad[:3]))
 
 
-def check_denormalized_sync(report, lake_dir):
+def check_denormalized_sync(report: ValidationReport, lake_dir: str) -> None:
     """Verify that denormalized parent columns in child tables match entries.
 
     Uses DuckDB joins instead of Python dicts for scalability (entries alone
@@ -1025,13 +1036,13 @@ def check_denormalized_sync(report, lake_dir):
         child_path = _table_glob(lake_dir, child_name)
         t0 = time.time()
         try:
-            result = _duckdb().sql(f"""
+            result = cast(tuple[Any, ...], _duckdb().sql(f"""
                 SELECT
                     count(*) FILTER (WHERE c.organism_id != e.organism_id) AS taxid_mismatches,
                     count(*) FILTER (WHERE c.reviewed != e.reviewed) AS reviewed_mismatches
                 FROM read_parquet('{child_path}', hive_partitioning = false) c
                 JOIN read_parquet('{entries_path}', hive_partitioning = false) e ON c.accession = e.accession
-            """).fetchone()
+            """).fetchone())
             taxid_mismatches = result[0]
             reviewed_mismatches = result[1]
             elapsed = time.time() - t0
@@ -1056,7 +1067,7 @@ def check_denormalized_sync(report, lake_dir):
             )
 
 
-def check_sequence_integrity(report, lake_dir):
+def check_sequence_integrity(report: ValidationReport, lake_dir: str) -> None:
     """Verify the length of sequence.value equals length."""
     report.checks.append("\n--- 10. SEQUENCE INTEGRITY ---")
     eprint("\n--- 10. SEQUENCE INTEGRITY ---")
@@ -1064,7 +1075,7 @@ def check_sequence_integrity(report, lake_dir):
     entries_ds = open_table(lake_dir, "entries")
     mismatches = 0
     zero_length = 0
-    mismatch_examples = []
+    mismatch_examples: list[str] = []
 
     for batch in entries_ds.to_batches(columns=["accession", "sequence", "length"]):
         seq_lens = batch.column("length")
@@ -1101,14 +1112,14 @@ def check_sequence_integrity(report, lake_dir):
     )
 
 
-def check_feature_coordinates(report, lake_dir):
+def check_feature_coordinates(report: ValidationReport, lake_dir: str) -> None:
     """Verify feature start_pos <= end_pos where both are non-null."""
     report.checks.append("\n--- 11. FEATURE COORDINATE BOUNDARIES ---")
     eprint("\n--- 11. FEATURE COORDINATE BOUNDARIES ---")
 
     features_ds = open_table(lake_dir, "features")
     inverted = 0
-    inversion_examples = []
+    inversion_examples: list[str] = []
 
     for batch in features_ds.to_batches(
         columns=["accession", "type", "start_pos", "end_pos"]
@@ -1148,7 +1159,7 @@ def check_feature_coordinates(report, lake_dir):
         report.checks.append(f"    {ex}")
 
 
-def check_schema_types(report, lake_dir):
+def check_schema_types(report: ValidationReport, lake_dir: str) -> None:
     """Verify every shortcut column has its declared type (COLUMN_TYPES).
     Source columns are not checked: their type follows the input by design."""
     report.checks.append("\n--- 12. SHORTCUT COLUMN TYPES ---")
@@ -1157,13 +1168,13 @@ def check_schema_types(report, lake_dir):
     # COLUMN_TYPES holds the DuckDB type of every shortcut column: whatever
     # DuckDB inferred, and whether or not a build's input had the source.
     from parquet_transform import COLUMN_TYPES
-    by_table = {}
+    by_table: dict[str, dict[str, str]] = {}
     for (table_name, col_name), expected in COLUMN_TYPES.items():
         by_table.setdefault(table_name, {})[col_name] = expected
     for table_name, columns in sorted(by_table.items()):
         path = _table_glob(lake_dir, table_name)
         rel = _duckdb().sql(f"SELECT * FROM read_parquet('{path}', hive_partitioning = false) LIMIT 0")
-        actual = {c: str(t) for c, t in zip(rel.columns, rel.types)}
+        actual = {c: str(t) for c, t in zip(rel.columns, rel.types, strict=False)}
         mismatches = [f"{c}: expected {e}, actual {actual.get(c)}"
                       for c, e in columns.items() if actual.get(c) != e]
         report.check(
@@ -1173,7 +1184,7 @@ def check_schema_types(report, lake_dir):
         )
 
 
-def check_curated_coverage(report, lake_dir, release=False):
+def check_curated_coverage(report: ValidationReport, lake_dir: str, release: bool = False) -> None:
     """Report a shortcut column that holds no value in any row: a source
     field UniProt renamed or dropped leaves it a typed NULL (or empty list)
     throughout while its data moves to a new source column, so
@@ -1227,7 +1238,7 @@ def check_curated_coverage(report, lake_dir, release=False):
                 report.note(f"{table_name}: every shortcut column has values")
 
 
-def check_field_completeness(report, lake_dir, sampled_entries):
+def check_field_completeness(report: ValidationReport, lake_dir: str, sampled_entries: list[dict[str, Any]]) -> None:
     """Every source field is a source column.
 
     The transform makes one column per top-level key of each table's JSON
@@ -1245,11 +1256,11 @@ def check_field_completeness(report, lake_dir, sampled_entries):
     if not sampled:
         report.check("field completeness sample non-empty", False, "no entries sampled")
         return
-    columns = {t: _duckdb().sql(f"SELECT * FROM read_parquet('{_table_glob(lake_dir, t)}', hive_partitioning = false) "
-                                f"LIMIT 0").columns
+    columns = {t: _duckdb().sql(f"SELECT * FROM read_parquet('{_table_glob(lake_dir, t)}', "
+                                f"hive_partitioning = false) LIMIT 0").columns
                for t in ("entries", *CHILD_TABLES)}
     arrays = {array: table for table, (array, _, _) in CHILD_TABLES.items()}
-    missing = set()
+    missing: set[str] = set()
     for entry in sampled:
         for key, value in entry.items():
             if key in arrays:
@@ -1283,7 +1294,7 @@ TEXT_COMMENT_TYPES = {
 }
 
 
-def check_text_value(report, lake_dir):
+def check_text_value(report: ValidationReport, lake_dir: str) -> None:
     """Text-bearing comment types must have a populated text_value.
 
     Only TEXT_COMMENT_TYPES are aggregated: in every other type text_value
@@ -1310,13 +1321,18 @@ def check_text_value(report, lake_dir):
         report.check(f"comments.text_value populated for {ctype}", with_text == n, detail)
 
 
-def _sampled_originals(sampled_entries, n, n_reviewed=None):
+# fetch_sample_rows' result: {table: {accession: [row, ...]}}
+_SampleRows = dict[str, dict[str, list[dict[str, Any]]]]
+
+
+def _sampled_originals(sampled_entries: list[dict[str, Any]], n: int,
+                       n_reviewed: int | None = None) -> dict[str, dict[str, Any]]:
     """{accession: entry} for the subsample checks 16 and 21 share."""
     return {e["primaryAccession"]: e for e in _spot_subsample(sampled_entries, n, n_reviewed=n_reviewed)
             if e.get("primaryAccession")}
 
 
-def fetch_sample_rows(lake_dir, accessions):
+def fetch_sample_rows(lake_dir: str, accessions: Collection[str]) -> _SampleRows:
     """{table: {accession: [row, ...]}}: every table's rows for the sampled
     entries, as rows_from_arrow dicts (JSON decoded, MAPs as dicts).
     accession_map rows are grouped by primary_accession, the entry they
@@ -1324,15 +1340,16 @@ def fetch_sample_rows(lake_dir, accessions):
     from reconstruct import rows_from_arrow
     in_list = _sql_in_list(accessions)
 
-    def fetch(table, key):
+    def fetch(table: str, key: str) -> dict[str, list[dict[str, Any]]]:
         path = _table_glob(lake_dir, table)
-        tbl = _duckdb().sql(f"SELECT * FROM read_parquet('{path}', hive_partitioning = false) WHERE {key} IN ({in_list})").arrow().read_all()
+        tbl = _duckdb().sql(f"SELECT * FROM read_parquet('{path}', hive_partitioning = false) "
+                            f"WHERE {key} IN ({in_list})").arrow().read_all()
         # DuckDB hands a JSON column over as plain strings: which columns are
         # JSON comes from the files' own schema.
         files = _table_files(lake_dir, table)
         json_columns = ({f.name for f in pq.read_schema(files[0]) if isinstance(f.type, pa.JsonType)}
                         if files else set())
-        grouped = {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
         # MAP columns come back as dicts (an empty MAP as {}, not []), so
         # reconstruct.py never has to guess a column's type from its values.
         for row in rows_from_arrow(tbl, json_columns):
@@ -1346,14 +1363,15 @@ def fetch_sample_rows(lake_dir, accessions):
     return rows
 
 
-def check_reconstruction(report, lake_dir, sampled_entries, n, rows=None, n_reviewed=None):
+def check_reconstruction(report: ValidationReport, lake_dir: str, sampled_entries: list[dict[str, Any]], n: int,
+                         rows: _SampleRows | None = None, n_reviewed: int | None = None) -> None:
     """g(f(x)) == x on a sample: rebuild sampled entries from the five tables
     with bin/reconstruct.py and compare with the JSONL, array order included.
     ``rows`` is fetch_sample_rows' result for the same sample, if main()
     already fetched it."""
     report.checks.append(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
     eprint(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
-    from reconstruct import reconstruct_entry, entries_match
+    from reconstruct import entries_match, reconstruct_entry
 
     originals = _sampled_originals(sampled_entries, n, n_reviewed)
     if not originals:
@@ -1362,7 +1380,8 @@ def check_reconstruction(report, lake_dir, sampled_entries, n, rows=None, n_revi
     if rows is None:
         rows = fetch_sample_rows(lake_dir, originals)
 
-    matched, failures = {True: 0, False: 0}, []
+    matched: dict[bool, int] = {True: 0, False: 0}
+    failures: list[str] = []
     for accession, orig in originals.items():
         entry_rows = rows["entries"].get(accession)
         if not entry_rows:
@@ -1388,7 +1407,8 @@ def check_reconstruction(report, lake_dir, sampled_entries, n, rows=None, n_revi
     )
 
 
-def check_shortcut_values(report, lake_dir, sampled_entries, n, rows=None, n_reviewed=None):
+def check_shortcut_values(report: ValidationReport, lake_dir: str, sampled_entries: list[dict[str, Any]], n: int,
+                          rows: _SampleRows | None = None, n_reviewed: int | None = None) -> None:
     """Every shortcut column of the sampled entries' rows, in every table,
     equals bin/shortcut_reference.py's independent computation from the
     JSON entry.  Lists compare in order (those built by list_distinct as
@@ -1403,7 +1423,7 @@ def check_shortcut_values(report, lake_dir, sampled_entries, n, rows=None, n_rev
         return
     if rows is None:
         rows = fetch_sample_rows(lake_dir, originals)
-    problems = {table: [] for table in ALL_TABLES}
+    problems: dict[str, list[str]] = {table: [] for table in ALL_TABLES}
     compared = dict.fromkeys(ALL_TABLES, 0)
     for accession, orig in originals.items():
         for table, expected in expected_shortcuts(orig).items():
@@ -1420,7 +1440,7 @@ def check_shortcut_values(report, lake_dir, sampled_entries, n, rows=None, n_rev
         )
 
 
-def check_accession_map(report, lake_dir):
+def check_accession_map(report: ValidationReport, lake_dir: str) -> None:
     """accession_map: primary rows == entries, secondary rows == sum of
     secondaryAccessions lengths, no duplicate (accession, primary_accession),
     every primary_accession exists, the secondary rows are exactly the
@@ -1432,41 +1452,42 @@ def check_accession_map(report, lake_dir):
     amap = _table_glob(lake_dir, "accession_map")
     entries = _table_glob(lake_dir, "entries")
 
-    n_primary, n_secondary, n_dup = _duckdb().sql(f"""
+    n_primary, n_secondary, n_dup = cast(tuple[Any, ...], _duckdb().sql(f"""
         SELECT count(*) FILTER (WHERE is_primary), count(*) FILTER (WHERE NOT is_primary),
                count(*) - count(DISTINCT (accession, primary_accession))
         FROM read_parquet('{amap}', hive_partitioning = false)
-    """).fetchone()
+    """).fetchone())
     # secondaryAccessions is a source column: absent when no entry has one.
     has_secondaries = "secondaryAccessions" in _duckdb().sql(
         f"SELECT * FROM read_parquet('{entries}', hive_partitioning = false) LIMIT 0").columns
     secondaries = "coalesce(sum(len(secondaryAccessions)), 0)" if has_secondaries else "0"
-    n_entries, n_secs = _duckdb().sql(f"""
+    n_entries, n_secs = cast(tuple[Any, ...], _duckdb().sql(f"""
         SELECT count(*), {secondaries} FROM read_parquet('{entries}', hive_partitioning = false)
-    """).fetchone()
+    """).fetchone())
     report.check("accession_map primary rows == entries rows", n_primary == n_entries,
                  f"{n_primary:,} vs {n_entries:,}")
     report.check("accession_map secondary rows == sum(len(entries.secondaryAccessions))",
                  n_secondary == n_secs, f"{n_secondary:,} vs {n_secs:,}")
     report.check("accession_map has no duplicate (accession, primary_accession)", n_dup == 0, f"{n_dup:,} duplicates")
 
-    orphans = _duckdb().sql(f"""
+    orphans = cast(tuple[Any, ...], _duckdb().sql(f"""
         SELECT count(*) FROM read_parquet('{amap}', hive_partitioning = false) m
         ANTI JOIN read_parquet('{entries}', hive_partitioning = false) e ON m.primary_accession = e.accession
-    """).fetchone()[0]
+    """).fetchone())[0]
     report.check("every accession_map.primary_accession exists in entries", orphans == 0, f"{orphans:,} orphans")
 
     # The mappings themselves, as set comparisons DuckDB can spill: each
     # secondary row is one (secondary accession, entry) pair of entries'
     # secondaryAccessions, in both directions.
     if has_secondaries:
-        extra, lost = _duckdb().sql(f"""
-            WITH m AS (SELECT accession, primary_accession FROM read_parquet('{amap}', hive_partitioning = false) WHERE NOT is_primary),
+        extra, lost = cast(tuple[Any, ...], _duckdb().sql(f"""
+            WITH m AS (SELECT accession, primary_accession
+                       FROM read_parquet('{amap}', hive_partitioning = false) WHERE NOT is_primary),
                  e AS (SELECT unnest(secondaryAccessions) AS accession, accession AS primary_accession
                        FROM read_parquet('{entries}', hive_partitioning = false))
             SELECT (SELECT count(*) FROM (SELECT * FROM m EXCEPT ALL SELECT * FROM e)),
                    (SELECT count(*) FROM (SELECT * FROM e EXCEPT ALL SELECT * FROM m))
-        """).fetchone()
+        """).fetchone())
     else:
         extra, lost = n_secondary, 0
     report.check("accession_map secondary rows map each secondary accession to its entry",
@@ -1474,23 +1495,24 @@ def check_accession_map(report, lake_dir):
                  f"{extra:,} rows no entry lists, {lost:,} listed secondaries without their row"
                  if extra or lost else "")
 
-    n_self = _duckdb().sql(f"""
+    n_self = cast(tuple[Any, ...], _duckdb().sql(f"""
         SELECT count(*) FILTER (WHERE is_primary AND accession IS DISTINCT FROM primary_accession)
         FROM read_parquet('{amap}', hive_partitioning = false)
-    """).fetchone()[0]
+    """).fetchone())[0]
     report.check("accession_map primary rows have accession == primary_accession", n_self == 0,
                  f"{n_self:,} rows" if n_self else "")
 
-    mism = _duckdb().sql(f"""
+    mism = cast(tuple[Any, ...], _duckdb().sql(f"""
         SELECT count(*) FILTER (WHERE m.reviewed IS DISTINCT FROM e.reviewed
                                    OR m.organism_id IS DISTINCT FROM e.organism_id)
-        FROM read_parquet('{amap}', hive_partitioning = false) m JOIN read_parquet('{entries}', hive_partitioning = false) e ON m.primary_accession = e.accession
-    """).fetchone()[0]
+        FROM read_parquet('{amap}', hive_partitioning = false) m
+        JOIN read_parquet('{entries}', hive_partitioning = false) e ON m.primary_accession = e.accession
+    """).fetchone())[0]
     report.check("accession_map (reviewed, organism_id) match the entry of primary_accession", mism == 0,
                  f"{mism:,} mismatches")
 
 
-def check_partitions(report, lake_dir):
+def check_partitions(report: ValidationReport, lake_dir: str) -> None:
     """Hive partitions agree with the stored column they mirror.
     Uses stats_min_value / stats_max_value: DuckDB's stats_min / stats_max are
     the legacy Parquet fields, which PyArrow omits for string columns.
@@ -1514,13 +1536,14 @@ def check_partitions(report, lake_dir):
         side_total = 0
         for side in key["values"]:
             path = os.path.join(lake_dir, table_name, f"{key['name']}={side}", "*.parquet")
-            bad, rows = _duckdb().sql(f"""
+            bad, rows = cast(tuple[Any, ...], _duckdb().sql(f"""
                 SELECT count(*) FILTER (WHERE lower(stats_min_value) != '{expected_flag[side]}'
                                            OR lower(stats_max_value) != '{expected_flag[side]}'),
                        coalesce(sum(row_group_num_rows), 0)
                 FROM parquet_metadata('{path}') WHERE path_in_schema = '{derived}'
-            """).fetchone()
-            report.check(f"{table_name}/{key['name']}={side}: every row group has {derived} = {expected_flag[side]}",
+            """).fetchone())
+            report.check(f"{table_name}/{key['name']}={side}: every row group has "
+                         f"{derived} = {expected_flag[side]}",
                          bad == 0, f"{bad} row groups disagree")
             report.check(f"{table_name}/{key['name']}={side}: rows match manifest",
                          rows == key["row_counts"].get(side), f"disk {rows} vs manifest {key['row_counts'].get(side)}")
@@ -1541,7 +1564,7 @@ def _arrow_type_paths(t: str, prefix: str = "") -> set[str]:
     from parquet_transform import _split_top
     t = t.strip()
     if t.startswith("struct<") and t.endswith(">"):
-        paths = set()
+        paths: set[str] = set()
         for part in _split_top(t[len("struct<"):-1]):
             name, _, sub = part.partition(": ")
             path = f"{prefix}.{name}" if prefix else name
@@ -1559,16 +1582,21 @@ def _type_change(before: str, after: str) -> str:
     removed, or the two types when only a leaf type changed."""
     old, new = _arrow_type_paths(before), _arrow_type_paths(after)
     # Only the topmost changed path: a removed struct implies its fields.
-    top = lambda ps: sorted(p for p in ps if not any(p.startswith(q + ".") for q in ps))  # noqa: E731
+    def top(ps: set[str]) -> list[str]:
+        return sorted(p for p in ps if not any(p.startswith(q + ".") for q in ps))
+
     added, removed = top(new - old), top(old - new)
     if added or removed:
         return "; ".join(p for p in (f"fields added: {', '.join(added)}" if added else "",
                                      f"fields removed: {', '.join(removed)}" if removed else "") if p)
-    short = lambda t: t if len(t) <= 80 else t[:77] + "..."  # noqa: E731
+
+    def short(t: str) -> str:
+        return t if len(t) <= 80 else t[:77] + "..."
+
     return f"{short(before)} → {short(after)}"
 
 
-def check_schema_diff(report, lake_dir, previous_manifest_path):
+def check_schema_diff(report: ValidationReport, lake_dir: str, previous_manifest_path: str | None) -> None:
     """Informational: how this build's schema differs from the previous release.
 
     Source columns follow the input, so one added, removed or retyped is
@@ -1599,7 +1627,7 @@ def check_schema_diff(report, lake_dir, previous_manifest_path):
 
     prev_tables, cur_tables = previous.get("tables", {}), current.get("tables", {})
 
-    def curated(table):
+    def curated(table: str) -> set[str]:
         # A shortcut now or in the previous release: a removed shortcut is no
         # longer in TABLE_META, only in the previous manifest.
         return (set(TABLE_META.get(table, {}).get("columns", {}).get("shortcut", []))
@@ -1627,15 +1655,14 @@ def check_schema_diff(report, lake_dir, previous_manifest_path):
             report.warn(f"{table}: {tag} {what}: {column}", detail)
     if not any_diff:
         report.note("no table or column differences")
-    if previous.get("schema_version") == current.get("schema_version"):
-        if curated_changed:
-            report.warn("shortcut schema changed but schema_version did not",
-                        f"both {current.get('schema_version')}")
+    if previous.get("schema_version") == current.get("schema_version") and curated_changed:
+        report.warn("shortcut schema changed but schema_version did not",
+                    f"both {current.get('schema_version')}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Production validation for UniProtKB Parquet data lake"
     )
@@ -1711,7 +1738,7 @@ def main():
 
     # ── Run all checks ──
     check_completeness(report, args.lake, jsonl_count, args.expected_count)
-    entry_total, entry_unique = check_uniqueness(report, args.lake)
+    _entry_total, entry_unique = check_uniqueness(report, args.lake)
     check_null_keys(report, args.lake, unclassified)
     check_referential_integrity(report, args.lake, entry_unique)
     check_sort_order(report, args.lake)

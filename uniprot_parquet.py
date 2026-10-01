@@ -24,14 +24,12 @@ and seven macros ready to use.
 Requirements: pip install duckdb
 """
 
-from __future__ import annotations
-
 import json
 import os
 import re
+from typing import Any, NotRequired, TypedDict, overload
 
 import duckdb
-
 
 # ── Views ───────────────────────────────────────────────────────────────
 # Every table is Hive-partitioned as <table>/review_status=swissprot|trembl/.
@@ -49,10 +47,50 @@ import duckdb
 # fallback when the manifest cannot be read.
 TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
 
-_VIEW_REPLACE = {}   # per-table REPLACE list, when one differs from the default
+_VIEW_REPLACE: dict[str, str] = {}   # per-table REPLACE list, when one differs from the default
 
 
-def _q(s) -> str:
+class TableStatus(TypedDict):
+    """One table's entry in tables()."""
+    row_count: int
+    present: bool
+    files_present: int
+    files_total: int
+
+
+class TableOverview(TypedDict):
+    """One table's entry in schema() with no table named."""
+    description: str
+    row_count: int
+    primary_key: list[str]
+    sort_order: list[str]
+    foreign_keys: NotRequired[dict[str, str]]
+    join_hint: NotRequired[str]
+
+
+class ColumnInfo(TypedDict):
+    """One column in schema(lake_path, table)["columns"]."""
+    name: str
+    type: str
+    nullable: bool
+    description: str
+    category: NotRequired[str]
+
+
+class TableSchema(TypedDict):
+    """schema(lake_path, table): one table's columns."""
+    description: str
+    row_count: int
+    primary_key: list[str]
+    foreign_keys: dict[str, str]
+    sort_order: list[str]
+    shortcut_columns: list[str]
+    source_columns: list[str]
+    all_columns: list[str]
+    columns: list[ColumnInfo]
+
+
+def _q(s: object) -> str:
     """Escape a value for interpolation inside a single-quoted SQL literal."""
     return str(s).replace("'", "''")
 
@@ -166,7 +204,7 @@ CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
     ) i
     JOIN entries e ON e.accession = i.accession
 );
-"""
+"""  # noqa: E501 (unnest_isoforms' from_json type literal is one SQL string)
 
 
 def _split_sql(sql: str) -> list[str]:
@@ -239,9 +277,7 @@ def connect(
     base = lake_path.rstrip("/")
 
     # Auto-install httpfs for remote paths
-    if base.startswith("http://") or base.startswith("https://"):
-        con.sql("INSTALL httpfs; LOAD httpfs;")
-    elif base.startswith("s3://"):
+    if base.startswith("http://") or base.startswith("https://") or base.startswith("s3://"):
         con.sql("INSTALL httpfs; LOAD httpfs;")
 
     # Views: over the manifest's explicit file lists when the manifest is
@@ -271,7 +307,7 @@ def _is_remote(base: str) -> bool:
     return base.startswith(("http://", "https://", "s3://"))
 
 
-def _read_manifest(base: str) -> dict | None:
+def _read_manifest(base: str) -> dict[str, Any] | None:
     """manifest.json from a local dir, http(s) URL or s3 URI; None if unreachable."""
     return _read_json(base, "manifest.json")
 
@@ -281,7 +317,7 @@ def _read_manifest(base: str) -> dict | None:
 _NOT_FOUND = re.compile(r"\b(?:403|404)\b|Not Found|No files found")
 
 
-def _remote_readable(con, url: str) -> bool:
+def _remote_readable(con: duckdb.DuckDBPyConnection, url: str) -> bool:
     """True if ``url`` can be read; False if the server says it is not there.
     Any other failure (a 5xx, a rate limit, a timeout that outlasted httpfs's
     retries) raises: taking it as "absent" would build views that silently
@@ -296,7 +332,7 @@ def _remote_readable(con, url: str) -> bool:
                            f"(the request failed: {e}). Retry connect().") from e
 
 
-def _present_files(con, base: str, table: str, rels: list[str]) -> list[str]:
+def _present_files(con: duckdb.DuckDBPyConnection, base: str, table: str, rels: list[str]) -> list[str]:
     """The table's files that exist in *this* copy of the lake, as full paths.
 
     A copy may hold a whole table, one partition (a Swiss-Prot-only rsync) or
@@ -318,7 +354,7 @@ def _present_files(con, base: str, table: str, rels: list[str]) -> list[str]:
     by_part: dict[str, list[str]] = {}
     for rel in rels:
         by_part.setdefault(rel.rsplit("/", 1)[0] if "/" in rel else "", []).append(rel)
-    present = []
+    present: list[str] = []
     for part_rels in by_part.values():
         first, rest = part_rels[0], part_rels[1:]
         if _remote_readable(con, f"{base}/{table}/{first}"):
@@ -329,25 +365,32 @@ def _present_files(con, base: str, table: str, rels: list[str]) -> list[str]:
     return present
 
 
-def _read_json(base: str, name: str) -> dict | None:
+def _read_json(base: str, name: str) -> dict[str, Any] | None:
     """A JSON sidecar (manifest.json, datapackage.json) from a local dir,
     http(s) URL or s3 URI; None if unreachable or invalid."""
+    data: dict[str, Any]
     try:
         if base.startswith(("http://", "https://")):
             import urllib.request
             with urllib.request.urlopen(f"{base}/{name}", timeout=30) as r:
-                return json.loads(r.read())
+                data = json.loads(r.read())
+                return data
         if base.startswith("s3://"):
             con = duckdb.connect()
             con.sql("INSTALL httpfs; LOAD httpfs;")
-            return json.loads(con.sql(f"SELECT content FROM read_text('{_q(base)}/{name}')").fetchone()[0])
+            row = con.sql(f"SELECT content FROM read_text('{_q(base)}/{name}')").fetchone()
+            if row is None:   # as before: subscripting None raised, caught below
+                return None
+            data = json.loads(row[0])
+            return data
         with open(os.path.join(base, name)) as f:
-            return json.load(f)
+            data = json.load(f)
+            return data
     except Exception:
         return None
 
 
-def manifest(lake_path: str) -> dict:
+def manifest(lake_path: str) -> dict[str, Any]:
     """Read the lake's manifest.json and return it as a dict.
 
     Useful for inspecting table schemas, row counts, sort orders,
@@ -372,7 +415,8 @@ def manifest(lake_path: str) -> dict:
         return m
     try:
         with open(manifest_path) as f:
-            return json.load(f)
+            data: dict[str, Any] = json.load(f)
+            return data
     except FileNotFoundError:
         raise FileNotFoundError(
             f"manifest.json not found at {manifest_path}. "
@@ -384,7 +428,7 @@ def manifest(lake_path: str) -> dict:
         ) from None
 
 
-def tables(lake_path: str) -> dict[str, dict]:
+def tables(lake_path: str) -> dict[str, TableStatus]:
     """Return {table_name: {"row_count", "present", "files_present", "files_total"}}.
 
     ``present`` says whether any of the table's files are in *this* copy of
@@ -400,7 +444,7 @@ def tables(lake_path: str) -> dict[str, dict]:
     con = duckdb.connect()
     if _is_remote(base):
         con.sql("INSTALL httpfs; LOAD httpfs;")
-    out = {}
+    out: dict[str, TableStatus] = {}
     for name, info in m.get("tables", {}).items():
         rels = info.get("files", [])
         present = _present_files(con, base, name, rels)
@@ -436,7 +480,7 @@ def files_for_organism_id(lake_path: str, organism_id: int, table: str = "entrie
             and d["organism_id_min"] <= organism_id <= d["organism_id_max"]]
 
 
-def _join_hint(name: str, foreign_keys: dict) -> str:
+def _join_hint(name: str, foreign_keys: dict[str, str]) -> str:
     """JOIN clause(s) from the tables ``name``'s foreign keys point at:
     ``JOIN features ON features.accession = entries.accession AND
     features.organism_id = entries.organism_id``.  Built from each key's
@@ -449,7 +493,11 @@ def _join_hint(name: str, foreign_keys: dict) -> str:
     return " ".join(f"JOIN {name} ON {' AND '.join(conds)}" for conds in by_target.values())
 
 
-def schema(lake_path: str, table: str | None = None) -> dict | str:
+@overload
+def schema(lake_path: str, table: None = None) -> dict[str, TableOverview]: ...
+@overload
+def schema(lake_path: str, table: str) -> TableSchema: ...
+def schema(lake_path: str, table: str | None = None) -> dict[str, TableOverview] | TableSchema:
     """Describe the lake schema for LLM agents and interactive exploration.
 
     With no arguments, returns a compact overview of all tables with their
@@ -468,16 +516,17 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
 
     Returns
     -------
-    dict | str
-        Schema information.
+    dict
+        Schema information: {table: TableOverview} with no table named, else
+        that table's TableSchema.
     """
     m = manifest(lake_path)
     tbls = m.get("tables", {})
 
     if table is None:
-        overview = {}
+        overview: dict[str, TableOverview] = {}
         for name, info in tbls.items():
-            entry = {
+            entry: TableOverview = {
                 "description": info.get("description", ""),
                 "row_count": info.get("row_count", 0),
                 "primary_key": info.get("primary_key", []),
@@ -501,8 +550,8 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
 
     # Enrich with semantic descriptions from datapackage.json if available
     dp = _load_datapackage(lake_path)
-    desc_map = {}
-    type_map = {}
+    desc_map: dict[str, str] = {}
+    type_map: dict[str, str] = {}
     if dp:
         for resource in dp.get("resources", []):
             if resource["name"] == table:
@@ -511,20 +560,20 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
                     type_map[field["name"]] = field.get("arrowType", "")
                 break
 
-    columns = []
+    columns: list[ColumnInfo] = []
     for col in info.get("columns", []):
         col_name = col["name"]
-        entry = {
+        column: ColumnInfo = {
             "name": col_name,
             "type": col.get("type", type_map.get(col_name, "")),
             "nullable": col.get("nullable", True),
             "description": desc_map.get(col_name, ""),
         }
         if col_name in cats.get("shortcut", []):
-            entry["category"] = "shortcut"
+            column["category"] = "shortcut"
         elif col_name in cats.get("source", []):
-            entry["category"] = "source"
-        columns.append(entry)
+            column["category"] = "source"
+        columns.append(column)
 
     return {
         "description": info.get("description", ""),
@@ -539,12 +588,12 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
     }
 
 
-def _load_datapackage(lake_path: str) -> dict | None:
+def _load_datapackage(lake_path: str) -> dict[str, Any] | None:
     """Load datapackage.json (local, http(s) or s3) if it exists, else None."""
     return _read_json(lake_path.rstrip("/"), "datapackage.json")
 
 
-def datapackage(lake_path: str) -> dict:
+def datapackage(lake_path: str) -> dict[str, Any]:
     """Read the lake's datapackage.json (Frictionless Data Package descriptor).
 
     This is the machine-readable schema documentation for the lake,

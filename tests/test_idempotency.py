@@ -7,13 +7,15 @@ so row counts remain correct (no duplication).
 import gzip
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 
+import pyarrow as pa
 import pyarrow.dataset as ds
 import pytest
-
 from conftest import table_files
 
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
@@ -21,20 +23,22 @@ BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
 
 
-def _expected_entries_from_jsonl(jsonl_path):
+def _expected_entries_from_jsonl(jsonl_path: str) -> int:
     import zstandard as zstd
     with open(jsonl_path, "rb") as f:
-        return zstd.ZstdDecompressor().stream_reader(f).read().count(b"\n")
+        lines: int = zstd.ZstdDecompressor().stream_reader(f).read().count(b"\n")
+        return lines
 
 
-def _expected_entries(fixture_path):
+def _expected_entries(fixture_path: str) -> int:
     """Derive expected entry count from the fixture."""
     with gzip.open(fixture_path, "rt") as f:
         data = json.load(f)
     return len(data["results"])
 
 
-def _run_transform(small_jsonl, outdir, extra_args=None):
+def _run_transform(small_jsonl: str, outdir: str,
+                   extra_args: Sequence[str] | None = None) -> subprocess.CompletedProcess[str]:
     """Run parquet_transform.py once and return the subprocess result."""
     transform_script = os.path.join(BIN_DIR, "parquet_transform.py")
     env = os.environ.copy()
@@ -52,9 +56,9 @@ def _run_transform(small_jsonl, outdir, extra_args=None):
     return subprocess.run(cmd, env=env, capture_output=True, text=True)
 
 
-def _get_row_counts(outdir):
+def _get_row_counts(outdir: str) -> dict[str, int]:
     """Return dict of {table_name: row_count} from Parquet files."""
-    counts = {}
+    counts: dict[str, int] = {}
     for name in TABLE_NAMES:
         table_dir = os.path.join(outdir, name)
         if os.path.isdir(table_dir):
@@ -65,13 +69,13 @@ def _get_row_counts(outdir):
     return counts
 
 
-def _read_table(outdir, name):
+def _read_table(outdir: str, name: str) -> pa.Table:
     """A table's rows in file order (swissprot partition first)."""
     from conftest import open_table
     return open_table(outdir, name).to_table()
 
 
-def test_idempotency(small_jsonl, fixture_json_gz, tmp_path_factory):
+def test_idempotency(small_jsonl: str, fixture_json_gz: str, tmp_path_factory: pytest.TempPathFactory) -> None:
     """Running the pipeline twice on the same output should not duplicate data."""
     lake_dir = tmp_path_factory.mktemp("idempotency")
     outdir = str(lake_dir / "output")
@@ -104,7 +108,7 @@ def test_idempotency(small_jsonl, fixture_json_gz, tmp_path_factory):
     assert counts2["entries"] == _expected_entries(fixture_json_gz)
 
 
-def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
+def test_skip_existing_preserves_tables(small_jsonl: str, tmp_path_factory: pytest.TempPathFactory) -> None:
     """--skip-existing skips tables that already have Parquet files."""
     lake_dir = tmp_path_factory.mktemp("skip_existing")
     outdir = str(lake_dir / "output")
@@ -116,9 +120,8 @@ def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
     counts1 = _get_row_counts(outdir)
 
     # Record modification times from first run
-    mtimes1 = {}
+    mtimes1: dict[str, float] = {}
     for name in TABLE_NAMES:
-        table_dir = os.path.join(outdir, name)
         files = table_files(outdir, name)
         if files:
             mtimes1[name] = os.path.getmtime(files[0])
@@ -143,7 +146,6 @@ def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
 
     # File modification times must be the same (files were not rewritten)
     for name in TABLE_NAMES:
-        table_dir = os.path.join(outdir, name)
         files = table_files(outdir, name)
         if files:
             mtime2 = os.path.getmtime(files[0])
@@ -152,11 +154,11 @@ def test_skip_existing_preserves_tables(small_jsonl, tmp_path_factory):
             )
 
 
-def _sentinel(outdir, name):
+def _sentinel(outdir: str, name: str) -> str:
     return os.path.join(outdir, ".complete", f"{name}.json")
 
 
-def test_skip_existing_rebuilds_without_sentinel(small_jsonl, tmp_path):
+def test_skip_existing_rebuilds_without_sentinel(small_jsonl: str, tmp_path: pathlib.Path) -> None:
     """Files on disk are not proof of a complete table: a run killed during the
     publish window leaves Parquet files but no completion sentinel, and
     --skip-existing must rebuild rather than trust (and hash) them."""
@@ -180,7 +182,7 @@ def test_skip_existing_rebuilds_without_sentinel(small_jsonl, tmp_path):
     assert _get_row_counts(outdir)["entries"] == n
 
 
-def test_skip_existing_rebuilds_on_file_list_mismatch(small_jsonl, tmp_path):
+def test_skip_existing_rebuilds_on_file_list_mismatch(small_jsonl: str, tmp_path: pathlib.Path) -> None:
     """A table whose files on disk differ from what its sentinel recorded (here
     one partition file lost) is rebuilt, restoring the full row count."""
     outdir = str(tmp_path / "lake")
@@ -194,7 +196,7 @@ def test_skip_existing_rebuilds_on_file_list_mismatch(small_jsonl, tmp_path):
     assert _get_row_counts(outdir)["entries"] == n
 
 
-def test_rebuild_with_fewer_files_removes_stale_ones(small_jsonl, tmp_path):
+def test_rebuild_with_fewer_files_removes_stale_ones(small_jsonl: str, tmp_path: pathlib.Path) -> None:
     """A rebuild that writes fewer files per partition deletes the previous run's extras."""
     outdir = str(tmp_path / "lake")
     _run_transform(small_jsonl, outdir, extra_args=["--target-file-bytes", "200000"])
@@ -210,7 +212,7 @@ def test_rebuild_with_fewer_files_removes_stale_ones(small_jsonl, tmp_path):
     assert _get_row_counts(outdir)["entries"] == _expected_entries_from_jsonl(small_jsonl)
 
 
-def test_rebuild_removes_leftover_tmp_files(small_jsonl, tmp_path):
+def test_rebuild_removes_leftover_tmp_files(small_jsonl: str, tmp_path: pathlib.Path) -> None:
     """A partial file a killed run left under <partition>/.tmp/ is removed by the
     next run.  DuckDB's ** glob descends into hidden directories, so a leftover
     would otherwise be double-counted by every <table>/**/*.parquet reader."""
@@ -218,17 +220,20 @@ def test_rebuild_removes_leftover_tmp_files(small_jsonl, tmp_path):
     outdir = str(tmp_path / "lake")
     _run_transform(small_jsonl, outdir)
     entries_dir = os.path.join(outdir, "entries")
+    count_sql = f"SELECT count(*) FROM read_parquet('{entries_dir}/**/*.parquet')"
     stale = os.path.join(entries_dir, "review_status=trembl", ".tmp", "entries_00002.parquet")
     os.makedirs(os.path.dirname(stale))
     shutil.copy(table_files(outdir, "entries")[-1], stale)
     n = _expected_entries_from_jsonl(small_jsonl)
-    assert duckdb.sql(f"SELECT count(*) FROM read_parquet('{entries_dir}/**/*.parquet')").fetchone()[0] > n
+    before = duckdb.sql(count_sql).fetchone()
+    assert before is not None and before[0] > n
     _run_transform(small_jsonl, outdir)
     assert not os.path.exists(os.path.dirname(stale))
-    assert duckdb.sql(f"SELECT count(*) FROM read_parquet('{entries_dir}/**/*.parquet')").fetchone()[0] == n
+    after = duckdb.sql(count_sql).fetchone()
+    assert after is not None and after[0] == n
 
 
-def test_skip_existing_rebuilds_for_a_different_input(small_jsonl, tmp_path):
+def test_skip_existing_rebuilds_for_a_different_input(small_jsonl: str, tmp_path: pathlib.Path) -> None:
     """A sentinel is proof only for the input that wrote it: a manual re-run
     on another JSONL into the same outdir rebuilds every table instead of
     mixing the old tables with a manifest for the new input."""
@@ -245,7 +250,7 @@ def test_skip_existing_rebuilds_for_a_different_input(small_jsonl, tmp_path):
     assert _get_row_counts(outdir)["entries"] == 10
 
 
-def test_skip_existing_rebuilds_on_sentinel_without_input(small_jsonl, tmp_path):
+def test_skip_existing_rebuilds_on_sentinel_without_input(small_jsonl: str, tmp_path: pathlib.Path) -> None:
     """A sentinel that does not record its input (written before it did)
     cannot vouch for the table."""
     outdir = str(tmp_path / "lake")

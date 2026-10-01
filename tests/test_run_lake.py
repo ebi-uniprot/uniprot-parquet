@@ -2,15 +2,19 @@
 that records its arguments instead of running the pipeline."""
 
 import os
+import pathlib
 import subprocess
+from collections.abc import Callable
 
 import pytest
-
 from conftest import PROJECT_ROOT
+
+# run(*args, mode="small", marker=True) -> CompletedProcess, path of the recorded nextflow args
+Stub = tuple[Callable[..., subprocess.CompletedProcess[str]], pathlib.Path]
 
 
 @pytest.fixture
-def stub(tmp_path):
+def stub(tmp_path: pathlib.Path) -> Stub:
     """(run(*args, mode="small") -> CompletedProcess, path of the recorded
     nextflow args)."""
     bin_dir = tmp_path / "bin"
@@ -30,7 +34,7 @@ done
     nextflow.chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
 
-    def run(*args, mode="small", marker=True):
+    def run(*args: str, mode: str = "small", marker: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", os.path.join(PROJECT_ROOT, "run_lake.sh"), mode,
              "--outdir", str(tmp_path / "out"), *args],
@@ -40,14 +44,14 @@ done
 
 
 class TestPreviousManifest:
-    def test_missing_file_is_refused_by_name(self, stub):
+    def test_missing_file_is_refused_by_name(self, stub: Stub) -> None:
         run, args_file = stub
         result = run("--previous-manifest", "datalake/2026_3/lake/manifest.json")
         assert result.returncode != 0
         assert "datalake/2026_3/lake/manifest.json" in result.stdout + result.stderr
         assert not args_file.exists(), "nextflow was launched"
 
-    def test_existing_file_reaches_nextflow(self, stub):
+    def test_existing_file_reaches_nextflow(self, stub: Stub) -> None:
         run, args_file = stub
         manifest = "tests/fixtures/small.json.gz"   # any existing file, relative to the launch dir
         result = run("--previous-manifest", manifest)
@@ -56,7 +60,7 @@ class TestPreviousManifest:
         passed = args[args.index("--previous_manifest") + 1]
         assert os.path.samefile(os.path.join(PROJECT_ROOT, passed), os.path.join(PROJECT_ROOT, manifest))
 
-    def test_manifest_of_the_release_being_built_is_refused(self, stub, tmp_path):
+    def test_manifest_of_the_release_being_built_is_refused(self, stub: Stub, tmp_path: pathlib.Path) -> None:
         """The run republishes that manifest while VALIDATE reads it, so the
         schema diff would compare the release with itself."""
         run, args_file = stub
@@ -68,8 +72,8 @@ class TestPreviousManifest:
         assert "inside the release being built" in result.stdout + result.stderr
         assert not args_file.exists(), "nextflow was launched"
 
-    def test_manifest_of_another_release_in_outdir_is_accepted(self, stub, tmp_path):
-        run, args_file = stub
+    def test_manifest_of_another_release_in_outdir_is_accepted(self, stub: Stub, tmp_path: pathlib.Path) -> None:
+        run, _ = stub
         manifest = tmp_path / "out" / "rel_2" / "lake" / "manifest.json"   # shares a prefix with "rel"
         manifest.parent.mkdir(parents=True)
         manifest.write_text("{}")
@@ -83,7 +87,7 @@ class TestFullModeSchemaDiff:
 
     FULL = ("--expected-count", "52", "--input", "tests/fixtures/small.json.gz")
 
-    def test_refused_without_previous_manifest(self, stub):
+    def test_refused_without_previous_manifest(self, stub: Stub) -> None:
         run, args_file = stub
         result = run(*self.FULL, mode="full")
         assert result.returncode != 0
@@ -91,32 +95,32 @@ class TestFullModeSchemaDiff:
         assert "--first-release" in result.stdout + result.stderr
         assert not args_file.exists(), "nextflow was launched"
 
-    def test_first_release_launches_without_diff(self, stub):
+    def test_first_release_launches_without_diff(self, stub: Stub) -> None:
         run, args_file = stub
         result = run(*self.FULL, "--first-release", mode="full")
         assert result.returncode == 0, result.stdout + result.stderr
         assert "--previous_manifest" not in args_file.read_text().splitlines()
 
-    def test_previous_manifest_launches(self, stub):
+    def test_previous_manifest_launches(self, stub: Stub) -> None:
         run, args_file = stub
         result = run(*self.FULL, "--previous-manifest", "tests/fixtures/small.json.gz", mode="full")
         assert result.returncode == 0, result.stdout + result.stderr
         assert "--previous_manifest" in args_file.read_text().splitlines()
 
-    def test_both_flags_are_refused(self, stub):
+    def test_both_flags_are_refused(self, stub: Stub) -> None:
         run, args_file = stub
         result = run(*self.FULL, "--first-release",
                      "--previous-manifest", "tests/fixtures/small.json.gz", mode="full")
         assert result.returncode != 0
         assert not args_file.exists(), "nextflow was launched"
 
-    def test_small_mode_needs_neither(self, stub):
-        run, args_file = stub
+    def test_small_mode_needs_neither(self, stub: Stub) -> None:
+        run, _ = stub
         assert run().returncode == 0
 
 
 class TestReleaseMarker:
-    def test_success_needs_the_marker(self, stub):
+    def test_success_needs_the_marker(self, stub: Stub) -> None:
         """Nextflow exits 0 when the published copy fails verification (the
         check runs in onComplete): run_lake.sh goes by RELEASE_COMPLETE."""
         run, _ = stub
@@ -124,13 +128,13 @@ class TestReleaseMarker:
         assert result.returncode != 0
         assert "RELEASE_COMPLETE" in result.stdout + result.stderr
 
-    def test_marker_means_success(self, stub):
+    def test_marker_means_success(self, stub: Stub) -> None:
         run, _ = stub
         result = run()
         assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_max_time_reaches_nextflow(stub):
+def test_max_time_reaches_nextflow(stub: Stub) -> None:
     """A queue whose wall-time limit is under 72h needs a lower cap for the
     retries' doubled time."""
     run, args_file = stub
@@ -140,7 +144,7 @@ def test_max_time_reaches_nextflow(stub):
     assert args[args.index("--max_time") + 1] == "48h"
 
 
-def _header_examples(mode):
+def _header_examples(mode: str) -> list[list[str]]:
     """The ``./run_lake.sh <mode> ...`` usage lines of run_lake.sh's header,
     as argument lists (lines abbreviated with '...' excluded)."""
     import shlex
@@ -152,11 +156,11 @@ def _header_examples(mode):
 
 
 @pytest.mark.parametrize("example", _header_examples("full"), ids=" ".join)
-def test_full_mode_header_examples_launch(example, stub, tmp_path):
+def test_full_mode_header_examples_launch(example: list[str], stub: Stub, tmp_path: pathlib.Path) -> None:
     """Each full-mode example in the header works as written, from a
     directory holding the dump and the previous release under the default
     outdir (datalake/)."""
-    run, args_file = stub
+    _, args_file = stub
     cwd = tmp_path / "launch"
     (cwd / "datalake" / "2026_03" / "lake").mkdir(parents=True)
     (cwd / "datalake" / "2026_03" / "lake" / "manifest.json").write_text("{}")

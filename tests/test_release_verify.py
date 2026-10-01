@@ -3,15 +3,16 @@ against its own metadata (the workflow's last step before RELEASE_COMPLETE)."""
 
 import json
 import os
+import pathlib
 import shutil
+import subprocess
 
 import pytest
-
 from conftest import run_bin
 
 
 @pytest.fixture
-def release(small_lake, tmp_path):
+def release(small_lake: dict[str, str], tmp_path: pathlib.Path) -> pathlib.Path:
     """A release directory as the workflow publishes it: lake/, the sorted
     JSONL, the validation reports, SCHEMA.md and provenance.json, plus the
     .pending marker release_manifest.py writes."""
@@ -36,21 +37,21 @@ def release(small_lake, tmp_path):
     return rel
 
 
-def _verify(rel, *extra):
+def _verify(rel: pathlib.Path, *extra: str) -> subprocess.CompletedProcess[str]:
     return run_bin("verify_release.py", rel, "--marker", rel / ".RELEASE_COMPLETE.pending", *extra)
 
 
-def _first_parquet(rel):
+def _first_parquet(rel: pathlib.Path) -> pathlib.Path:
     return next(p for p in sorted((rel / "lake").rglob("*.parquet")))
 
 
-def test_complete_release_passes(release):
+def test_complete_release_passes(release: pathlib.Path) -> None:
     for extra in ((), ("--full",)):
         result = _verify(release, *extra)
         assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_provenance_records_published_sidecars(release):
+def test_provenance_records_published_sidecars(release: pathlib.Path) -> None:
     with open(release / "provenance.json") as f:
         published = json.load(f)["published"]
     assert sorted(published) == ["SCHEMA.md", "sorted.jsonl.zst",
@@ -58,7 +59,7 @@ def test_provenance_records_published_sidecars(release):
     assert published["SCHEMA.md"]["size_bytes"] == len("# schema\n")
 
 
-def test_missing_parquet_file_fails(release):
+def test_missing_parquet_file_fails(release: pathlib.Path) -> None:
     path = _first_parquet(release)
     path.unlink()
     result = _verify(release)
@@ -66,7 +67,7 @@ def test_missing_parquet_file_fails(release):
     assert f"{path.relative_to(release / 'lake')}: missing" in result.stdout
 
 
-def test_wrong_size_fails(release):
+def test_wrong_size_fails(release: pathlib.Path) -> None:
     path = _first_parquet(release)
     with open(path, "ab") as f:
         f.write(b"x")
@@ -74,21 +75,21 @@ def test_wrong_size_fails(release):
     assert result.returncode == 1 and "manifest.json says" in result.stdout
 
 
-def test_extra_parquet_file_fails(release):
+def test_extra_parquet_file_fails(release: pathlib.Path) -> None:
     path = _first_parquet(release)
     shutil.copy(path, path.parent / "stray_00099.parquet")
     result = _verify(release)
     assert result.returncode == 1 and "stray_00099.parquet: not listed in SHA256SUMS.txt" in result.stdout
 
 
-def test_truncated_jsonl_fails(release):
+def test_truncated_jsonl_fails(release: pathlib.Path) -> None:
     path = release / "sorted.jsonl.zst"
     os.truncate(path, os.path.getsize(path) // 2)
     result = _verify(release)
     assert result.returncode == 1 and "sorted.jsonl.zst:" in result.stdout
 
 
-def test_same_size_corruption_needs_full(release):
+def test_same_size_corruption_needs_full(release: pathlib.Path) -> None:
     """A flipped byte keeps the size: only --full sees it in a large file,
     and the small metadata files are always hashed."""
     path = _first_parquet(release)
@@ -101,14 +102,14 @@ def test_same_size_corruption_needs_full(release):
     assert result.returncode == 1 and "SCHEMA.md: SHA-256 differs" in result.stdout
 
 
-def test_marker_of_another_lake_fails(release):
+def test_marker_of_another_lake_fails(release: pathlib.Path) -> None:
     marker = release / ".RELEASE_COMPLETE.pending"
     marker.write_text(marker.read_text().replace("sha256sums_sha256: ", "sha256sums_sha256: 0"))
     result = _verify(release)
     assert result.returncode == 1 and "marker" in result.stdout
 
 
-def test_provenance_identifies_source_tools_and_params(release):
+def test_provenance_identifies_source_tools_and_params(release: pathlib.Path) -> None:
     with open(release / "provenance.json") as f:
         provenance = json.load(f)
     assert provenance["inputs"]["source"]["sha256"] == "ab" * 32

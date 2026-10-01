@@ -2,8 +2,10 @@
 partial lakes, the helpers, and every README example that is cheap to run."""
 
 import os
+import pathlib
 import re
 import shutil
+from typing import Any, NoReturn, cast
 
 import duckdb
 import pytest
@@ -11,24 +13,30 @@ import pytest
 import uniprot_parquet as up
 
 
+def _scalar(rel: duckdb.DuckDBPyRelation) -> Any:
+    # The first value of the first row: the queries here (count(*)) always give one row
+    return cast(tuple[Any, ...], rel.fetchone())[0]
+
+
 @pytest.fixture(scope="module")
-def full_lake(parquet_lake):
+def full_lake(parquet_lake: dict[str, str]) -> str:
     return parquet_lake["lake_dir"]
 
 
 @pytest.fixture(scope="module")
-def fixture_acc(full_lake):
+def fixture_acc(full_lake: str) -> dict[str, Any]:
     con = up.connect(full_lake)
-    accession, organism_id = con.sql("SELECT accession, organism_id FROM entries WHERE reviewed ORDER BY accession LIMIT 1").fetchone()
+    accession, organism_id = cast(tuple[str, int], con.sql(
+        "SELECT accession, organism_id FROM entries WHERE reviewed ORDER BY accession LIMIT 1").fetchone())
     iso = con.sql("SELECT accession FROM comments WHERE commentType = 'ALTERNATIVE PRODUCTS' LIMIT 1").fetchone()
     return {"accession": accession, "organism_id": organism_id, "isoform_acc": iso[0] if iso else None}
 
 
-def test_connect_full_lake(full_lake, fixture_acc):
+def test_connect_full_lake(full_lake: str, fixture_acc: dict[str, Any]) -> None:
     con = up.connect(full_lake)
     m = up.manifest(full_lake)
     for name, info in m["tables"].items():
-        assert con.sql(f"SELECT count(*) FROM {name}").fetchone()[0] == info["row_count"], name
+        assert _scalar(con.sql(f"SELECT count(*) FROM {name}")) == info["row_count"], name
     accession, organism_id = fixture_acc["accession"], fixture_acc["organism_id"]
     assert len(con.sql(f"SELECT * FROM protein_card('{accession}')").fetchall()) == 1
     con.sql(f"SELECT * FROM organism_features({organism_id}, 'Chain')").fetchall()
@@ -40,10 +48,10 @@ def test_connect_full_lake(full_lake, fixture_acc):
     if iso:
         assert len(con.sql(f"SELECT * FROM unnest_isoforms('{iso}')").fetchall()) > 0
     else:
-        assert con.sql(f"SELECT count(*) FROM unnest_isoforms('{accession}')").fetchone()[0] == 0
+        assert _scalar(con.sql(f"SELECT count(*) FROM unnest_isoforms('{accession}')")) == 0
 
 
-def _copy_partial(src, dst, tables):
+def _copy_partial(src: str, dst: str, tables: list[str]) -> str:
     for name in tables:
         shutil.copytree(os.path.join(src, name), os.path.join(dst, name))
     for f in ("manifest.json", "datapackage.json"):
@@ -51,11 +59,11 @@ def _copy_partial(src, dst, tables):
     return dst
 
 
-def test_connect_entries_only(full_lake, fixture_acc, tmp_path):
+def test_connect_entries_only(full_lake: str, fixture_acc: dict[str, Any], tmp_path: pathlib.Path) -> None:
     lake = _copy_partial(full_lake, str(tmp_path / "partial"), ["entries", "accession_map"])
     con = up.connect(lake)
     m = up.manifest(lake)
-    assert con.sql("SELECT count(*) FROM entries").fetchone()[0] == m["tables"]["entries"]["row_count"]
+    assert _scalar(con.sql("SELECT count(*) FROM entries")) == m["tables"]["entries"]["row_count"]
     assert len(con.sql(f"SELECT * FROM protein_card('{fixture_acc['accession']}')").fetchall()) == 1
     with pytest.raises(Exception, match="not in this lake copy"):
         con.sql("SELECT count(*) FROM features").fetchall()
@@ -66,7 +74,7 @@ def test_connect_entries_only(full_lake, fixture_acc, tmp_path):
     assert t["features"]["row_count"] == m["tables"]["features"]["row_count"]
 
 
-def test_connect_swissprot_only_copy(full_lake, tmp_path):
+def test_connect_swissprot_only_copy(full_lake: str, tmp_path: pathlib.Path) -> None:
     """A review_status=swissprot-only rsync (all tables, one partition each) works."""
     lake = str(tmp_path / "sp")
     m = up.manifest(full_lake)
@@ -79,14 +87,15 @@ def test_connect_swissprot_only_copy(full_lake, tmp_path):
         shutil.copy(os.path.join(full_lake, f), os.path.join(lake, f))
     con = up.connect(lake)
     sp = m["tables"]["entries"]["partitioning"]["keys"][0]["row_counts"]["swissprot"]
-    assert con.sql("SELECT count(*) FROM entries").fetchone()[0] == sp
-    assert con.sql("SELECT count(*) FROM entries WHERE NOT reviewed").fetchone()[0] == 0
-    assert con.sql("SELECT count(*) FROM features").fetchone()[0] > 0
+    assert _scalar(con.sql("SELECT count(*) FROM entries")) == sp
+    assert _scalar(con.sql("SELECT count(*) FROM entries WHERE NOT reviewed")) == 0
+    assert _scalar(con.sql("SELECT count(*) FROM features")) > 0
     t = up.tables(lake)["entries"]
     assert t["present"] and t["files_present"] < t["files_total"]
 
 
-def test_connect_files_for_organism_id_copy(full_lake, fixture_acc, tmp_path):
+def test_connect_files_for_organism_id_copy(full_lake: str, fixture_acc: dict[str, Any],
+                                            tmp_path: pathlib.Path) -> None:
     """A per-organism download (files_for_organism_id) of entries, plus the
     whole accession_map, works."""
     lake = str(tmp_path / "organism_id")
@@ -99,19 +108,19 @@ def test_connect_files_for_organism_id_copy(full_lake, fixture_acc, tmp_path):
     for f in ("manifest.json", "datapackage.json"):
         shutil.copy(os.path.join(full_lake, f), os.path.join(lake, f))
     con = up.connect(lake)
-    assert con.sql(f"SELECT count(*) FROM entries WHERE organism_id = {fixture_acc['organism_id']}").fetchone()[0] > 0
+    assert _scalar(con.sql(f"SELECT count(*) FROM entries WHERE organism_id = {fixture_acc['organism_id']}")) > 0
 
 
-def test_connect_without_manifest(full_lake, tmp_path):
+def test_connect_without_manifest(full_lake: str, tmp_path: pathlib.Path) -> None:
     lake = str(tmp_path / "nomanifest")
     shutil.copytree(full_lake, lake)
     os.remove(os.path.join(lake, "manifest.json"))
     con = up.connect(lake)
-    assert con.sql("SELECT count(*) FROM entries").fetchone()[0] > 0
-    assert con.sql("SELECT count(*) FROM features WHERE reviewed").fetchone()[0] > 0
+    assert _scalar(con.sql("SELECT count(*) FROM entries")) > 0
+    assert _scalar(con.sql("SELECT count(*) FROM features WHERE reviewed")) > 0
 
 
-def test_files_for_organism_id(full_lake, fixture_acc):
+def test_files_for_organism_id(full_lake: str, fixture_acc: dict[str, Any]) -> None:
     organism_id = fixture_acc["organism_id"]
     files = up.files_for_organism_id(full_lake, organism_id)
     assert files
@@ -123,13 +132,13 @@ def test_files_for_organism_id(full_lake, fixture_acc):
     assert up.files_for_organism_id(full_lake, organism_id, table="features")
 
 
-def test_files_for_organism_id_refuses_accession_map(full_lake):
+def test_files_for_organism_id_refuses_accession_map(full_lake: str) -> None:
     """accession_map is sorted by accession: no file subset is one organism's."""
     with pytest.raises(ValueError, match="accession_map is sorted by"):
         up.files_for_organism_id(full_lake, 9606, table="accession_map")
 
 
-def test_files_for_organism_id_null_bounds(full_lake, tmp_path):
+def test_files_for_organism_id_null_bounds(full_lake: str, tmp_path: pathlib.Path) -> None:
     """A foreign/hand-edited manifest with organism_id_max: null must be skipped, not crash."""
     import json
     m = up.manifest(full_lake)
@@ -143,30 +152,30 @@ def test_files_for_organism_id_null_bounds(full_lake, tmp_path):
     assert f"entries/{rel}" not in files
 
 
-def test_connect_path_with_quote(full_lake, tmp_path):
+def test_connect_path_with_quote(full_lake: str, tmp_path: pathlib.Path) -> None:
     """A lake path containing an apostrophe works (paths are SQL-escaped)."""
     lake = str(tmp_path / "o'brien" / "lake")
     shutil.copytree(full_lake, lake)
     con = up.connect(lake)  # manifest branch: explicit file list
-    assert con.sql("SELECT count(*) FROM entries").fetchone()[0] > 0
+    assert _scalar(con.sql("SELECT count(*) FROM entries")) > 0
     os.remove(os.path.join(lake, "manifest.json"))
     con = up.connect(lake)  # fallback branch: glob
-    assert con.sql("SELECT count(*) FROM entries").fetchone()[0] > 0
+    assert _scalar(con.sql("SELECT count(*) FROM entries")) > 0
 
 
-def test_entries_view_has_no_duplicate_or_partition_column(full_lake):
+def test_entries_view_has_no_duplicate_or_partition_column(full_lake: str) -> None:
     con = up.connect(full_lake)
     names = [r[0] for r in con.sql("DESCRIBE entries").fetchall()]
     assert len(names) == len(set(names))
     assert "review_status" not in names
 
 
-def test_split_sql_respects_quotes():
+def test_split_sql_respects_quotes() -> None:
     stmts = up._split_sql("SELECT 'a;b' AS x; SELECT 2;\nSELECT '[{\"k\":\"v;w\"}]'")
     assert stmts == ["SELECT 'a;b' AS x", "SELECT 2", "SELECT '[{\"k\":\"v;w\"}]'"]
 
 
-def test_schema_join_hints_execute(full_lake):
+def test_schema_join_hints_execute(full_lake: str) -> None:
     """Every join_hint schema() gives is SQL that runs, from the table its
     foreign keys point at (accession_map joins entries on primary_accession,
     a column entries does not have)."""
@@ -176,10 +185,10 @@ def test_schema_join_hints_execute(full_lake):
     for name, info in hints.items():
         target = {ref.split(".")[0] for ref in info["foreign_keys"].values()}
         assert target == {"entries"}, (name, target)
-        assert con.sql(f"SELECT count(*) FROM entries {info['join_hint']}").fetchone()[0] > 0, name
+        assert _scalar(con.sql(f"SELECT count(*) FROM entries {info['join_hint']}")) > 0, name
 
 
-def test_schema_helper(full_lake):
+def test_schema_helper(full_lake: str) -> None:
     overview = up.schema(full_lake)
     assert set(overview) >= {"entries", "features", "accession_map"}
     detail = up.schema(full_lake, "entries")
@@ -191,7 +200,7 @@ def test_schema_helper(full_lake):
 README = os.path.join(os.path.dirname(__file__), "..", "README.md")
 
 
-def _readme_sql_examples():
+def _readme_sql_examples() -> list[str]:
     """SQL from the README: every statement in a ```sql block and every
     con.sql(...) call in a ```python block that queries the views / macros."""
     with open(README) as f:
@@ -199,7 +208,7 @@ def _readme_sql_examples():
     stmts = []
     for block in re.findall(r"```sql\n(.*?)```", text, re.S):
         for stmt in up._split_sql(block):
-            body = "\n".join(l for l in stmt.splitlines() if not l.strip().startswith("--")).strip()
+            body = "\n".join(ln for ln in stmt.splitlines() if not ln.strip().startswith("--")).strip()
             if body.upper().startswith("SELECT") and "BASE}" not in body:
                 stmts.append(body)
     for block in re.findall(r"```python\n(.*?)```", text, re.S):
@@ -211,13 +220,13 @@ def _readme_sql_examples():
 
 
 @pytest.mark.parametrize("stmt", _readme_sql_examples())
-def test_readme_examples(full_lake, stmt):
+def test_readme_examples(full_lake: str, stmt: str) -> None:
     """Every README SQL example runs against the fixture lake (values may not exist; it must not error)."""
     con = up.connect(full_lake)
     con.sql(stmt).fetchall()
 
 
-def test_present_files_remote_probing(monkeypatch):
+def test_present_files_remote_probing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Remote copies: one probe per partition when its first file is there; a
     per-file fallback finds a hosted per-organism subset whose first file is
     missing (files_for_organism_id gives e.g. entries_00017.parquet alone)."""
@@ -226,25 +235,27 @@ def test_present_files_remote_probing(monkeypatch):
         [f"review_status=trembl/entries_{i:05d}.parquet" for i in (1, 2, 17, 18)]
     hosted = {f"{base}/entries/review_status=swissprot/entries_{i:05d}.parquet" for i in (1, 2, 3)} | \
         {f"{base}/entries/review_status=trembl/entries_00017.parquet"}
-    probes = []
+    probes: list[str] = []
 
-    def fake_probe(con, url):
+    def fake_probe(con: duckdb.DuckDBPyConnection, url: str) -> bool:
         probes.append(url)
         return url in hosted
 
     monkeypatch.setattr(up, "_remote_readable", fake_probe)
-    present = up._present_files(None, base, "entries", rels)
+    # None for the connection: the probe it would be handed to is faked
+    no_con = cast(duckdb.DuckDBPyConnection, None)
+    present = up._present_files(no_con, base, "entries", rels)
     assert present == sorted(hosted, key=lambda u: (("trembl" in u), u))
     # swissprot: first file present → one probe; trembl: first missing → the other three probed
     assert len(probes) == 1 + 4
-    assert up._present_files(None, base, "entries", []) == []
+    assert up._present_files(no_con, base, "entries", []) == []
 
 
 class _FailingConnection:
-    def __init__(self, error):
+    def __init__(self, error: Exception) -> None:
         self.error = error
 
-    def sql(self, query):
+    def sql(self, query: str) -> NoReturn:
         raise self.error
 
 
@@ -253,10 +264,11 @@ class _FailingConnection:
     duckdb.HTTPException('HTTP Error: Unable to connect to URL "s3://b/x.parquet": 403 (Forbidden).'),
     duckdb.IOException('IO Error: No files found that match the pattern "https://h/x.parquet"'),
 ])
-def test_remote_probe_not_found_means_absent(error):
+def test_remote_probe_not_found_means_absent(error: Exception) -> None:
     """A definite not-found is a file this copy does not hold (a partial or
     per-organism copy): left out of the views."""
-    assert up._remote_readable(_FailingConnection(error), "https://h/x.parquet") is False
+    con = cast(duckdb.DuckDBPyConnection, _FailingConnection(error))   # a stand-in: sql() raises ``error``
+    assert up._remote_readable(con, "https://h/x.parquet") is False
 
 
 @pytest.mark.parametrize("error", [
@@ -264,12 +276,13 @@ def test_remote_probe_not_found_means_absent(error):
     duckdb.IOException("IO Error: Could not establish connection error for HTTP HEAD to 'https://h/x.parquet'"),
     duckdb.HTTPException('HTTP Error: Unable to connect to URL "https://h/x.parquet": 429 (Too Many Requests).'),
 ])
-def test_remote_probe_failure_is_not_taken_as_absent(error):
+def test_remote_probe_failure_is_not_taken_as_absent(error: Exception) -> None:
     """Any other failure (a 5xx, a rate limit, a timeout) says nothing about
     whether the file exists: connect() stops rather than build views that
     silently miss the file's rows."""
-    with pytest.raises(RuntimeError, match="https://h/x.parquet"):
-        up._remote_readable(_FailingConnection(error), "https://h/x.parquet")
+    con = cast(duckdb.DuckDBPyConnection, _FailingConnection(error))   # a stand-in: sql() raises ``error``
+    with pytest.raises(RuntimeError, match=r"https://h/x.parquet"):
+        up._remote_readable(con, "https://h/x.parquet")
 
 
 # Shortcuts named like a UniProt REST return field and holding its value,
@@ -288,11 +301,12 @@ REST_NAME_EXCEPTIONS = {"feature_count", "comment_count"}
 REST_NAMES_NOT_USED = {"organism_name", "protein_name", "xref_proteomes"}
 
 
-def test_readme_lists_the_rest_named_shortcuts():
+def test_readme_lists_the_rest_named_shortcuts() -> None:
     """README §2's list of shortcuts that share a REST field name (and its
     value) is exactly the curated set, and no shortcut takes a REST name
     known to hold something else."""
     import re
+
     from parquet_transform import TABLE_META
     with open(README) as f:
         text = f.read()
@@ -301,7 +315,7 @@ def test_readme_lists_the_rest_named_shortcuts():
     assert set(re.findall(r"`(\w+)`", sentence)) == REST_NAMED_SHORTCUTS
     exceptions = text[text.index("Two names are the exception"):]
     exceptions = exceptions[:exceptions.index("\n")]
-    assert REST_NAME_EXCEPTIONS <= set(re.findall(r"`(\w+)`", exceptions))
+    assert set(re.findall(r"`(\w+)`", exceptions)) >= REST_NAME_EXCEPTIONS
     shortcuts = {c for meta in TABLE_META.values() for c in meta["columns"]["shortcut"]}
-    assert REST_NAMED_SHORTCUTS <= shortcuts
+    assert shortcuts >= REST_NAMED_SHORTCUTS
     assert not shortcuts & REST_NAMES_NOT_USED

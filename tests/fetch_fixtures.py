@@ -15,18 +15,15 @@ Usage:
     python tests/fetch_fixtures.py --force           # re-fetch even if present
 """
 
-from __future__ import annotations
-
 import argparse
 import gzip
 import json
-import os
-import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Any, cast
 
 SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
 ENTRY_URL = "https://rest.uniprot.org/uniprotkb"
@@ -39,7 +36,7 @@ FIXTURE_DIR = SCRIPT_DIR / "fixtures"
 # ── HTTP helpers ─────────────────────────────────────────────────────
 
 
-def _fetch_json(url: str, retries: int = 3) -> dict | None:
+def _fetch_json(url: str, retries: int = 3) -> dict[str, Any] | None:
     """Fetch JSON from a URL with retries on transient failures."""
     import http.client
 
@@ -47,7 +44,7 @@ def _fetch_json(url: str, retries: int = 3) -> dict | None:
         try:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=180) as resp:
-                return json.loads(resp.read())
+                return cast(dict[str, Any], json.loads(resp.read()))
         except (
             urllib.error.URLError,
             urllib.error.HTTPError,
@@ -63,9 +60,10 @@ def _fetch_json(url: str, retries: int = 3) -> dict | None:
             else:
                 print(f"    WARNING: Failed after {retries} attempts ({type(exc).__name__}: {exc}), skipping")
                 return None
+    return None
 
 
-def fetch_search(name: str, query: str, limit: int = MAX_PER_QUERY) -> list[dict]:
+def fetch_search(name: str, query: str, limit: int = MAX_PER_QUERY) -> list[dict[str, Any]]:
     """Run a UniProtKB search query and return the results list."""
     limit = min(limit, MAX_PER_QUERY)
     print(f"  {name} (limit {limit})...", end="", flush=True)
@@ -76,12 +74,12 @@ def fetch_search(name: str, query: str, limit: int = MAX_PER_QUERY) -> list[dict
     if data is None:
         print()
         return []
-    results = data.get("results", [])
+    results: list[dict[str, Any]] = data.get("results", [])
     print(f" {len(results)} entries")
     return results
 
 
-def fetch_entry(accession: str) -> dict | None:
+def fetch_entry(accession: str) -> dict[str, Any] | None:
     """Fetch a single entry by accession."""
     url = f"{ENTRY_URL}/{accession}.json"
     return _fetch_json(url)
@@ -90,7 +88,7 @@ def fetch_entry(accession: str) -> dict | None:
 # ── Annotation scoring ───────────────────────────────────────────────
 
 
-def annotation_count(entry: dict) -> int:
+def annotation_count(entry: dict[str, Any]) -> int:
     """Total annotation volume: features + xrefs + comments + references."""
     return (
         len(entry.get("features", []))
@@ -100,7 +98,7 @@ def annotation_count(entry: dict) -> int:
     )
 
 
-def annotation_summary(entry: dict) -> str:
+def annotation_summary(entry: dict[str, Any]) -> str:
     ft = len(entry.get("features", []))
     xr = len(entry.get("uniProtKBCrossReferences", []))
     cc = len(entry.get("comments", []))
@@ -111,7 +109,7 @@ def annotation_summary(entry: dict) -> str:
 # ── Champion discovery ───────────────────────────────────────────────
 
 
-def _discover_champions(reviewed: bool, n: int = 100) -> list[dict]:
+def _discover_champions(reviewed: bool, n: int = 100) -> list[dict[str, Any]]:
     """Sample candidate pools and return the top-N most annotated entries.
 
     For Swiss-Prot (reviewed=True), candidates come from:
@@ -131,7 +129,7 @@ def _discover_champions(reviewed: bool, n: int = 100) -> list[dict]:
     label = "Swiss-Prot" if reviewed else "TrEMBL"
     print(f"\n  Discovering top {n} {label} champions...")
 
-    pool: dict[str, dict] = {}  # acc → entry
+    pool: dict[str, dict[str, Any]] = {}  # acc → entry
 
     # ── Seed with known heavy hitters (by accession) ─────────────
     if reviewed:
@@ -284,10 +282,10 @@ STRESS_QUERIES: list[tuple[str, str] | tuple[str, str, int]] = [
 # ── Merge & deduplicate ──────────────────────────────────────────────
 
 
-def merge_entries(entry_lists: list[list[dict]]) -> list[dict]:
+def merge_entries(entry_lists: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
     """Merge multiple lists of entries, deduplicating by primaryAccession."""
     seen: set[str] = set()
-    merged: list[dict] = []
+    merged: list[dict[str, Any]] = []
     for entries in entry_lists:
         for entry in entries:
             acc = entry.get("primaryAccession", "")
@@ -297,7 +295,7 @@ def merge_entries(entry_lists: list[list[dict]]) -> list[dict]:
     return merged
 
 
-def write_fixture(entries: list[dict], output: Path) -> None:
+def write_fixture(entries: list[dict[str, Any]], output: Path) -> None:
     """Write entries to gzipped JSON in {"results": [...]} format."""
     output.parent.mkdir(parents=True, exist_ok=True)
     wrapped = {"results": entries}
@@ -310,7 +308,7 @@ def write_fixture(entries: list[dict], output: Path) -> None:
 # ── Main ─────────────────────────────────────────────────────────────
 
 
-def run_queries(queries: list) -> list[list[dict]]:
+def run_queries(queries: list[tuple[str, str] | tuple[str, str, int]]) -> list[list[dict[str, Any]]]:
     """Execute a list of (name, query[, limit]) tuples, return results."""
     results = []
     for item in queries:
@@ -346,7 +344,7 @@ def main() -> None:
 
     print(f"Fetching diverse test fixtures from UniProtKB REST API (scale: {args.scale})...\n")
 
-    all_results: list[list[dict]] = []
+    all_results: list[list[dict[str, Any]]] = []
 
     # ── Champion entries (top 100 from each) ──────────────────────
     print("═" * 68)

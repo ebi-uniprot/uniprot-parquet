@@ -17,11 +17,12 @@ Output:
 import argparse
 import json
 import os
+import statistics
 import sys
 import time
-import statistics
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pyarrow.parquet as pq
@@ -30,7 +31,7 @@ import pyarrow.parquet as pq
 # Utilities (shared with bench_baseline.py)
 # ---------------------------------------------------------------------------
 
-def _human_size(nbytes):
+def _human_size(nbytes: float) -> str:
     for unit in ("bytes", "KB", "MB", "GB", "TB"):
         if abs(nbytes) < 1024 or unit == "TB":
             if unit == "bytes":
@@ -40,12 +41,12 @@ def _human_size(nbytes):
     return f"{nbytes:.2f} TB"
 
 
-def _time_query(con, sql, warmup=1, runs=3):
+def _time_query(con: duckdb.DuckDBPyConnection, sql: str, warmup: int = 1, runs: int = 3) -> dict[str, Any]:
     """Run a query multiple times and return timing stats in milliseconds."""
     for _ in range(warmup):
         con.sql(sql).fetchall()
 
-    times = []
+    times: list[float] = []
     for _ in range(runs):
         t0 = time.perf_counter()
         result = con.sql(sql).fetchall()
@@ -67,7 +68,7 @@ def _time_query(con, sql, warmup=1, runs=3):
 # Query Suites (same 16 queries, adapted for each layout)
 # ---------------------------------------------------------------------------
 
-def _layout_a_queries(base):
+def _layout_a_queries(base: str) -> list[dict[str, str]]:
     """Layout A: single entries table, everything via VARIANT dot notation."""
     e = f"read_parquet('{base}/entries/*.parquet')"
     return [
@@ -268,7 +269,7 @@ def _layout_a_queries(base):
     ]
 
 
-def _layout_b_queries(base, *, arrays_stripped=False):
+def _layout_b_queries(base: str, *, arrays_stripped: bool = False) -> list[dict[str, str]]:
     """Layout B/C: star schema with VARIANT — child tables already unnested.
 
     Args:
@@ -461,7 +462,7 @@ def _layout_b_queries(base, *, arrays_stripped=False):
     ]
 
 
-def _layout_d_queries(base):
+def _layout_d_queries(base: str) -> list[dict[str, str]]:
     """Layout D: typed entries (baseline columns) + VARIANT child tables.
 
     Entries queries use typed convenience columns directly.
@@ -525,7 +526,8 @@ def _layout_d_queries(base):
         {
             "name": "count_by_organism",
             "description": "Entry count per organism (top 10)",
-            "sql": f"SELECT taxid, organism_name, count(*) AS n FROM {e} GROUP BY taxid, organism_name ORDER BY n DESC LIMIT 10",
+            "sql": (f"SELECT taxid, organism_name, count(*) AS n FROM {e} "
+                    "GROUP BY taxid, organism_name ORDER BY n DESC LIMIT 10"),
         },
         {
             "name": "feature_type_distribution",
@@ -603,21 +605,20 @@ def _layout_d_queries(base):
 # Run benchmarks for a layout
 # ---------------------------------------------------------------------------
 
-def run_query_suite(con, queries):
+def run_query_suite(con: duckdb.DuckDBPyConnection, queries: list[dict[str, str]]) -> dict[str, Any]:
     """Run all queries and return timing results."""
-    results = {}
+    results: dict[str, Any] = {}
     for q in queries:
         sql = q["sql"]
 
         # Handle parameterised queries
-        if "{acc}" in sql:
-            if "setup" in q:
-                setup_result = con.sql(q["setup"]).fetchone()
-                if setup_result:
-                    sql = sql.replace("{acc}", setup_result[0])
-                else:
-                    results[q["name"]] = {"skipped": "no data"}
-                    continue
+        if "{acc}" in sql and "setup" in q:
+            setup_result = con.sql(q["setup"]).fetchone()
+            if setup_result:
+                sql = sql.replace("{acc}", setup_result[0])
+            else:
+                results[q["name"]] = {"skipped": "no data"}
+                continue
 
         try:
             timing = _time_query(con, sql)
@@ -633,9 +634,9 @@ def run_query_suite(con, queries):
 # Storage Analysis
 # ---------------------------------------------------------------------------
 
-def analyze_storage(base_path):
+def analyze_storage(base_path: str) -> dict[str, Any]:
     """Analyze total and per-table Parquet sizes."""
-    results = {"tables": {}, "totals": {}}
+    results: dict[str, Any] = {"tables": {}, "totals": {}}
     total_bytes = 0
     total_rows = 0
     total_columns = 0
@@ -681,9 +682,9 @@ def analyze_storage(base_path):
 # Comparison Report
 # ---------------------------------------------------------------------------
 
-def format_comparison(all_results):
+def format_comparison(all_results: dict[str, Any]) -> str:
     """Generate a side-by-side comparison report."""
-    lines = []
+    lines: list[str] = []
     lines.append("=" * 90)
     lines.append("  VARIANT vs BASELINE BENCHMARK COMPARISON")
     lines.append(f"  Generated: {all_results['metadata']['timestamp']}")
@@ -740,7 +741,7 @@ def format_comparison(all_results):
         lines.append(f"  {name:<28} {parts[0]} {parts[1]} {parts[2]} {parts[3]} {parts[4]} {r_str:>8}")
 
     # Row count verification
-    lines.append(f"\n  Row count check:")
+    lines.append("\n  Row count check:")
     mismatches = []
     for name in bq:
         b_rows = bq.get(name, {}).get("row_count")
@@ -752,7 +753,7 @@ def format_comparison(all_results):
         for m in mismatches:
             lines.append(m)
     else:
-        lines.append(f"    All queries return identical row counts between Baseline and Layouts C/D ✓")
+        lines.append("    All queries return identical row counts between Baseline and Layouts C/D ✓")
 
     # ── Storage ──
     lines.append("\n┌────────────────────────────────────────────────────────────────────────────────┐")
@@ -769,7 +770,8 @@ def format_comparison(all_results):
 
     lines.append(f"  {'':>20} {'Base':>12} {'A':>12} {'B':>12} {'C':>12} {'D':>12}")
     lines.append(f"  {'─'*20} {'─'*12} {'─'*12} {'─'*12} {'─'*12} {'─'*12}")
-    for metric, key in [("Total size", "total_human"), ("Total rows", "total_rows"), ("Parquet columns", "total_parquet_columns")]:
+    for metric, key in [("Total size", "total_human"), ("Total rows", "total_rows"),
+                        ("Parquet columns", "total_parquet_columns")]:
         parts = []
         for src_key in ["base", "A", "B", "C", "D"]:
             v = storage_sources[src_key].get(key)
@@ -782,7 +784,7 @@ def format_comparison(all_results):
         lines.append(f"  {metric:<20} {parts[0]} {parts[1]} {parts[2]} {parts[3]} {parts[4]}")
 
     # Per-table
-    lines.append(f"\n  Per-table:")
+    lines.append("\n  Per-table:")
     all_tables = set()
     for layout_key in ["baseline", "layout_a", "layout_b", "layout_c", "layout_d"]:
         all_tables.update(all_results.get(layout_key, {}).get("storage", {}).get("tables", {}).keys())
@@ -814,10 +816,12 @@ def format_comparison(all_results):
 
     sc = baseline.get("schema_complexity", {})
     code = sc.get("code_complexity", {})
-    lines.append(f"  Baseline:  {code.get('total_pipeline_loc', '?')} LOC, {code.get('sql_builder_loc', '?')} SQL builder LOC ({code.get('sql_builder_pct', '?')}%)")
-    lines.append(f"             {sc.get('summary', {}).get('total_shortcut_columns', '?')} shortcut cols, {sc.get('summary', {}).get('total_source_columns', '?')} source cols")
+    lines.append(f"  Baseline:  {code.get('total_pipeline_loc', '?')} LOC, {code.get('sql_builder_loc', '?')} "
+                 f"SQL builder LOC ({code.get('sql_builder_pct', '?')}%)")
+    lines.append(f"             {sc.get('summary', {}).get('total_shortcut_columns', '?')} shortcut cols, "
+                 f"{sc.get('summary', {}).get('total_source_columns', '?')} source cols")
     lines.append(f"  VARIANT:   ~{bm.get('estimated_variant_loc', '?')} LOC, 0 SQL builder LOC")
-    lines.append(f"             0 convenience cols (VARIANT shredding replaces them)")
+    lines.append("             0 convenience cols (VARIANT shredding replaces them)")
 
     # ── Verdict ──
     lines.append("\n┌────────────────────────────────────────────────────────────────────────────────┐")
@@ -833,7 +837,8 @@ def format_comparison(all_results):
 
         if times_b and times_x:
             ratio = statistics.mean(times_x) / statistics.mean(times_b)
-            lines.append(f"  {label}  query: {ratio:>7.1f}x avg    storage: {x_bytes/b_bytes:.2f}x" if b_bytes else f"  {label}  query: {ratio:>7.1f}x avg")
+            lines.append(f"  {label}  query: {ratio:>7.1f}x avg    storage: {x_bytes/b_bytes:.2f}x" if b_bytes
+                         else f"  {label}  query: {ratio:>7.1f}x avg")
 
     lines.append("\n" + "=" * 90)
     lines.append("  END OF COMPARISON")
@@ -846,7 +851,7 @@ def format_comparison(all_results):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark VARIANT layouts")
     parser.add_argument("--variant-lake", default="benchmarks/variant_lake",
                         help="Path to VARIANT lake directory")
@@ -859,14 +864,14 @@ def main():
     repo_root = str(Path(__file__).resolve().parents[1])
     os.chdir(repo_root)
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     os.makedirs(args.output_dir, exist_ok=True)
 
     con = duckdb.connect()
 
-    all_results = {
+    all_results: dict[str, Any] = {
         "metadata": {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "duckdb_version": duckdb.__version__,
             "benchmark_type": "variant_comparison",
         }
@@ -882,8 +887,9 @@ def main():
     from uniprot_parquet import connect
     baseline_con = connect(str(Path(args.baseline_lake).resolve()))
 
-    from bench_baseline import QUERY_SUITE as baseline_queries, analyze_storage as baseline_storage_fn
-    baseline_results = {}
+    from bench_baseline import QUERY_SUITE as baseline_queries
+    from bench_baseline import analyze_storage as baseline_storage_fn
+    baseline_results: dict[str, Any] = {}
     for q in baseline_queries:
         sql = q["sql"]
         if "{acc}" in sql and "setup" in q:
@@ -924,8 +930,8 @@ def main():
     }
     errors_a = [k for k, v in a_results.items() if "error" in v]
     print(f"  {len(a_results)} queries ({len(errors_a)} errors)", file=sys.stderr)
-    for e in errors_a:
-        print(f"    ERROR {e}: {a_results[e]['error'][:100]}", file=sys.stderr)
+    for name in errors_a:
+        print(f"    ERROR {name}: {a_results[name]['error'][:100]}", file=sys.stderr)
 
     # ── Layout B ──
     print("\n[3/8] Running Layout B queries...", file=sys.stderr)
@@ -938,8 +944,8 @@ def main():
     }
     errors_b = [k for k, v in b_results.items() if "error" in v]
     print(f"  {len(b_results)} queries ({len(errors_b)} errors)", file=sys.stderr)
-    for e in errors_b:
-        print(f"    ERROR {e}: {b_results[e]['error'][:100]}", file=sys.stderr)
+    for name in errors_b:
+        print(f"    ERROR {name}: {b_results[name]['error'][:100]}", file=sys.stderr)
 
     # ── Layout C ──
     print("\n[4/8] Running Layout C queries...", file=sys.stderr)
@@ -952,8 +958,8 @@ def main():
     }
     errors_c = [k for k, v in c_results.items() if "error" in v]
     print(f"  {len(c_results)} queries ({len(errors_c)} errors)", file=sys.stderr)
-    for e in errors_c:
-        print(f"    ERROR {e}: {c_results[e]['error'][:100]}", file=sys.stderr)
+    for name in errors_c:
+        print(f"    ERROR {name}: {c_results[name]['error'][:100]}", file=sys.stderr)
 
     # ── Layout D ──
     layout_d_path = os.path.join(args.variant_lake, "layout_d")
@@ -967,8 +973,8 @@ def main():
         }
         errors_d = [k for k, v in d_results.items() if "error" in v]
         print(f"  {len(d_results)} queries ({len(errors_d)} errors)", file=sys.stderr)
-        for e in errors_d:
-            print(f"    ERROR {e}: {d_results[e]['error'][:100]}", file=sys.stderr)
+        for name in errors_d:
+            print(f"    ERROR {name}: {d_results[name]['error'][:100]}", file=sys.stderr)
     else:
         print("\n[5/8] Layout D not found, skipping...", file=sys.stderr)
 
