@@ -123,11 +123,11 @@ if [[ -f "$RELEASE_DIR/provenance.json" ]]; then
     echo "  Provenance:   $RELEASE_DIR/provenance.json"
 fi
 echo ""
-echo "Query with DuckDB:"
+echo "Query it from the repo root, or open demo.ipynb:"
 echo ""
 cat <<EOF
-import duckdb
-con = duckdb.connect()
-con.sql("SELECT * FROM read_parquet('$(pwd)/$RELEASE_DIR/lake/entries/**/*.parquet') LIMIT 5").show()
+from uniprot_parquet import connect
+con = connect("$(pwd)/$RELEASE_DIR/lake")
+con.sql("SELECT accession, gene_primary, protein_name_primary FROM entries LIMIT 5").show()
 EOF
 echo ""
