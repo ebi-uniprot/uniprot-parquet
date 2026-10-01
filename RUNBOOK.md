@@ -202,22 +202,24 @@ print(con.sql(\"SELECT feature_index, type, start_pos FROM features WHERE access
 A 1–5M-entry slice of the full dump best predicts full-run memory and disk, and
 is the input the provisional settings wait for (README, "Open decisions").
 `sample_jsonl.py` emits JSONL, not the JSON the workflow takes, so run the
-scripts directly:
+scripts directly. Write the slice outside the checkout (`S`): an untracked
+`slice_2m_lake/` in it would make later provenance record `dirty: true`.
 
 ```bash
+S=/path/to/scratch/slice; mkdir -p $S
 pigz -dc /path/to/UniProtKB.json.gz | python bin/stream_jsonl.py \
-  | python bin/sample_jsonl.py --n 2000000 --seed 1 > slice_2m.jsonl
-python bin/sort_jsonl.py slice_2m.jsonl -o slice_2m.sorted.jsonl.zst --memory-limit 12GB --threads 4
-/usr/bin/time -v python bin/parquet_transform.py slice_2m.sorted.jsonl.zst --outdir slice_2m_lake \
+  | python bin/sample_jsonl.py --n 2000000 --seed 1 > $S/slice_2m.jsonl
+python bin/sort_jsonl.py $S/slice_2m.jsonl -o $S/slice_2m.sorted.jsonl.zst --memory-limit 12GB --threads 4
+/usr/bin/time -v python bin/parquet_transform.py $S/slice_2m.sorted.jsonl.zst --outdir $S/slice_2m_lake \
     --memory-limit 12GB --threads 4 --release slice          # macOS: /usr/bin/time -l
-python bin/validate_lake.py --lake slice_2m_lake --jsonl slice_2m.sorted.jsonl.zst --expected-count 2000000
-# the measurements the provisional settings wait for
-python benchmarks/bench_zstd.py --jsonl slice_2m.sorted.jsonl.zst --out benchmarks/results/
-python benchmarks/bench_file_size.py --jsonl slice_2m.sorted.jsonl.zst --out benchmarks/results/
-python benchmarks/bench_point_lookup.py --lake slice_2m_lake --serve --label slice
+python bin/validate_lake.py --lake $S/slice_2m_lake --jsonl $S/slice_2m.sorted.jsonl.zst --expected-count 2000000
+# the measurements the provisional settings wait for (results/ is git-ignored)
+python benchmarks/bench_zstd.py --jsonl $S/slice_2m.sorted.jsonl.zst --out benchmarks/results/
+python benchmarks/bench_file_size.py --jsonl $S/slice_2m.sorted.jsonl.zst --out benchmarks/results/
+python benchmarks/bench_point_lookup.py --lake $S/slice_2m_lake --serve --label slice
 ```
 
-**Checks**: the validator exits 0; `du -sh slice_2m_lake` × 125 estimates the
+**Checks**: the validator exits 0; `du -sh $S/slice_2m_lake` × 125 estimates the
 full lake; peak RSS does not scale linearly (DuckDB spills) but should stay well
 under the 96 GB the full run requests.
 
@@ -455,7 +457,7 @@ completed process and republishes every output whole.
 | Head job / login session killed mid-run | Re-submit. A copy cut short mid-publish is repaired; `RELEASE_COMPLETE` is written only after `bin/verify_release.py` passes. For hash-level certainty: `bin/verify_release.py <release dir> --full`. |
 | `RELEASE_COMPLETE not written: the published copy ... does not match its metadata` | Something changed the release directory during or after publishing (full disk, another process). Re-submit. |
 | A job hit its wall time | SORT_JSONL, PARQUET_TRANSFORM and VALIDATE retry once with twice the time (capped at `--max_time`); STREAM_JSONL and PROVENANCE do not. If it still fails, raise `--max-time` within the queue's limit, or re-submit. PARQUET_TRANSFORM always restarts in a fresh work dir: the whole transform re-runs. |
-| `PARQUET_TRANSFORM` OOM twice | Raise `MEMORY=` in `run_lake.sh`'s `full` mode (or `--process_memory`) and re-submit. |
+| `PARQUET_TRANSFORM` OOM twice | Raise `MEMORY=` in `run_lake.sh`'s `full` mode and commit it (an uncommitted edit makes provenance record `dirty: true`), or run Nextflow directly with `--process_memory`; then re-submit. |
 | `Process requirement exceeds available memory` (local) | `--process_memory` exceeds the machine; lower it (DuckDB spills to `--duckdb_temp`). |
 | `STREAM_JSONL`: `FATAL — count mismatch` | The dump is not the release you think, or is truncated: re-check `EXPECTED` and `pigz -t`. |
 | `STREAM_JSONL`: `FATAL — LoneSurrogate` or `Integer exceeds 64-bit range` | The dump holds data a JSON line cannot carry exactly (an unpaired `\uD800`-style escape; an integer outside −2^63 … 2^64−1); the message names the entry (and byte offset). Report it to UniProt; the pipeline refuses rather than change data. |
