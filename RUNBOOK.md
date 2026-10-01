@@ -197,6 +197,44 @@ print(con.sql('SELECT division, count(*) FROM entries GROUP BY 1 ORDER BY 2 DESC
 print(con.sql(\"SELECT feature_index, type, start_pos FROM features WHERE accession = 'P01308' ORDER BY feature_index\").fetchall()[:5])"
 ```
 
+### 4c. Rehearse the SLURM runs (stand-in SLURM)
+
+`tests/fake_slurm/` holds stand-ins for `sbatch`, `squeue` and `scancel`: on
+the PATH, the `short` and `prod` profiles go through Nextflow's real SLURM
+executor, and each job script runs on this machine. Requests are recorded in
+`$FAKE_SLURM_DIR/<jobid>.sbatch`, not enforced. Each run gets its own copy of
+the input, so nothing is served from an earlier stage's cache.
+
+```bash
+R=/path/to/scratch/rehearse; mkdir -p $R/oom/reports
+export FAKE_SLURM_DIR=$R/slurm PATH=$(pwd)/tests/fake_slurm:$PATH
+for run in smoke oom full; do cp tests/fixtures/small.json.gz $R/$run.json.gz; done
+
+# 7a: short profile through run_lake.sh
+./run_lake.sh subset --input $R/smoke.json.gz --outdir $R/smoke --duckdb-tmp $R/duckdb_tmp
+# 7b: DuckDB out of memory at 2.5 GB, retried at 5 GB
+nextflow run upjson2lake.nf -profile short --inputfile $R/oom.json.gz --outdir $R/oom \
+    --release oom --process_memory '2.5 GB' -ansi-log false
+# 8b: prod profile through run_lake.sh, with your queue's MaxWall
+./run_lake.sh full --expected-count 52 --first-release --release full --input $R/full.json.gz \
+    --outdir $R/full --duckdb-tmp $R/duckdb_tmp --max-time <MaxWall, e.g. 72h>
+```
+
+**Checks**: after each run, the checks of the stage it rehearses (7a checks
+2–4, 7b, and stage 9 checks 1 and 4); then the requests each job was submitted with:
+
+```bash
+for f in $FAKE_SLURM_DIR/*.sbatch; do echo "$(grep -o 'nf-[A-Z_]*' $f) $(grep -oE -- '(-c|-t|--mem|-p) \S+' $f | tr '\n' ' ')"; done
+#   smoke: -t 04:00:00 -p short, --mem 16384M for SORT/TRANSFORM/VALIDATE
+#   oom:   SORT_JSONL and PARQUET_TRANSFORM each twice: --mem 2560M, then 5120M
+#   full:  the 8a table (-p production; transform -c 4 -t 48:00:00 --mem 98304M; VALIDATE -c 8)
+```
+
+This proves the profiles, the headers, the retry scaling, `run_lake.sh` and
+the `wd` helper. It cannot prove what only the cluster knows (queue limits,
+the environment on the nodes, shared filesystems, the OOM killer): stage 7
+still runs there. `tests/test_workflow.py` runs the prod case on every CI run.
+
 ## 5. (Optional) Real-data slice and benchmarks
 
 A 1–5M-entry slice of the full dump best predicts full-run memory and disk, and
@@ -237,11 +275,22 @@ in stage 0. `run_lake.sh` relies on the active conda env carrying over to the
 compute nodes (no container), so run the stage 0 checks, and optionally
 stage 1's tests, inside `srun --pty bash`.
 
+Nextflow's work directory holds every intermediate file (the JSONL twice, the
+transform's staging Parquet, each output before it is published): hundreds of
+GB at full scale. It defaults to `work/` in the launch directory, the checkout,
+which on a cluster is often a home directory with a quota. Put it on scratch
+that every compute node can see, in every shell you launch from:
+
+```bash
+export NXF_WORK=/scratch/$USER/nf_work   # keep it the same for every re-submit: -resume looks there
+```
+
 ## 7. SLURM smoke test and OOM retry (`short` queue)
 
 Run `run_lake.sh` from `tmux`/`screen` on the login node, or as a light `sbatch`
 head job: it blocks until Nextflow finishes. To find a task's work directory
-(latest attempt) during or after a run:
+(latest attempt) during or after a run (only tasks submitted by the latest run,
+not cached ones; `.nextflow.log` is rewritten by every run):
 
 ```bash
 wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //'; }
@@ -268,7 +317,7 @@ grep -c "executor > slurm" .nextflow.log              # >= 1
 
 # 2. Nodes see the env and tools
 grep "SLURM Job ID" $(wd STREAM_JSONL)/.command.log   # beforeScript ran on a node
-grep -l "command not found" work/*/*/.command.err     # no output
+grep -l "command not found" $NXF_WORK/*/*/.command.err   # no output
 
 # 3. The 2a end-state checks on /scratch/$USER/uplake_smoke/subset/
 #    (RELEASE_COMPLETE, VERDICT, expected count, provenance commit, checksums, SCHEMA.md)
@@ -296,9 +345,11 @@ nextflow run upjson2lake.nf -profile short --inputfile tests/fixtures/small.json
 
 ```bash
 ls /scratch/$USER/uplake_oom/oom/RELEASE_COMPLETE
+#   the console ends "[FAILED] completed=7 failed=2": the two failed attempts are counted,
+#   but the run succeeded (exit 0, marker written)
 nextflow log last -f name,status,exit,memory,time
 #   SORT_JSONL and PARQUET_TRANSFORM twice each: FAILED 75 2.5 GB, then COMPLETED 0 5 GB (prod: 96 -> 192 GB)
-grep -l "FATAL — DuckDB ran out of memory" work/*/*/.command.err   # the two failed attempts
+grep -l "FATAL — DuckDB ran out of memory" $NXF_WORK/*/*/.command.err   # the two failed attempts
 rm -rf /scratch/$USER/uplake_oom /scratch/$USER/uplake_smoke
 ```
 
@@ -331,7 +382,8 @@ ls -l /path/to/UniProtKB.json.gz          # ~160 GB compressed for 2026 releases
 # 4. Disk: spill under --duckdb_temp peaks at ~1-2 TB (SORT_JSONL ~1 TB, then PARQUET_TRANSFORM);
 #    the transform also stages the JSONL as Parquet in its work dir; the published release is
 #    tens to a few hundred GB. `disk` directives are not passed to SLURM, so nothing reserves this
-df -h /scratch/$USER                      # >= 3 TB free if work dir and spill share it, plus the output
+df -h /scratch/$USER                      # >= 3 TB free if $NXF_WORK and spill share it, plus the output
+echo $NXF_WORK                            # set (stage 6), on that scratch filesystem
 
 # 5. Queue limits. Requests, attempt 1 -> retry:
 #      STREAM_JSONL       4 CPUs   4 GB          48h         (not retried)
@@ -449,7 +501,8 @@ head -5 $OUT/SCHEMA.md
 
 ## 10. Recovery cheatsheet
 
-"Re-submit" means the identical `run_lake.sh` command: `-resume` reuses every
+"Re-submit" means the identical `run_lake.sh` command, from the same directory
+with the same `NXF_WORK`: `-resume` reuses every
 completed process and republishes every output whole.
 
 | Symptom | What to do |

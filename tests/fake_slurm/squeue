@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stand-in for squeue (see sbatch): "<jobid> <state>" for every job, R while
+# its script runs and CD after, whatever the options.
+state="${FAKE_SLURM_DIR:-/tmp/fake_slurm_${USER:-$(id -un)}}"
+for pidfile in "$state"/*.pid; do
+    [[ -e "$pidfile" ]] || continue
+    id=$(basename "$pidfile" .pid)
+    if kill -0 "$(cat "$pidfile")" 2>/dev/null; then echo "$id R"; else echo "$id CD"; fi
+done

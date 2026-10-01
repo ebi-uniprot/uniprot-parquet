@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stand-in for scancel (see sbatch): kills the jobs' scripts.
+state="${FAKE_SLURM_DIR:-/tmp/fake_slurm_${USER:-$(id -un)}}"
+for id in "$@"; do
+    [[ -e "$state/$id.pid" ]] && pkill -TERM -P "$(cat "$state/$id.pid")" 2>/dev/null
+    [[ -e "$state/$id.pid" ]] && kill -TERM "$(cat "$state/$id.pid")" 2>/dev/null
+done
+exit 0

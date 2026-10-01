@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Stand-in for SLURM's sbatch, so Nextflow's slurm executor (the short and prod
+# profiles) runs on a machine without SLURM: the job script runs here in the
+# background.  Resource requests are recorded, not enforced.  State lives in
+# $FAKE_SLURM_DIR (default /tmp/fake_slurm_$USER).
+set -euo pipefail
+state="${FAKE_SLURM_DIR:-/tmp/fake_slurm_${USER:-$(id -un)}}"
+mkdir -p "$state"
+script="${@: -1}"                                   # Nextflow: sbatch .command.run
+id=$(( $(cat "$state/last_id" 2>/dev/null || echo 1000) + 1 ))
+echo "$id" > "$state/last_id"
+grep '^#SBATCH' "$script" > "$state/$id.sbatch" || true
+echo "$(pwd)" > "$state/$id.workdir"
+# The job's output goes where #SBATCH -o says (Nextflow: .command.log), as with SLURM.
+out=$(sed -n 's/^#SBATCH -o //p' "$script" | head -1)
+SLURM_JOB_ID=$id SLURM_JOBID=$id nohup bash "$script" > "${out:-/dev/null}" 2>&1 &
+echo $! > "$state/$id.pid"
+echo "Submitted batch job $id"

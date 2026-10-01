@@ -269,3 +269,53 @@ def test_provenance_identifies_the_source_dump(launch_dir):
     assert provenance["tools"]["nextflow"] and provenance["tools"]["duckdb"]
     assert provenance["params"]["release"] == "prev"
     assert provenance["params"]["process_memory"] == "4 GB"
+
+
+# ─── The SLURM profiles, on the stand-in tests/fake_slurm ──────────────
+
+
+def test_prod_profile_on_stand_in_slurm(tmp_path):
+    """The prod profile through Nextflow's slurm executor (sbatch, squeue and
+    scancel stood in by tests/fake_slurm): every process is submitted with
+    the requests RUNBOOK 8a lists; DuckDB's out-of-memory error is retried
+    with twice the memory and the time, capped at --max_time; the job's
+    output lands in .command.log with beforeScript's job id; and the log
+    names each submitted task's work directory (the RUNBOOK's wd helper)."""
+    import re
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    (launch / "no_reports.config").write_text(
+        "trace.enabled = false\nreport.enabled = false\n"
+        "timeline.enabled = false\ndag.enabled = false\n")
+    state = tmp_path / "slurm"
+    fake = os.path.join(PROJECT_ROOT, "tests", "fake_slurm")
+    env = {**os.environ, "FAKE_SLURM_DIR": str(state), "NXF_OFFLINE": "true",
+           "PATH": os.pathsep.join([fake, os.path.dirname(sys.executable), os.environ["PATH"]])}
+    result = subprocess.run(
+        ["nextflow", "run", WORKFLOW, "-c", "no_reports.config", "-profile", "prod", "-ansi-log", "false",
+         "--inputfile", SMALL_JSON_GZ, "--outdir", "out", "--release", "slurm",
+         "--process_memory", "2.5 GB", "--max_time", "50h", "--expected_count", "52"],
+        cwd=launch, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout[-3000:]
+    assert (launch / "out" / "slurm" / "RELEASE_COMPLETE").exists()
+
+    def requests(job):
+        text = job.read_text()
+        name = re.search(r"#SBATCH -J nf-([A-Z_]+)", text).group(1).rstrip("_")
+        opts = dict(re.findall(r"#SBATCH (-c|-t|--mem|-p) (\S+)", text))
+        return name, opts.get("-c"), opts["-t"], opts["--mem"], opts["-p"]
+    jobs = [requests(j) for j in sorted(state.glob("*.sbatch"), key=lambda p: int(p.stem))]
+    assert jobs == [
+        ("STREAM_JSONL", "4", "48:00:00", "4096M", "production"),
+        ("SORT_JSONL", "4", "24:00:00", "2560M", "production"),         # DuckDB out of memory: exit 75
+        ("SORT_JSONL", "4", "48:00:00", "5120M", "production"),         # retry: twice memory and time
+        ("PARQUET_TRANSFORM", "4", "48:00:00", "2560M", "production"),
+        ("PARQUET_TRANSFORM", "4", "50:00:00", "5120M", "production"),  # 96h capped at --max_time
+        ("VALIDATE", "8", "24:00:00", "2560M", "production"),
+        ("PROVENANCE", None, "24:00:00", "1024M", "production"),
+    ], jobs
+    assert all("--mail-type=FAIL" in j.read_text() for j in state.glob("*.sbatch"))
+
+    log = (launch / ".nextflow.log").read_text()
+    workdir = re.findall(r"submitted process VALIDATE.*workDir: (\S+)", log)[-1]
+    assert "SLURM Job ID: " in open(os.path.join(workdir, ".command.log")).read()
