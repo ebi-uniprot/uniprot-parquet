@@ -99,8 +99,8 @@ class TestEntryFields:
     def test_organism_name_preserved(self, originals, lake_entries):
         for accession, orig in originals.items():
             lake = lake_entries[accession]
-            assert lake["organism_name"] == orig["organism"]["scientificName"], (
-                f"{accession}: organism_name mismatch"
+            assert lake["organism_scientific_name"] == orig["organism"]["scientificName"], (
+                f"{accession}: organism_scientific_name mismatch"
             )
 
     def test_seq_length_preserved(self, originals, lake_entries):
@@ -363,7 +363,7 @@ class TestConvenienceColumns:
                 x["id"] for x in (orig.get("uniProtKBCrossReferences") or [])
                 if x["database"] == "Proteomes"
             })
-            assert (lake_entries[accession].get("xref_proteomes") or []) == expected, f"{accession}: xref_proteomes"
+            assert (lake_entries[accession].get("proteome_id") or []) == expected, f"{accession}: proteome_id"
 
     def test_division_values(self, originals, lake_entries):
         allowed = {"archaea", "bacteria", "fungi", "human", "invertebrates", "mammals",

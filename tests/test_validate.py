@@ -584,7 +584,7 @@ def _failed(report_path):
     ("entries", "lit_pubmed_id", lambda v: []),
     ("entries", "date_created", lambda v: None),
     ("entries", "reviewed", lambda v: not v),
-    ("features", "organism_name", lambda v: "x"),
+    ("features", "organism_scientific_name", lambda v: "x"),
     ("features", "start_pos", lambda v: None if v is None else v + 1),
 ])
 def test_wrong_shortcut_values_fail_check_21(small_lake, tmp_path, table, column, fn):

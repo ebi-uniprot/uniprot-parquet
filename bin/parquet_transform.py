@@ -401,13 +401,13 @@ COLUMN_TYPES: dict[tuple[str, str], str] = {
        for table in ("entries", "features", "xrefs", "comments", "publications", "accession_map")
        for column, ctype in (("accession", "VARCHAR"), ("reviewed", "BOOLEAN"), ("organism_id", "BIGINT"))},
     ("entries", "id"): "VARCHAR",
-    ("entries", "organism_name"): "VARCHAR",
+    ("entries", "organism_scientific_name"): "VARCHAR",
     ("entries", "length"): "INTEGER",
     ("entries", "division"): "VARCHAR",
     ("entries", "ec"): "VARCHAR[]",
     ("entries", "go_id"): "VARCHAR[]",
     ("entries", "xref_dbs"): "VARCHAR[]",
-    ("entries", "xref_proteomes"): "VARCHAR[]",
+    ("entries", "proteome_id"): "VARCHAR[]",
     ("entries", "keywordid"): "VARCHAR[]",
     ("entries", "keyword"): "VARCHAR[]",
     ("entries", "keyword_categories"): "VARCHAR[]",
@@ -416,7 +416,7 @@ COLUMN_TYPES: dict[tuple[str, str], str] = {
     ("entries", "date_sequence_modified"): "DATE",
     **{("entries", count): "INTEGER" for _, _, count in CHILD_TABLES.values()},
     ("entries", "lit_pubmed_id"): "VARCHAR[]",
-    ("features", "organism_name"): "VARCHAR",
+    ("features", "organism_scientific_name"): "VARCHAR",
     ("features", "length"): "INTEGER",
     ("features", "start_pos"): "INTEGER",
     ("features", "end_pos"): "INTEGER",
@@ -450,7 +450,7 @@ COLUMN_SOURCES: dict[tuple[str, str], str] = {
     ("entries", "id"): "uniProtkbId",
     ("entries", "reviewed"): "entryType",
     ("entries", "organism_id"): "organism.taxonId",
-    ("entries", "organism_name"): "organism.scientificName",
+    ("entries", "organism_scientific_name"): "organism.scientificName",
     ("entries", "gene_primary"): "genes.geneName.value",
     ("entries", "protein_name_primary"): "proteinDescription.recommendedName.fullName.value",
     ("entries", "length"): "sequence.length",
@@ -458,7 +458,7 @@ COLUMN_SOURCES: dict[tuple[str, str], str] = {
     ("entries", "alt_protein_names"): "proteinDescription.alternativeNames.fullName.value",
     ("entries", "go_id"): "uniProtKBCrossReferences.id",
     ("entries", "xref_dbs"): "uniProtKBCrossReferences.database",
-    ("entries", "xref_proteomes"): "uniProtKBCrossReferences.id",
+    ("entries", "proteome_id"): "uniProtKBCrossReferences.id",
     ("entries", "keywordid"): "keywords.id",
     ("entries", "keyword"): "keywords.name",
     ("entries", "keyword_categories"): "keywords.category",
@@ -470,7 +470,7 @@ COLUMN_SOURCES: dict[tuple[str, str], str] = {
        for table in CHILD_TABLES
        for column, source in (("accession", "primaryAccession"), ("reviewed", "entryType"),
                               ("organism_id", "organism.taxonId"))},
-    ("features", "organism_name"): "organism.scientificName",
+    ("features", "organism_scientific_name"): "organism.scientificName",
     ("features", "length"): "sequence.length",
     ("features", "start_pos"): "features.location.start.value",
     ("features", "end_pos"): "features.location.end.value",
@@ -1028,7 +1028,7 @@ SELECT
     {c('id', 'e.uniProtkbId')}                      AS id,
     {c('reviewed', REVIEWED_EXPR)}                  AS reviewed,
     {c('organism_id', 'e.organism.taxonId')}              AS organism_id,
-    {c('organism_name', 'e.organism.scientificName')} AS organism_name,
+    {c('organism_scientific_name', 'e.organism.scientificName')} AS organism_scientific_name,
     {gene_names_expr}                               AS gene_primary,
     {protein_name_expr}                             AS protein_name_primary,
     {c('length', 'e.sequence.length')}          AS length,
@@ -1049,7 +1049,7 @@ SELECT
     {c('go_id', go_ids_expr)}                      AS go_id,
     {go_terms_expr}                                 AS go_terms,
     {c('xref_dbs', xref_dbs_expr)}                  AS xref_dbs,
-    {c('xref_proteomes', proteome_ids_expr)}          AS xref_proteomes,
+    {c('proteome_id', proteome_ids_expr)}          AS proteome_id,
     {c('keywordid', _keyword_list('id'))}         AS keywordid,
     {c('keyword', _keyword_list('name'))}     AS keyword,
     {c('keyword_categories', _keyword_list('category'))} AS keyword_categories,
@@ -1101,7 +1101,7 @@ SELECT
     sub.accession,
     sub.reviewed,
     sub.organism_id,
-    sub.organism_name,
+    sub.organism_scientific_name,
     sub.length,
     {_cast("features", "feature_index", "ordinality - 1")} AS feature_index,
     {_cast("features", "start_pos", "unnest.location.start.value")} AS start_pos,
@@ -1109,7 +1109,7 @@ SELECT
     {ligand_id}                                     AS ligand_id,
     {evidence_codes}                                AS evidence_codes{_child_sources_sql("features", schema_paths, json_paths)}
 
-{_child_from("features", schema_paths, {"organism_name": "e.organism.scientificName",
+{_child_from("features", schema_paths, {"organism_scientific_name": "e.organism.scientificName",
                                                 "length": "e.sequence.length"})}
 """
 
@@ -1254,10 +1254,10 @@ TABLE_META = {
             # Same order as the SELECT in _build_entries_sql (the sequence
             # source column sits after length).
             "shortcut": [
-                "accession", "id", "reviewed", "organism_id", "organism_name", "gene_primary",
+                "accession", "id", "reviewed", "organism_id", "organism_scientific_name", "gene_primary",
                 "protein_name_primary", "length",
                 "gene_synonym", "alt_protein_names", "ec", "division",
-                "go_id", "go_terms", "xref_dbs", "xref_proteomes",
+                "go_id", "go_terms", "xref_dbs", "proteome_id",
                 "keywordid", "keyword", "keyword_categories",
                 "date_created", "date_modified", "date_sequence_modified",
                 "feature_count", "xref_count", "comment_count", "reference_count", "lit_pubmed_id",
@@ -1271,7 +1271,7 @@ TABLE_META = {
         "foreign_keys": {"accession": "entries.accession", "organism_id": "entries.organism_id"},
         "columns": {
             "shortcut": [
-                "accession", "reviewed", "organism_id", "organism_name", "length", "feature_index",
+                "accession", "reviewed", "organism_id", "organism_scientific_name", "length", "feature_index",
                 "start_pos", "end_pos", "ligand_id", "evidence_codes",
             ],
         },
@@ -1743,7 +1743,7 @@ def _file_details(table_dir, rel_path):
                 mins.append(stats.min)
                 maxs.append(stats.max)
     return {"size_bytes": os.path.getsize(path), "sha256": sha, "md5": md5,
-            "taxid_min": min(mins) if mins else None, "taxid_max": max(maxs) if maxs else None}
+            "organism_id_min": min(mins) if mins else None, "organism_id_max": max(maxs) if maxs else None}
 
 
 def hash_file(path, chunk_size=8 << 20):
@@ -1865,7 +1865,7 @@ COLUMN_DESCRIPTIONS = {
     ("entries", "id"):                 "UniProtKB mnemonic entry name (e.g. A4_HUMAN). May change between releases.",
     ("entries", "reviewed"):           "True for Swiss-Prot (manually reviewed); false for TrEMBL (automated annotation).",
     ("entries", "organism_id"):              "NCBI taxonomy ID of the source organism (e.g. 9606 for Homo sapiens).",
-    ("entries", "organism_name"):      "Scientific name of the source organism.",
+    ("entries", "organism_scientific_name"):      "Scientific name of the source organism.",
     ("entries", "gene_primary"):         "Primary gene name of each gene of the entry, in the genes array's order; NULL for a gene with no geneName (ORF or ordered locus names only).",
     ("entries", "protein_name_primary"):       "Recommended (Swiss-Prot) or submitted (TrEMBL) full protein name.",
     ("entries", "length"):         "Sequence length in amino acids.",
@@ -1878,9 +1878,9 @@ COLUMN_DESCRIPTIONS = {
     ("entries", "go_id"):             "Distinct Gene Ontology term IDs (e.g. GO:0005634) from cross-references.",
     ("entries", "go_terms"):           "GO annotations as {id, aspect (P/F/C), term, evidence_type}; go_id is the flat id list.",
     ("entries", "xref_dbs"):           "Distinct database names referenced in cross-references (e.g. PDB, Ensembl).",
-    ("entries", "xref_proteomes"):       "Distinct UniProt proteome ids (UP…) from cross-references, sorted.",
-    ("entries", "keywordid"):        "UniProt keyword IDs (e.g. KW-0181).",
-    ("entries", "keyword"):      "UniProt keyword names (e.g. 'Complete proteome').",
+    ("entries", "proteome_id"):       "Distinct UniProt proteome ids (UP…) from cross-references, sorted.",
+    ("entries", "keywordid"):        "UniProt keyword IDs (e.g. KW-0418).",
+    ("entries", "keyword"):      "UniProt keyword names (e.g. 'Kinase').",
     ("entries", "keyword_categories"): "Keyword categories aligned with keywordid (e.g. Molecular function, Biological process).",
     ("entries", "date_created"):       "Date the entry was first made public in UniProtKB (entryAudit.firstPublicDate as a DATE).",
     ("entries", "date_modified"):      "Date of the last annotation update (entryAudit.lastAnnotationUpdateDate as a DATE).",
@@ -1909,7 +1909,7 @@ COLUMN_DESCRIPTIONS = {
 
     # ── features ──
     **{("features", k): v for k, v in _KEY_DESCRIPTIONS.items()},
-    ("features", "organism_name"):     "Scientific name of the parent entry's organism (denormalized for convenience).",
+    ("features", "organism_scientific_name"):     "Scientific name of the parent entry's organism (denormalized for convenience).",
     ("features", "length"):        "Sequence length of the parent entry (denormalized for coverage calculations).",
     ("features", "feature_index"):     "Position of this feature in the entry's features array (0-based). ORDER BY feature_index gives UniProt's order.",
     ("features", "start_pos"):         "Start position in the sequence (1-based, inclusive): location.start.value.",

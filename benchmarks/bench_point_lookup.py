@@ -46,8 +46,8 @@ from _bench_common import (  # noqa: E402
     read_parquet_source,
 )
 
-HOT = "accession, id, reviewed, organism_id, organism_name, gene_primary, protein_name_primary, length, sequence"
-DEFAULT7 = "accession, id, reviewed, organism_id, organism_name, gene_primary, protein_name_primary"
+HOT = "accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary, length, sequence"
+DEFAULT7 = "accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary"
 SIZES = (1, 37, 1000)
 TABLES = ("entries", "features", "xrefs")
 

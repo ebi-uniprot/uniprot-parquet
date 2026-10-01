@@ -295,7 +295,7 @@ class TestManifest:
             for rel, d in info["file_details"].items():
                 path = os.path.join(lake_dir, table, rel)
                 assert os.path.getsize(path) == d["size_bytes"], rel
-                assert d["taxid_min"] is not None and d["taxid_min"] <= d["taxid_max"], rel
+                assert d["organism_id_min"] is not None and d["organism_id_min"] <= d["organism_id_max"], rel
             rel = info["files"][0]
             with open(os.path.join(lake_dir, table, rel), "rb") as fh:
                 assert hashlib.sha256(fh.read()).hexdigest() == info["file_details"][rel]["sha256"]
@@ -446,10 +446,10 @@ class TestSchema:
         names = set(entries_ds.schema.names)
         required = {
             # shortcuts
-            "accession", "id", "reviewed", "organism_id", "organism_name", "gene_primary",
+            "accession", "id", "reviewed", "organism_id", "organism_scientific_name", "gene_primary",
             "gene_synonym", "protein_name_primary", "alt_protein_names", "length", "go_id",
             "xref_dbs", "feature_count", "xref_count", "comment_count", "reference_count",
-            "go_terms", "xref_proteomes", "lit_pubmed_id", "division",
+            "go_terms", "proteome_id", "lit_pubmed_id", "division",
             "keyword_categories", "date_created",
             # source columns: the entry's keys
             "entryType", "primaryAccession", "uniProtkbId", "entryAudit", "organism",
@@ -462,7 +462,7 @@ class TestSchema:
         """UniProt's default result columns, organism_id and the sequence are first
         and contiguous."""
         assert entries_ds.schema.names[:9] == [
-            "accession", "id", "reviewed", "organism_id", "organism_name", "gene_primary",
+            "accession", "id", "reviewed", "organism_id", "organism_scientific_name", "gene_primary",
             "protein_name_primary", "length", "sequence",
         ]
         assert entries_ds.schema.names[9] == "gene_synonym"
@@ -504,7 +504,7 @@ class TestSchema:
     def test_features_required_columns(self, features_ds):
         names = set(features_ds.schema.names)
         required = {
-            "accession", "reviewed", "organism_id", "organism_name", "length", "feature_index",
+            "accession", "reviewed", "organism_id", "organism_scientific_name", "length", "feature_index",
             "start_pos", "end_pos", "ligand_id", "evidence_codes",
             "type", "location", "description", "featureId", "evidences", "ligand",
         }

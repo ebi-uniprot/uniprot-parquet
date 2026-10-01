@@ -123,7 +123,7 @@ QUERY_SUITE = [
         "name": "count_by_organism",
         "description": "Entry count per organism (top 10)",
         "table": "entries",
-        "sql": "SELECT organism_id, organism_name, count(*) AS n FROM entries GROUP BY organism_id, organism_name ORDER BY n DESC LIMIT 10",
+        "sql": "SELECT organism_id, organism_scientific_name, count(*) AS n FROM entries GROUP BY organism_id, organism_scientific_name ORDER BY n DESC LIMIT 10",
     },
     {
         "name": "feature_type_distribution",
@@ -170,7 +170,7 @@ QUERY_SUITE = [
         "name": "nested_organism_access",
         "description": "Access nested organism struct directly",
         "table": "entries",
-        "sql": "SELECT accession, organism_id, organism_name, organism.synonyms FROM entries WHERE organism_id = 9606",
+        "sql": "SELECT accession, organism_id, organism_scientific_name, organism.synonyms FROM entries WHERE organism_id = 9606",
     },
     {
         "name": "nested_protein_desc_access",

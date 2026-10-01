@@ -85,11 +85,13 @@ def test_connect_swissprot_only_copy(full_lake, tmp_path):
     assert t["present"] and t["files_present"] < t["files_total"]
 
 
-def test_connect_files_for_taxid_copy(full_lake, fixture_acc, tmp_path):
-    """A per-organism download (files_for_taxid) of entries + accession_map works."""
+def test_connect_files_for_organism_id_copy(full_lake, fixture_acc, tmp_path):
+    """A per-organism download (files_for_organism_id) of entries, plus the
+    whole accession_map, works."""
     lake = str(tmp_path / "organism_id")
-    files = up.files_for_taxid(full_lake, fixture_acc["organism_id"]) + \
-        up.files_for_taxid(full_lake, fixture_acc["organism_id"], table="accession_map")
+    amap = up.manifest(full_lake)["tables"]["accession_map"]["files"]
+    files = up.files_for_organism_id(full_lake, fixture_acc["organism_id"]) + \
+        [f"accession_map/{rel}" for rel in amap]
     for rel in files:
         os.makedirs(os.path.dirname(os.path.join(lake, rel)), exist_ok=True)
         shutil.copy(os.path.join(full_lake, rel), os.path.join(lake, rel))
@@ -108,28 +110,35 @@ def test_connect_without_manifest(full_lake, tmp_path):
     assert con.sql("SELECT count(*) FROM features WHERE reviewed").fetchone()[0] > 0
 
 
-def test_files_for_taxid(full_lake, fixture_acc):
+def test_files_for_organism_id(full_lake, fixture_acc):
     organism_id = fixture_acc["organism_id"]
-    files = up.files_for_taxid(full_lake, organism_id)
+    files = up.files_for_organism_id(full_lake, organism_id)
     assert files
     fd = up.manifest(full_lake)["tables"]["entries"]["file_details"]
     for f in files:
         rel = f.split("/", 1)[1]
-        assert fd[rel]["taxid_min"] <= organism_id <= fd[rel]["taxid_max"]
-    assert up.files_for_taxid(full_lake, -1) == []
+        assert fd[rel]["organism_id_min"] <= organism_id <= fd[rel]["organism_id_max"]
+    assert up.files_for_organism_id(full_lake, -1) == []
+    assert up.files_for_organism_id(full_lake, organism_id, table="features")
 
 
-def test_files_for_taxid_null_bounds(full_lake, tmp_path):
-    """A foreign/hand-edited manifest with taxid_max: null must be skipped, not crash."""
+def test_files_for_organism_id_refuses_accession_map(full_lake):
+    """accession_map is sorted by accession: no file subset is one organism's."""
+    with pytest.raises(ValueError, match="accession_map is sorted by"):
+        up.files_for_organism_id(full_lake, 9606, table="accession_map")
+
+
+def test_files_for_organism_id_null_bounds(full_lake, tmp_path):
+    """A foreign/hand-edited manifest with organism_id_max: null must be skipped, not crash."""
     import json
     m = up.manifest(full_lake)
     fd = m["tables"]["entries"]["file_details"]
     rel = next(iter(fd))
-    fd[rel]["taxid_max"] = None
+    fd[rel]["organism_id_max"] = None
     lake = tmp_path / "nullbounds"
     lake.mkdir()
     (lake / "manifest.json").write_text(json.dumps(m))
-    files = up.files_for_taxid(str(lake), 9606)
+    files = up.files_for_organism_id(str(lake), 9606)
     assert f"entries/{rel}" not in files
 
 
@@ -154,6 +163,19 @@ def test_entries_view_has_no_duplicate_or_partition_column(full_lake):
 def test_split_sql_respects_quotes():
     stmts = up._split_sql("SELECT 'a;b' AS x; SELECT 2;\nSELECT '[{\"k\":\"v;w\"}]'")
     assert stmts == ["SELECT 'a;b' AS x", "SELECT 2", "SELECT '[{\"k\":\"v;w\"}]'"]
+
+
+def test_schema_join_hints_execute(full_lake):
+    """Every join_hint schema() gives is SQL that runs, from the table its
+    foreign keys point at (accession_map joins entries on primary_accession,
+    a column entries does not have)."""
+    con = up.connect(full_lake)
+    hints = {name: info for name, info in up.schema(full_lake).items() if "join_hint" in info}
+    assert set(hints) >= {"features", "xrefs", "comments", "publications", "accession_map"}
+    for name, info in hints.items():
+        target = {ref.split(".")[0] for ref in info["foreign_keys"].values()}
+        assert target == {"entries"}, (name, target)
+        assert con.sql(f"SELECT count(*) FROM entries {info['join_hint']}").fetchone()[0] > 0, name
 
 
 def test_schema_helper(full_lake):
@@ -197,7 +219,7 @@ def test_readme_examples(full_lake, stmt):
 def test_present_files_remote_probing(monkeypatch):
     """Remote copies: one probe per partition when its first file is there; a
     per-file fallback finds a hosted per-organism subset whose first file is
-    missing (files_for_taxid gives e.g. entries_00017.parquet alone)."""
+    missing (files_for_organism_id gives e.g. entries_00017.parquet alone)."""
     base = "https://example.org/lake"
     rels = [f"review_status=swissprot/entries_{i:05d}.parquet" for i in (1, 2, 3)] + \
         [f"review_status=trembl/entries_{i:05d}.parquet" for i in (1, 2, 17, 18)]
@@ -215,3 +237,38 @@ def test_present_files_remote_probing(monkeypatch):
     # swissprot: first file present → one probe; trembl: first missing → the other three probed
     assert len(probes) == 1 + 4
     assert up._present_files(None, base, "entries", []) == []
+
+
+# Shortcuts named like a UniProt REST return field and holding its value,
+# checked by hand against rest.uniprot.org/configure/uniprotkb/result-fields
+# and sample REST responses (2026-10-01).  A new shortcut with a REST name
+# goes here only once its values are checked to match REST's.
+REST_NAMED_SHORTCUTS = {
+    "accession", "id", "reviewed", "organism_id", "gene_primary", "gene_synonym", "length", "ec",
+    "go_id", "keyword", "keywordid", "date_created", "date_modified", "date_sequence_modified",
+    "lit_pubmed_id",
+}
+# REST names a shortcut reuses for a different value (README says so).
+REST_NAME_EXCEPTIONS = {"feature_count", "comment_count"}
+# Every other REST return field name a shortcut must not take: those that
+# hold a different value from a similarly named lake column.
+REST_NAMES_NOT_USED = {"organism_name", "protein_name", "xref_proteomes"}
+
+
+def test_readme_lists_the_rest_named_shortcuts():
+    """README §2's list of shortcuts that share a REST field name (and its
+    value) is exactly the curated set, and no shortcut takes a REST name
+    known to hold something else."""
+    import re
+    from parquet_transform import TABLE_META
+    with open(README) as f:
+        text = f.read()
+    sentence = text[text.index("holds that field's value:"):]
+    sentence = sentence[:sentence.index("(as typed values")]
+    assert set(re.findall(r"`(\w+)`", sentence)) == REST_NAMED_SHORTCUTS
+    exceptions = text[text.index("Two names are the exception"):]
+    exceptions = exceptions[:exceptions.index("\n")]
+    assert REST_NAME_EXCEPTIONS <= set(re.findall(r"`(\w+)`", exceptions))
+    shortcuts = {c for meta in TABLE_META.values() for c in meta["columns"]["shortcut"]}
+    assert REST_NAMED_SHORTCUTS <= shortcuts
+    assert not shortcuts & REST_NAMES_NOT_USED

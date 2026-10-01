@@ -20,11 +20,11 @@ The dump is the source of truth. A hand-written copy of its schema would go stal
 
 ### 2. Two kinds of column: UniProt's JSON, and shortcuts
 
-Every table holds UniProt's JSON as it is shipped, one column per key, next to a few typed shortcut columns. Both kinds use UniProt's own names: **a camelCase column is a key of UniProt's JSON; a snake_case column is a shortcut, named like the UniProt REST API's return field for the same value** (`accession`, `organism_id`, `gene_primary`, `length`, `ec`, `go_id`, `keyword`, `keywordid`, `date_created`, `lit_pubmed_id`, ...; the list is at `rest.uniprot.org/configure/uniprotkb/result-fields`). A shortcut with no REST equivalent (`division`, `go_terms`, `*_count`, `*_index`, `start_pos`, ...) has a descriptive name, and none reuses a REST name for a different value: UniProt's `protein_name` lists every name, so the one main name here is `protein_name_primary`.
+Every table holds UniProt's JSON as it is shipped, one column per key, next to a few typed shortcut columns. Both kinds use UniProt's own names: **a camelCase column is a key of UniProt's JSON; a snake_case column is a shortcut**. A shortcut that shares its name with a UniProt REST API return field (the list is at `rest.uniprot.org/configure/uniprotkb/result-fields`) holds that field's value: `accession`, `id`, `reviewed`, `organism_id`, `gene_primary`, `gene_synonym`, `length`, `ec`, `go_id`, `keyword`, `keywordid`, `date_created`, `date_modified`, `date_sequence_modified`, `lit_pubmed_id` (as typed values: `reviewed` is a boolean, lists are arrays, dates are DATEs). Two names are the exception: REST's `feature_count` and `comment_count` give a count per type ("Chain (1); Domain (2)"), where the lake's give the number of rows. Every other shortcut has a descriptive name that REST does not use (`organism_scientific_name`, `protein_name_primary`, `proteome_id`, `division`, `go_terms`, `*_index`, `start_pos`, ...): REST's `organism_name` is "Homo sapiens (Human)" and its `protein_name` lists every name, so the lake's scientific name and one main name have names of their own.
 
 | | Source columns | Shortcut columns |
 | --- | --- | --- |
-| What | One per top-level key of the table's JSON element: the entry (`entryType`, `organism`, `proteinDescription`, `sequence`, `genes`, ...), the feature (`type`, `location`, `ligand`, `evidences`, ...), the cross-reference, the comment or the reference | Keys (`accession`, `reviewed`, `organism_id`, `*_index`), UniProt's default result columns (`id`, `organism_name`, `gene_primary`, `protein_name_primary`, `length`) and values derived from several fields (`ec`, `go_terms`, `division`, `lit_pubmed_id`, `start_pos`, `text_value`, ...) |
+| What | One per top-level key of the table's JSON element: the entry (`entryType`, `organism`, `proteinDescription`, `sequence`, `genes`, ...), the feature (`type`, `location`, `ligand`, `evidences`, ...), the cross-reference, the comment or the reference | Keys (`accession`, `reviewed`, `organism_id`, `*_index`), UniProt's default result columns (`id`, `organism_scientific_name`, `gene_primary`, `protein_name_primary`, `length`) and values derived from several fields (`ec`, `go_terms`, `division`, `lit_pubmed_id`, `start_pos`, `text_value`, ...) |
 | Names | UniProt's JSON keys, exactly | snake_case, fixed |
 | Types | Inferred from the release's input, the value as shipped | Declared in code (`COLUMN_TYPES`), identical in every release and every subset build |
 | Holds | The element itself: the source columns of a row are the JSON object | Copies and derivations, never needed to rebuild the JSON |
@@ -73,7 +73,7 @@ A field is read where UniProt puts it: a ligand's ChEBI id is `features.ligand.i
 An 8-week sample of live UniProt REST API logs (January–August 2026) was used to check the design against real demand:
 
 - 94% of the fields that programmatic users filter or return mapped to a named column of `entries` in the schema this sample was checked against; each of them is a shortcut or a field of a source column today.
-- Every one of the 20 most requested field pairs is among nine columns: `accession`, `id`, `reviewed`, `organism_id`, `organism_name`, `gene_primary`, `protein_name_primary`, `length`, `sequence` (the sequence object; the amino acids are `sequence.value`). These are the first nine columns of `entries`, stored together.
+- Every one of the 20 most requested field pairs is among nine columns: `accession`, `id`, `reviewed`, `organism_id`, `organism_scientific_name`, `gene_primary`, `protein_name_primary`, `length`, `sequence` (the sequence object; the amino acids are `sequence.value`). These are the first nine columns of `entries`, stored together.
 - The one pattern row-group statistics cannot serve is lookup by accession, which is why `accession_map` exists.
 
 ### 7. Releases
@@ -109,12 +109,12 @@ Shortcut columns (snake_case, declared types) are listed first, then the **sourc
 
 **entries**: one row per protein.
 
-- Shortcuts: `accession`, `id`, `reviewed`, `organism_id`, `organism_name`, `gene_primary` (one element per gene, NULL for a gene with only ORF or locus names), `protein_name_primary` (falls back to the submitted name for TrEMBL entries), `length`, `gene_synonym`, `alt_protein_names`, `ec` (every EC number of the entry's naming blocks and of its domains' and chains' — `includes` and `contains` — as REST's `ec`), `division` (the UniProt FTP taxonomic division: `archaea`, `bacteria`, `fungi`, `human`, `invertebrates`, `mammals`, `plants`, `rodents`, `vertebrates`, `viruses`, `unclassified`), `go_id`, `go_terms` (`{id, aspect (P/F/C), term, evidence_type}`), `xref_dbs`, `xref_proteomes`, `keywordid`, `keyword`, `keyword_categories`, `date_created`, `date_modified`, `date_sequence_modified` (DATEs), `feature_count`, `xref_count`, `comment_count`, `reference_count`, `lit_pubmed_id` (distinct, stored as strings: numeric ids in numeric order, then any non-numeric id)
+- Shortcuts: `accession`, `id`, `reviewed`, `organism_id`, `organism_scientific_name`, `gene_primary` (one element per gene, NULL for a gene with only ORF or locus names), `protein_name_primary` (falls back to the submitted name for TrEMBL entries), `length`, `gene_synonym`, `alt_protein_names`, `ec` (every EC number of the entry's naming blocks and of its domains' and chains' — `includes` and `contains` — as REST's `ec`), `division` (the UniProt FTP taxonomic division: `archaea`, `bacteria`, `fungi`, `human`, `invertebrates`, `mammals`, `plants`, `rodents`, `vertebrates`, `viruses`, `unclassified`), `go_id`, `go_terms` (`{id, aspect (P/F/C), term, evidence_type}`), `xref_dbs`, `proteome_id`, `keywordid`, `keyword`, `keyword_categories`, `date_created`, `date_modified`, `date_sequence_modified` (DATEs), `feature_count`, `xref_count`, `comment_count`, `reference_count`, `lit_pubmed_id` (distinct, stored as strings: numeric ids in numeric order, then any non-numeric id)
 - **Source:** `sequence` (`value`, `length`, `molWeight`, `crc64`, `md5`; stored after `length`), `entryType`, `primaryAccession`, `secondaryAccessions`, `uniProtkbId`, `entryAudit` (dates and versions as strings), `annotationScore`, `organism` (`scientificName`, `commonName`, `synonyms`, `taxonId`, `lineage`, `evidences`), `organismHosts`, `proteinExistence`, `proteinDescription` (`recommendedName`, `alternativeNames`, `submissionNames`, `flag`, `contains`, `includes`, ...), `genes`, `geneLocations`, `keywords`, `extraAttributes` (`countByCommentType`, `countByFeatureType`, `uniParcId`)
 
 **features**: one row per positional annotation.
 
-- Shortcuts: `accession`, `reviewed`, `organism_id`, `organism_name`, `length`, `feature_index`, `start_pos`, `end_pos`, `ligand_id`, `evidence_codes`
+- Shortcuts: `accession`, `reviewed`, `organism_id`, `organism_scientific_name`, `length`, `feature_index`, `start_pos`, `end_pos`, `ligand_id`, `evidence_codes`
 - **Source:** `type`, `location` (`start` / `end` as `{value, modifier}`, `sequence`), `description`, `featureId`, `evidences`, `featureCrossReferences`, `ligand` (`name`, `id`, `label`, `note`), `ligandPart`, `alternativeSequence` (`originalSequence`, `alternativeSequences`)
 
 **xrefs**: one row per cross-reference.
@@ -157,7 +157,7 @@ con.sql("SELECT * FROM protein_card('P04637')").show()
 con.sql("SELECT * FROM organism_features(9606, 'Domain')").show()
 ```
 
-The returned object is a standard `duckdb.DuckDBPyConnection`. `connect()` also works on a partial download: querying a table you did not download fails with a message naming the directory to fetch. `schema()`, `tables()`, `manifest()`, `datapackage()` and `files_for_taxid()` describe a lake without scanning it.
+The returned object is a standard `duckdb.DuckDBPyConnection`. `connect()` also works on a partial download: querying a table you did not download fails with a message naming the directory to fetch. `schema()`, `tables()`, `manifest()`, `datapackage()` and `files_for_organism_id()` describe a lake without scanning it.
 
 ### setup_views.sql (plain SQL)
 
@@ -243,6 +243,8 @@ SELECT primary_accession, reviewed, organism_id FROM accession_map WHERE accessi
 SELECT * FROM entries  WHERE reviewed = true AND organism_id = 9606 AND accession = 'P04637';
 SELECT * FROM features WHERE reviewed = true AND organism_id = 9606 AND accession = 'P04637';
 ```
+
+Run step 2 with the values step 1 returned, as literals. Measured with `EXPLAIN ANALYZE` (DuckDB 1.5, 2026-10-01), a subquery or a join from `accession_map` in step 2 is not pruned: DuckDB does not push its values into the row-group statistics. The single-accession macros (`protein_card`, `unnest_isoforms`) therefore filter on `accession` alone.
 
 `SELECT * FROM entries WHERE accession = 'P04637'` also works, but it scans the whole `accession` column. That is fine locally on `entries`, slow on the child tables, and one HTTP range request per row group remotely.
 
@@ -334,7 +336,7 @@ rsync -avm --include='*/' --include='review_status=swissprot/***' --include='*.j
 rsync -av rsync://<host>/<release>/lake/ ./lake/
 ```
 
-A release is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors should check it first. `python bin/verify_release.py <release> --full` re-checks a downloaded or mirrored copy: every file listed, every SHA-256 matching `SHA256SUMS.txt` and `provenance.json`, no stray Parquet file. `curl --metalink RELEASE.metalink` works as on the rest of the UniProt FTP. Without downloading, `connect("https://<host>/<release>/lake")` reads only the byte ranges a query needs; use the two-step accession lookup for remote point queries.
+A release is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors should check it first. `python bin/verify_release.py <release> --full` re-checks a downloaded or mirrored copy: every file listed, every SHA-256 matching `SHA256SUMS.txt` and `provenance.json`, no stray Parquet file. To fetch the whole lake over HTTP(S) with every file checked against its size and checksums, use the Metalink file with aria2: `aria2c -M RELEASE.metalink --metalink-base-uri=https://<host>/<release>/lake/` (its `<url>` entries are relative to the lake directory; curl dropped Metalink support in 7.78). Without downloading, `connect("https://<host>/<release>/lake")` reads only the byte ranges a query needs; use the two-step accession lookup for remote point queries.
 
 ---
 
@@ -357,7 +359,7 @@ A release is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors sh
 - **`manifest.json`** lists every Parquet file with its size, SHA-256, MD5 and organism_id range, and every table's schema, row count, sort order, partitioning, keys and column categories (`shortcut`, `source`). Tools and LLM agents can read it to discover the data and write correct joins without scanning files.
 - **`datapackage.json`** is a [Frictionless Data Package](https://specs.frictionlessdata.io/data-package/) descriptor with the full Arrow type, nullability and description of every column, primary and foreign keys, licensing and provenance.
 - **Parquet footers** carry the release, `schema_version`, licence and zstd level; every field carries its description, category and source path.
-- **`SHA256SUMS.txt`** (`sha256sum -c` format) covers the whole lake; **`RELEASE.metalink`** (Metalink 4) lists the same files for `curl --metalink`.
+- **`SHA256SUMS.txt`** (`sha256sum -c` format) covers the whole lake; **`RELEASE.metalink`** (Metalink 4) lists the same files with sizes and SHA-256/MD5 hashes, for `aria2c -M` (each `<url>` is relative to the lake directory).
 - **`LICENSE`** carries the CC BY 4.0 text with a header naming UniProtKB as the source, so a copied directory keeps its terms.
 
 ## Schema versioning

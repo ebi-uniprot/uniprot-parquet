@@ -27,7 +27,7 @@ from _bench_common import (  # noqa: E402
     serve_directory, duckdb_http_connection, time_query, write_results, read_parquet_source,
 )
 
-QUERY = ("SELECT accession, id, reviewed, organism_id, organism_name, gene_primary, protein_name_primary, length "
+QUERY = ("SELECT accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary, length "
          "FROM read_parquet({source}, hive_partitioning = true) WHERE organism_id = {organism_id}")
 TARGETS_MB = (256, 512, 1024)
 FULL_ENTRIES = 248_000_000

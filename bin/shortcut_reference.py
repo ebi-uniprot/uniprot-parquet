@@ -127,7 +127,7 @@ def expected_shortcuts(entry: dict) -> dict[str, list[dict]]:
     accession = entry.get("primaryAccession")
     reviewed = ENTRY_TYPES.get(entry.get("entryType"))
     organism_id = _get(entry, "organism", "taxonId")
-    organism_name = _get(entry, "organism", "scientificName")
+    organism_scientific_name = _get(entry, "organism", "scientificName")
     length = _get(entry, "sequence", "length")
     keys = {"accession": accession, "reviewed": reviewed, "organism_id": organism_id}
 
@@ -150,7 +150,7 @@ def expected_shortcuts(entry: dict) -> dict[str, list[dict]]:
     entries_row = {
         **keys,
         "id": entry.get("uniProtkbId"),
-        "organism_name": organism_name,
+        "organism_scientific_name": organism_scientific_name,
         "gene_primary": [_get(g, "geneName", "value") for g in genes],
         "protein_name_primary": _protein_name_primary(desc),
         "length": length,
@@ -161,8 +161,8 @@ def expected_shortcuts(entry: dict) -> dict[str, list[dict]]:
         "go_id": _distinct(x.get("id") for x in go_xrefs),
         "go_terms": [_go_term(x) for x in go_xrefs],
         "xref_dbs": _distinct(x.get("database") for x in xrefs),
-        "xref_proteomes": sorted(_distinct(x.get("id") for x in xrefs
-                                           if x.get("database") == "Proteomes")),
+        "proteome_id": sorted(_distinct(x.get("id") for x in xrefs
+                                        if x.get("database") == "Proteomes")),
         "keywordid": [k.get("id") for k in keywords],
         "keyword": [k.get("name") for k in keywords],
         "keyword_categories": [k.get("category") for k in keywords],
@@ -184,7 +184,7 @@ def expected_shortcuts(entry: dict) -> dict[str, list[dict]]:
     out = {
         "entries": [entries_row],
         "features": children("features", lambda f: {
-            "organism_name": organism_name,
+            "organism_scientific_name": organism_scientific_name,
             "length": length,
             "start_pos": _get(f, "location", "start", "value"),
             "end_pos": _get(f, "location", "end", "value"),
@@ -219,7 +219,7 @@ def _comparable(table: str, column: str, value):
 
 _LIST_COLUMNS = {
     "entries": {"gene_primary", "gene_synonym", "alt_protein_names", "ec", "go_id", "go_terms",
-                "xref_dbs", "xref_proteomes", "keywordid", "keyword", "keyword_categories",
+                "xref_dbs", "proteome_id", "keywordid", "keyword", "keyword_categories",
                 "lit_pubmed_id"},
     "features": {"evidence_codes"},
 }

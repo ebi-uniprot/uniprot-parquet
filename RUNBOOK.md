@@ -63,9 +63,9 @@ python -m pytest tests/ -q --stress      # ~8 min; ~14K entries (one-time ~60 MB
 
 **Checks**
 
-- `301 passed, 1 xfailed`, no skips, no failures (the `--stress` count is the same).
-  Without `nextflow` on the PATH, 5 workflow tests are skipped:
-  `296 passed, 5 skipped, 1 xfailed`.
+- All passed: no failures, no errors, no skips, and exactly 1 xfailed (the
+  same with `--stress`). Without `nextflow` on the PATH, the workflow tests
+  (`tests/test_workflow.py`) are skipped: put it on the PATH so they run.
 - If the fixture fetch fails (no network), run `python tests/fetch_fixtures.py`
   from a machine that can reach `rest.uniprot.org` and copy
   `tests/fixtures/diverse*.json.gz` over.
@@ -98,7 +98,7 @@ grep -c "Execution complete -- Goodbye" .nextflow.log     # 1
 ls datalake/small/RELEASE_COMPLETE
 
 # 3. Validation: all checks passed, including the pre-sort entry-count anchor
-grep VERDICT datalake/small/validation_report.txt          # VERDICT: ALL CHECKS PASSED (172/172 ...)
+grep VERDICT datalake/small/validation_report.txt          # VERDICT: ALL CHECKS PASSED (N/N checks passed, 0 failed, ...)
 grep "expected count" datalake/small/validation_report.txt # [PASS] ... expected=52, jsonl=52, entries=52
 grep -E "reconstruction matches|shortcut values match" datalake/small/validation_report.txt
 #   [PASS] reconstruction matches JSONL for 31/31 Swiss-Prot and 21/21 TrEMBL entries
@@ -320,7 +320,7 @@ then repeat the stage 0 checks **inside an interactive job on a compute node**
 git rev-parse HEAD                       # the commit Part A passed on
 srun --pty bash
 #   on the node: the stage 0 checks, then
-python -m pytest tests/ -q               # optional: 260 passed, 1 xfailed (as in step 1), proves the node's libraries
+python -m pytest tests/ -q               # optional: all passed, 1 xfailed (as in step 1), proves the node's libraries
 ```
 
 ---

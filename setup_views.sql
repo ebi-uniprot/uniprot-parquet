@@ -19,14 +19,10 @@
 --   with open('setup_views.sql') as f:
 --       con.sql(f.read().replace('${BASE}', base))
 --
--- Usage (remote — EBI FTP via httpfs):
---
---   import duckdb
---   con = duckdb.connect()
---   con.sql("INSTALL httpfs; LOAD httpfs;")
---   base = 'https://ftp.ebi.ac.uk/pub/databases/uniprot/knowledgebase/parquet/2026_01/lake'
---   with open('setup_views.sql') as f:
---       con.sql(f.read().replace('${BASE}', base))
+-- Remote lakes (https://): DuckDB cannot expand a glob over HTTP(S), so
+-- these views do not work there.  Use uniprot_parquet.connect(url), which
+-- lists every file from the manifest.  (An s3:// copy can be globbed with
+-- httpfs loaded.)
 --
 -- After setup, query with plain table names:
 --   con.sql("SELECT * FROM entries WHERE organism_id = 9606 LIMIT 5")
@@ -66,12 +62,17 @@ CREATE OR REPLACE VIEW accession_map AS SELECT * EXCLUDE (review_status) REPLACE
 --   SELECT * FROM protein_card('P04637');
 --   SELECT * FROM organism_features(9606, 'Domain');
 
--- Full annotation card for a single protein: entry + features + xrefs
--- Returns one row per feature/xref combination for a single accession.
--- Use this when you want everything about one protein at a glance.
+-- Annotation card for a single protein: its one entries row (names,
+-- organism, length, GO, keywords, EC, and the counts of its features,
+-- cross-references, comments and references).
+-- Filters on accession alone, which reads the accession column of every row
+-- group.  For many lookups, or a remote lake, resolve the accession in
+-- accession_map first and query with literal (reviewed, organism_id,
+-- accession) values (README "Looking up by accession"): a subquery or join
+-- there is not pruned by row-group statistics.
 CREATE OR REPLACE MACRO protein_card(target_acc) AS TABLE (
     SELECT
-        e.accession, e.gene_primary, e.protein_name_primary, e.organism_name, e.organism_id,
+        e.accession, e.gene_primary, e.protein_name_primary, e.organism_scientific_name, e.organism_id,
         e.reviewed, e.length, e.proteinExistence, e.annotationScore,
         e.go_id, e.keyword, e.ec,
         e.feature_count, e.xref_count, e.comment_count, e.reference_count
@@ -100,8 +101,12 @@ CREATE OR REPLACE MACRO organism_xrefs(target_taxid, databases) AS TABLE (
 );
 
 
--- Functional annotations (comments) for an organism.
+-- Comments of one type for an organism, with their text.
 -- commentType values are plain strings: 'FUNCTION', 'SUBCELLULAR LOCATION', etc.
+-- text_value joins the comment's texts; it is NULL for the types that keep
+-- their prose under `note` (SUBCELLULAR LOCATION, DISEASE) and for the
+-- structured ones (COFACTOR, CATALYTIC ACTIVITY, INTERACTION, ALTERNATIVE
+-- PRODUCTS, ...): read those from the comments table's source columns.
 -- Example: SELECT * FROM organism_comments(9606, 'FUNCTION');
 CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
     SELECT c.accession, c.commentType, c.text_value
@@ -116,7 +121,7 @@ CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
 -- Example: SELECT * FROM entries_with_features(9606) WHERE type = 'Signal';
 CREATE OR REPLACE MACRO entries_with_features(target_taxid) AS TABLE (
     SELECT e.accession, e.gene_primary, e.protein_name_primary, e.reviewed,
-           f.* EXCLUDE (accession, reviewed, organism_id, organism_name, length)
+           f.* EXCLUDE (accession, reviewed, organism_id, organism_scientific_name, length)
     FROM entries e
     JOIN features f ON f.accession = e.accession AND f.organism_id = e.organism_id
     WHERE e.organism_id = target_taxid
@@ -136,7 +141,8 @@ CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
 );
 
 
--- Unnest isoforms for a single protein.
+-- Unnest isoforms for a single protein (filters on accession alone, like
+-- protein_card).
 -- Parses the ALTERNATIVE PRODUCTS comment to extract isoform IDs,
 -- names, sequence status, and variant sequence identifiers.
 -- Useful for proteomics/mass-spec workflows that need to map

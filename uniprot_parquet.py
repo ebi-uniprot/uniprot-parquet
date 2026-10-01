@@ -87,10 +87,12 @@ def _missing_view_sql(table: str, columns: list[str]) -> str:
 
 _MACRO_SQL = """\
 
--- Annotation card for a single protein
+-- Annotation card for a single protein: its one entries row.  Filters on
+-- accession alone (the accession column of every row group).  README
+-- "Looking up by accession" has the pruned two-step lookup.
 CREATE OR REPLACE MACRO protein_card(target_acc) AS TABLE (
     SELECT
-        e.accession, e.gene_primary, e.protein_name_primary, e.organism_name, e.organism_id,
+        e.accession, e.gene_primary, e.protein_name_primary, e.organism_scientific_name, e.organism_id,
         e.reviewed, e.length, e.proteinExistence, e.annotationScore,
         e.go_id, e.keyword, e.ec,
         e.feature_count, e.xref_count, e.comment_count, e.reference_count
@@ -114,7 +116,9 @@ CREATE OR REPLACE MACRO organism_xrefs(target_taxid, databases) AS TABLE (
     ORDER BY x.accession, x.database
 );
 
--- Comments by type for an organism (plain strings: 'FUNCTION', 'SUBCELLULAR LOCATION', etc.)
+-- Comments by type for an organism (plain strings: 'FUNCTION', 'SUBCELLULAR LOCATION', etc.).
+-- text_value is NULL for types whose prose is under `note` (SUBCELLULAR
+-- LOCATION, DISEASE) and for structured ones (COFACTOR, CATALYTIC ACTIVITY, ...).
 CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
     SELECT c.accession, c.commentType, c.text_value
     FROM comments c
@@ -125,7 +129,7 @@ CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
 -- Entries joined with features for an organism (filter first, join second)
 CREATE OR REPLACE MACRO entries_with_features(target_taxid) AS TABLE (
     SELECT e.accession, e.gene_primary, e.protein_name_primary, e.reviewed,
-           f.* EXCLUDE (accession, reviewed, organism_id, organism_name, length)
+           f.* EXCLUDE (accession, reviewed, organism_id, organism_scientific_name, length)
     FROM entries e
     JOIN features f ON f.accession = e.accession AND f.organism_id = e.organism_id
     WHERE e.organism_id = target_taxid
@@ -283,7 +287,7 @@ def _present_files(con, base: str, table: str, rels: list[str]) -> list[str]:
     """The table's files that exist in *this* copy of the lake, as full paths.
 
     A copy may hold a whole table, one partition (a Swiss-Prot-only rsync) or
-    a few files (a per-organism download from files_for_taxid).  Locally every
+    a few files (a per-organism download from files_for_organism_id).  Locally every
     file is checked.  Remotely the first file of each partition directory is
     probed: if it is there the whole partition is taken as present (a full or
     partition-level mirror, one request per partition); if it is not, every
@@ -390,22 +394,44 @@ def tables(lake_path: str) -> dict[str, dict]:
     return out
 
 
-def files_for_taxid(lake_path: str, organism_id: int, table: str = "entries") -> list[str]:
-    """Relative paths of the files that can contain rows for one organism.
+def files_for_organism_id(lake_path: str, organism_id: int, table: str = "entries") -> list[str]:
+    """Relative paths of the files of ``table`` that can contain rows for one organism.
 
-    Every partition is sorted (organism_id ASC, accession ASC) and manifest.json records
-    each file's organism_id range, so the files holding one organism are contiguous
-    and usually one or two per side — an organism-level download without a
-    layout change.
+    Every partition of entries and of the child tables is sorted
+    (organism_id ASC, accession ASC, ...) and manifest.json records each
+    file's organism_id range, so the files holding one organism are
+    contiguous and usually one or two per side: an organism-level download
+    without a layout change.
 
-    >>> files_for_taxid("/data/uniprot/2026_01/lake", 9606)
+    accession_map is sorted by accession, so every file holds every organism:
+    it raises ValueError (download all of accession_map, which is small).
+
+    >>> files_for_organism_id("/data/uniprot/2026_01/lake", 9606)
     ['entries/review_status=swissprot/entries_00001.parquet', 'entries/review_status=trembl/entries_00017.parquet']
     """
     m = manifest(lake_path)
-    fd = m["tables"][table]["file_details"]
+    info = m["tables"][table]
+    keys = [k.split()[0] for k in info.get("sort_order", [])]
+    if "organism_id" not in keys[:2]:
+        raise ValueError(f"{table} is sorted by {', '.join(keys) or 'nothing'}, not by organism_id: "
+                         f"any of its files can hold any organism (download them all)")
+    fd = info["file_details"]
     return [f"{table}/{rel}" for rel, d in fd.items()
-            if d.get("taxid_min") is not None and d.get("taxid_max") is not None
-            and d["taxid_min"] <= organism_id <= d["taxid_max"]]
+            if d.get("organism_id_min") is not None and d.get("organism_id_max") is not None
+            and d["organism_id_min"] <= organism_id <= d["organism_id_max"]]
+
+
+def _join_hint(name: str, foreign_keys: dict) -> str:
+    """JOIN clause(s) from the tables ``name``'s foreign keys point at:
+    ``JOIN features ON features.accession = entries.accession AND
+    features.organism_id = entries.organism_id``.  Built from each key's
+    target, not USING: accession_map.primary_accession joins
+    entries.accession, a column of another name."""
+    by_target: dict[str, list[str]] = {}
+    for column, ref in foreign_keys.items():
+        ref_table, ref_column = ref.split(".", 1)
+        by_target.setdefault(ref_table, []).append(f"{name}.{column} = {ref_table}.{ref_column}")
+    return " ".join(f"JOIN {name} ON {' AND '.join(conds)}" for conds in by_target.values())
 
 
 def schema(lake_path: str, table: str | None = None) -> dict | str:
@@ -445,9 +471,7 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
             fk = info.get("foreign_keys", {})
             if fk:
                 entry["foreign_keys"] = fk
-                entry["join_hint"] = (
-                    f"JOIN {name} USING ({', '.join(fk.keys())})"
-                )
+                entry["join_hint"] = _join_hint(name, fk)
             overview[name] = entry
         return overview
 

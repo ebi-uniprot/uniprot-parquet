@@ -24,7 +24,7 @@ from _bench_common import (  # noqa: E402
 )
 
 LEVELS = (1, 3, 9, 15)
-QUERY = ("SELECT accession, id, reviewed, organism_id, organism_name, gene_primary, protein_name_primary, length "
+QUERY = ("SELECT accession, id, reviewed, organism_id, organism_scientific_name, gene_primary, protein_name_primary, length "
          "FROM read_parquet('{lake}/entries/**/*.parquet', hive_partitioning = true) WHERE organism_id = {organism_id}")
 
 
