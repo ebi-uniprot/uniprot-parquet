@@ -826,7 +826,8 @@ def test_git_info_clean_with_pipeline_outputs(tmp_path):
     for output in ("datalake/small/provenance.json", "datalake/reports/trace.txt",
                    "results/uniprot_parquet/2026_03/SCHEMA.md", "work/ab/cdef/.command.sh",
                    ".nextflow/history", ".nextflow.log", ".nextflow.log.1",
-                   "demo/lake/2026_03/provenance.json", "demo/work/x"):
+                   "demo/lake/2026_03/provenance.json", "demo/work/x",
+                   "slurm-123456.out"):              # an sbatch head job's default output
         (repo / output).parent.mkdir(parents=True, exist_ok=True)
         (repo / output).write_text("x")
 

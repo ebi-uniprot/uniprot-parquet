@@ -73,3 +73,6 @@ install.sh
 logs/
 repo-context.txt
 schema_baseline.json
+
+# SLURM head-job output (RUNBOOK 8b): untracked files mark provenance dirty
+slurm-*.out

@@ -46,6 +46,45 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
 
+  # The end-to-end pipeline tests (release marker, -resume republishing, OOM
+  # retry, bin/ module digests): skipped by the test job, which has no
+  # Nextflow.  REQUIRE_NEXTFLOW turns that skip into a failure here.  The
+  # runner's 4 CPUs are enough: the local profile caps VALIDATE's 8.
+  workflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Nextflow, pigz and zstd
+        run: |
+          curl -s https://get.nextflow.io | bash
+          sudo mv nextflow /usr/local/bin/
+          nextflow -version
+          sudo apt-get update && sudo apt-get install -y pigz zstd
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install duckdb pyarrow orjson ijson zstandard pytest frictionless
+
+      - name: Run workflow tests
+        env:
+          REQUIRE_NEXTFLOW: "1"
+        run: python -m pytest tests/test_workflow.py -v --tb=short -rs
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 5

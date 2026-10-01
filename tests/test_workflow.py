@@ -1,6 +1,9 @@
 """End-to-end tests of upjson2lake.nf on the small fixture.
 
-Skipped unless ``nextflow`` is on PATH.  Every run uses -resume in one launch
+Skipped unless ``nextflow`` is on PATH; with REQUIRE_NEXTFLOW set (CI's
+workflow job), a missing nextflow fails them instead.  The static check that
+bin_modules() matches the scripts' imports is in test_bin_modules.py, which
+always runs.  Every run uses -resume in one launch
 directory (as run_lake.sh does), so the fixture's baseline run is reused and
 each test only re-runs what its params change.
 """
@@ -17,7 +20,8 @@ from conftest import PROJECT_ROOT, SMALL_JSON_GZ
 
 WORKFLOW = os.path.join(PROJECT_ROOT, "upjson2lake.nf")
 
-pytestmark = pytest.mark.skipif(shutil.which("nextflow") is None, reason="nextflow not on PATH")
+pytestmark = pytest.mark.skipif(shutil.which("nextflow") is None and not os.environ.get("REQUIRE_NEXTFLOW"),
+                                reason="nextflow not on PATH")
 
 
 def _launch(launch_dir, release, *extra, workflow=WORKFLOW):
@@ -92,15 +96,28 @@ class TestPreviousManifest:
         assert "inside the release being built" in result.stdout + result.stderr
 
 
+def _spill_dir_name(release_dir, process):
+    """spill_setup's directory for a release directory and process:
+    <release>.<process>.<first 8 hex digits of md5(absolute release dir)>."""
+    import hashlib
+    digest = hashlib.md5(str(release_dir).encode()).hexdigest()[:8]
+    return f"{release_dir.name}.{process}.{digest}"
+
+
 def test_stale_spill_of_a_killed_attempt_is_reclaimed(launch_dir, tmp_path):
     """An attempt killed by the OOM killer never runs its cleanup, so its
     spill stays in --duckdb_temp; the next attempt of the same release and
-    process removes it before spilling, and nothing else there is touched."""
+    process removes it before spilling, and nothing else there is touched:
+    not even the live spill of a run of the same release label into another
+    outdir, which shares --duckdb_temp."""
     temp = tmp_path / "duckdb tmp"
-    stale = [temp / f"spill.{p}" / "duckdb_spill_old" / "junk"
-             for p in ("SORT_JSONL", "PARQUET_TRANSFORM", "VALIDATE")]
-    other = temp / "other" / "keep"
-    for f in (*stale, other):
+    processes = ("SORT_JSONL", "PARQUET_TRANSFORM", "VALIDATE")
+    stale = [temp / _spill_dir_name(launch_dir / "out" / "spill", p) / "duckdb_spill_old" / "junk"
+             for p in processes]
+    other = [temp / "other" / "keep"] + [
+        temp / _spill_dir_name(tmp_path / "elsewhere" / "spill", p) / "duckdb_spill_live" / "keep"
+        for p in processes]
+    for f in (*stale, *other):
         f.parent.mkdir(parents=True)
         f.write_text("x")
     # An input of its own, so -resume cannot reuse the baseline's SORT_JSONL.
@@ -109,7 +126,8 @@ def test_stale_spill_of_a_killed_attempt_is_reclaimed(launch_dir, tmp_path):
     _run(launch_dir, "spill", "--duckdb_temp", str(temp), "--inputfile", str(inputfile))
     for f in stale:
         assert not f.exists(), f
-    assert other.exists()
+    for f in other:
+        assert f.exists(), f
 
 
 def test_published_lake_has_no_build_sentinels(launch_dir):
@@ -211,45 +229,6 @@ def test_changed_bin_module_reruns_validate(launch_dir, project_copy):
     assert result.returncode == 0, out[-3000:]
     # STREAM_JSONL, SORT_JSONL and PARQUET_TRANSFORM cached; VALIDATE and PROVENANCE run.
     assert "completed=2 failed=0 cached=3" in out, out[-1000:]
-
-
-def _sibling_imports(script, seen=None):
-    """The bin/ modules ``script`` imports, directly or through each other."""
-    import ast
-    bin_dir = os.path.join(PROJECT_ROOT, "bin")
-    seen = set() if seen is None else seen
-    with open(os.path.join(bin_dir, script)) as f:
-        tree = ast.parse(f.read())
-    for node in ast.walk(tree):
-        names = ([a.name for a in node.names] if isinstance(node, ast.Import)
-                 else [node.module] if isinstance(node, ast.ImportFrom) and node.module else [])
-        for name in names:
-            module = name.split(".")[0] + ".py"
-            if module not in seen and os.path.exists(os.path.join(bin_dir, module)):
-                seen.add(module)
-                _sibling_imports(module, seen)
-    return seen
-
-
-def test_bin_modules_list_every_imported_module():
-    """bin_modules(<process>) names exactly the bin/ modules the process's
-    scripts import, so a change to one re-runs the process under -resume."""
-    import re
-    with open(WORKFLOW) as f:
-        text = f.read()
-    table = text[text.index("def bin_modules("):]
-    table = table[:table.index("\n}\n")]
-    lists = {p: set(re.findall(r"'([^']+)'", names))
-             for p, names in re.findall(r"(\w+):\s*\[([^]]*)\]", table)}
-    assert set(lists) == {"STREAM_JSONL", "SORT_JSONL", "PARQUET_TRANSFORM", "VALIDATE", "PROVENANCE"}
-    for process, listed in lists.items():
-        body = text[text.index(f"process {process} {{"):]
-        body = body[:body.index("\n}\n")]
-        scripts = set(re.findall(r"\b(\w+\.py)\b", body))
-        imported = set().union(*(_sibling_imports(s) for s in scripts)) - scripts
-        assert listed == imported, f"{process}: bin_modules lists {sorted(listed)}, scripts import {sorted(imported)}"
-        if listed:
-            assert f"bin_digest('{process}')" in text, process
 
 
 def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir, tmp_path):

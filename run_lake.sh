@@ -35,6 +35,7 @@ EXPECTED_COUNT=""
 RELEASE_OVERRIDE=""
 PREVIOUS_MANIFEST=""
 FIRST_RELEASE=""
+MAX_TIME=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --release)        RELEASE_OVERRIDE="$2";      shift 2 ;;
         --previous-manifest) PREVIOUS_MANIFEST="$2";  shift 2 ;;
         --first-release)  FIRST_RELEASE=1;            shift ;;
+        --max-time)       MAX_TIME="$2";              shift 2 ;;
         *)                echo "Unknown flag: $1"; exit 1  ;;
     esac
 done
@@ -73,7 +75,7 @@ case "$MODE" in
         PROFILE="prod"
         ;;
     *)
-        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL] [--previous-manifest FILE | --first-release]"
+        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL] [--previous-manifest FILE | --first-release] [--max-time DURATION]"
         exit 1
         ;;
 esac
@@ -175,7 +177,21 @@ if [[ -n "$PREVIOUS_MANIFEST" ]]; then
     NF_CMD+=(--previous_manifest "$PREVIOUS_MANIFEST")
 fi
 
+# Wall-time cap of a retried heavy process (default 72h): at most the
+# queue's limit, or SLURM rejects the retry.
+if [[ -n "$MAX_TIME" ]]; then
+    NF_CMD+=(--max_time "$MAX_TIME")
+fi
+
 echo "Running: ${NF_CMD[*]}"
 echo ".-- BEGUN $(date) --."
 "${NF_CMD[@]}"
 echo "'-- ENDED $(date) --'"
+
+# Nextflow exits 0 even when the published copy fails verification (the check
+# runs in onComplete, after the workflow succeeded): the marker is the signal.
+if [[ ! -e "$OUTDIR/$RELEASE/RELEASE_COMPLETE" ]]; then
+    echo "ERROR: $OUTDIR/$RELEASE/RELEASE_COMPLETE was not written: the release is not complete." >&2
+    echo "  The log says why (RELEASE_COMPLETE not written: ...). Re-run the same command (-resume)." >&2
+    exit 1
+fi

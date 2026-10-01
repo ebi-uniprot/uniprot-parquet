@@ -145,17 +145,21 @@ def duckdb_mem(MemoryUnit memory) {
 }
 
 // Shell lines giving a DuckDB process its spill directory under
-// --duckdb_temp: one per release and process, emptied before use.  An
+// --duckdb_temp: one per release directory and process, emptied before use.  An
 // attempt killed by the OOM killer never runs its own cleanup, so its spill
 // (up to ~1-2 TB) stays behind; the retry, or a later run of the same
-// release, reclaims it here instead of adding a second one.  Only runs of
-// this release and process use the directory, and those never overlap.
+// release, reclaims it here instead of adding a second one.  The name ends
+// in a hash of the absolute release directory, so a run of the same
+// release label into another outdir (two rehearsals sharing --duckdb_temp)
+// has a directory of its own and never deletes this one's live spill; only
+// runs into the same release directory share it, and those never overlap.
 // '' with no --duckdb_temp: DuckDB then spills under $TMPDIR or /tmp.
 // Read through a function, so the spill location is not part of a task's
 // -resume hash: moving the scratch directory does not redo a sort.
 def spill_setup(process) {
     if (!params.duckdb_temp) return ''
-    def dir = "${params.duckdb_temp}/${params.release}.${process}"
+    def release_hash = file(release_dir()).toString().md5().take(8)
+    def dir = "${params.duckdb_temp}/${params.release}.${process}.${release_hash}"
     return "SPILL='${dir}'\n    rm -rf \"\$SPILL\"\n    mkdir -p \"\$SPILL\""
 }
 

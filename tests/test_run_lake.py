@@ -17,15 +17,25 @@ def stub(tmp_path):
     bin_dir.mkdir()
     args_file = tmp_path / "nextflow_args"
     nextflow = bin_dir / "nextflow"
-    nextflow.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{args_file}"\n')
+    # Like a successful run, it writes <outdir>/<release>/RELEASE_COMPLETE,
+    # unless NO_MARKER is set (a run whose published copy failed verification).
+    nextflow.write_text(f"""#!/usr/bin/env bash
+printf "%s\\n" "$@" > "{args_file}"
+while [[ $# -gt 0 ]]; do
+    case $1 in --outdir) outdir=$2 ;; --release) release=$2 ;; esac
+    shift
+done
+[[ -n "${{NO_MARKER:-}}" ]] || {{ mkdir -p "$outdir/$release" && touch "$outdir/$release/RELEASE_COMPLETE"; }}
+""")
     nextflow.chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
 
-    def run(*args, mode="small"):
+    def run(*args, mode="small", marker=True):
         return subprocess.run(
             ["bash", os.path.join(PROJECT_ROOT, "run_lake.sh"), mode,
              "--outdir", str(tmp_path / "out"), *args],
-            cwd=PROJECT_ROOT, env=env, capture_output=True, text=True)
+            cwd=PROJECT_ROOT, env={**env, **({} if marker else {"NO_MARKER": "1"})},
+            capture_output=True, text=True)
     return run, args_file
 
 
@@ -103,6 +113,31 @@ class TestFullModeSchemaDiff:
     def test_small_mode_needs_neither(self, stub):
         run, args_file = stub
         assert run().returncode == 0
+
+
+class TestReleaseMarker:
+    def test_success_needs_the_marker(self, stub):
+        """Nextflow exits 0 when the published copy fails verification (the
+        check runs in onComplete): run_lake.sh goes by RELEASE_COMPLETE."""
+        run, _ = stub
+        result = run(marker=False)
+        assert result.returncode != 0
+        assert "RELEASE_COMPLETE" in result.stdout + result.stderr
+
+    def test_marker_means_success(self, stub):
+        run, _ = stub
+        result = run()
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_max_time_reaches_nextflow(stub):
+    """A queue whose wall-time limit is under 72h needs a lower cap for the
+    retries' doubled time."""
+    run, args_file = stub
+    result = run("--max-time", "48h")
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = args_file.read_text().splitlines()
+    assert args[args.index("--max_time") + 1] == "48h"
 
 
 def _header_examples(mode):
