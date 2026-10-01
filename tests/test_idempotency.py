@@ -265,3 +265,17 @@ def test_skip_existing_rebuilds_on_sentinel_without_input(small_jsonl: str, tmp_
     assert result.returncode == 0, result.stderr
     assert "REBUILD entries" in result.stderr
     assert "SKIP features" in result.stderr
+
+
+def test_skip_existing_rebuilds_on_sentinel_that_is_not_an_object(
+        small_jsonl: str, tmp_path: pathlib.Path) -> None:
+    """A sentinel holding valid JSON that is not an object (damaged by hand)
+    cannot vouch for the table: rebuilt, not a crash."""
+    outdir = str(tmp_path / "lake")
+    assert _run_transform(small_jsonl, outdir).returncode == 0
+    with open(_sentinel(outdir, "entries"), "w") as f:
+        json.dump(["not", "a", "sentinel"], f)
+    result = _run_transform(small_jsonl, outdir, extra_args=["--skip-existing"])
+    assert result.returncode == 0, result.stderr
+    assert "REBUILD entries" in result.stderr
+    assert "SKIP features" in result.stderr

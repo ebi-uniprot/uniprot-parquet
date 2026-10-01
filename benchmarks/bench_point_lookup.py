@@ -180,8 +180,7 @@ def run_workloads(con: duckdb.DuckDBPyConnection, lake: str, base: str | None, a
     return results, c3
 
 
-def pass_criteria(results: Sequence[dict[str, Any]], c3: dict[str, Any],
-                  baseline_ms: float | None = None) -> list[tuple[str, bool | None, str]]:
+def pass_criteria(results: Sequence[dict[str, Any]], c3: dict[str, Any]) -> list[tuple[str, bool | None, str]]:
     """Pass criteria, PASS/FAIL each (bloom-filter criterion is N/A: none written)."""
     out: list[tuple[str, bool | None, str]] = []
     two_entries_1 = next((r for r in results if r["n"] == 1 and r["table"] == "entries" and r["form"] == "two_step"),

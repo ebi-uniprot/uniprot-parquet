@@ -6,6 +6,8 @@ import os
 import pathlib
 import shutil
 import subprocess
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 from conftest import run_bin
@@ -73,6 +75,34 @@ def test_wrong_size_fails(release: pathlib.Path) -> None:
         f.write(b"x")
     result = _verify(release)
     assert result.returncode == 1 and "manifest.json says" in result.stdout
+
+
+def _edit_json(path: pathlib.Path, edit: Callable[[dict[str, Any]], None]) -> None:
+    data = json.loads(path.read_text())
+    edit(data)
+    path.write_text(json.dumps(data))
+
+
+def test_size_missing_from_manifest_fails_cleanly(release: pathlib.Path) -> None:
+    """A file whose recorded size is missing is a problem line, not a traceback."""
+    def drop(manifest: dict[str, Any]) -> None:
+        details = next(iter(manifest["tables"]["entries"]["file_details"].values()))
+        del details["size_bytes"]
+    _edit_json(release / "lake" / "manifest.json", drop)
+    result = _verify(release)
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr, result.stderr
+    assert "manifest.json records no size" in result.stdout
+
+
+def test_size_missing_from_provenance_fails_cleanly(release: pathlib.Path) -> None:
+    def drop(provenance: dict[str, Any]) -> None:
+        del provenance["published"]["SCHEMA.md"]["size_bytes"]
+    _edit_json(release / "provenance.json", drop)
+    result = _verify(release)
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr, result.stderr
+    assert "SCHEMA.md: provenance.json records no size" in result.stdout
 
 
 def test_extra_parquet_file_fails(release: pathlib.Path) -> None:

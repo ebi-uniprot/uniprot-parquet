@@ -90,6 +90,8 @@ def verify(release_dir: str, full: bool = False, marker: str | None = None) -> l
         if name.endswith(".parquet"):
             if name not in sizes:
                 problems.append(f"lake/{name}: not in manifest.json file_details")
+            elif not isinstance(sizes[name], int):
+                problems.append(f"lake/{name}: manifest.json records no size")
             elif size != sizes[name]:
                 problems.append(f"lake/{name}: {size:,} bytes, manifest.json says {sizes[name]:,}")
         if (full or size <= SMALL_FILE_BYTES) and sha256(path) != digest:
@@ -116,6 +118,8 @@ def verify(release_dir: str, full: bool = False, marker: str | None = None) -> l
         path = os.path.join(release_dir, name)
         if not os.path.isfile(path):
             problems.append(f"{name}: missing")
+        elif not isinstance(info.get("size_bytes"), int):
+            problems.append(f"{name}: provenance.json records no size")
         elif os.path.getsize(path) != info.get("size_bytes"):
             problems.append(f"{name}: {os.path.getsize(path):,} bytes, provenance.json says "
                             f"{info.get('size_bytes'):,}")

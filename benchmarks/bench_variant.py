@@ -720,13 +720,16 @@ def format_comparison(all_results: dict[str, Any]) -> str:
 
     for name in bq:
         vals = {}
+        status = {}   # why a value is missing: the query errored, was skipped, or was not run
         for key, src in [("base", bq), ("A", aq), ("B", bq2), ("C", cq), ("D", dq)]:
-            vals[key] = src.get(name, {}).get("median_ms")
+            result = src.get(name, {})
+            vals[key] = result.get("median_ms")
+            status[key] = "ERR" if "error" in result else "SKIP" if "skipped" in result else "—"
 
         parts = []
         for key in ["base", "A", "B", "C", "D"]:
             v = vals[key]
-            parts.append(f"{v:>7.1f}ms" if v is not None else f"{'ERR':>8}s")
+            parts.append(f"{v:>7.1f}ms" if v is not None else f"{status[key]:>9}")
 
         if vals["base"] and vals.get("D"):
             ratio = vals["D"] / vals["base"]

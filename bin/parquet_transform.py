@@ -1734,12 +1734,14 @@ def _write_sentinel(path: str, table_name: str, files: Iterable[str], row_count:
 
 
 def _read_sentinel(path: str) -> dict[str, Any] | None:
-    """The sentinel's contents, or None if absent or unreadable."""
+    """The sentinel's contents, or None if absent, unreadable or not a JSON
+    object."""
     try:
         with open(path) as f:
-            return cast(dict[str, Any] | None, json.load(f))
+            data = json.load(f)
     except (OSError, ValueError):
         return None
+    return cast(dict[str, Any], data) if isinstance(data, dict) else None
 
 
 def _table_is_complete(outdir: str, table_name: str, table_dir: str, source: dict[str, int],
@@ -2145,7 +2147,7 @@ def _build_datapackage(manifest: dict[str, Any], release: str | None) -> dict[st
     resources: list[dict[str, Any]] = []
 
     for table_name, table_info in manifest["tables"].items():
-        meta = TABLE_META.get(table_name, {})
+        meta = TABLE_META[table_name]          # every table the transform writes
 
         # Build field descriptors from the actual Parquet schema
         fields = []

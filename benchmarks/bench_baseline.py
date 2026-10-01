@@ -199,9 +199,8 @@ QUERY_SUITE = [
 ]
 
 
-def run_query_benchmarks(con: duckdb.DuckDBPyConnection,
-                         lake_path: str) -> tuple[dict[str, Any], duckdb.DuckDBPyConnection]:
-    """Run all query benchmarks and return results."""
+def run_query_benchmarks(lake_path: str) -> tuple[dict[str, Any], duckdb.DuckDBPyConnection]:
+    """Run all query benchmarks; (results, the client connection they ran on)."""
     results: dict[str, Any] = {}
 
     # Setup views and macros via the client library
@@ -485,7 +484,8 @@ def analyze_schema_complexity(lake_path: str, repo_root: str) -> dict[str, Any]:
         "total_shortcut_columns": total_conv,
         "total_source_columns": total_nest,
         "total_columns": total_conv + total_nest,
-        "overall_shortcut_ratio": round(total_conv / (total_conv + total_nest), 2),
+        "overall_shortcut_ratio": (round(total_conv / (total_conv + total_nest), 2)
+                                   if total_conv + total_nest else 0),
         "description": (
             f"{total_conv} shortcut columns vs {total_nest} source columns "
             f"(UniProt's JSON keys) across 5 tables."
@@ -657,8 +657,7 @@ def main() -> None:
 
     # 1. Query Latency
     print("\n[1/4] Query latency benchmarks...", file=sys.stderr)
-    con = duckdb.connect()
-    query_results, con = run_query_benchmarks(con, args.lake)
+    query_results, con = run_query_benchmarks(args.lake)
     all_results["query_latency"] = query_results
     print(f"  {len(query_results)} queries benchmarked", file=sys.stderr)
 
