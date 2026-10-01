@@ -28,7 +28,7 @@ import time
 
 # Allow importing from the same bin/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from parquet_transform import init_duckdb, _sql_escape
+from duckdb_util import run_main, init_duckdb, _sql_escape
 
 
 def eprint(*args, **kwargs):
@@ -102,4 +102,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

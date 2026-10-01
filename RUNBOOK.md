@@ -367,26 +367,36 @@ column -t -s $'\t' /scratch/$USER/uplake_smoke/reports/trace.txt | cut -c1-160
 
 ### 7b. Prove the OOM retry (recommended, ~5 min)
 
-This can only be checked under SLURM: the local executor does not enforce
-memory limits. Force an OOM by giving the heavy processes far too little memory
-via a direct invocation (the wrapper pins 16 GB for `subset`):
+Give the heavy processes too little memory for DuckDB to sort or transform
+even the 52-entry fixture, but enough at twice the size. With
+`--process_memory '2.5 GB'`, DuckDB gets 1920MB at attempt 1. That is too
+little: the sort alone allocates a 1 GiB JSON buffer. The scripts exit 75
+(DuckDB's out-of-memory error) and are retried at 5 GB, where DuckDB gets
+3840MB and both pass. Run it directly, because the wrapper pins 16 GB for
+`subset`:
 
 ```bash
 nextflow run upjson2lake.nf -profile short \
-    --inputfile demo/input.json.gz --outdir /scratch/$USER/uplake_oom --release oom \
-    --process_memory '300 MB' -ansi-log false
+    --inputfile tests/fixtures/small.json.gz --outdir /scratch/$USER/uplake_oom --release oom \
+    --process_memory '2.5 GB' -ansi-log false
 ```
 
 **Checks**
 
-- `.nextflow.log` shows `SORT_JSONL` (or `PARQUET_TRANSFORM`) failing with exit
-  137/140/143 and being **retried once**; `trace.txt` lists the process twice,
-  the second attempt with double the memory (600 MB here; in `prod`, 96 GB → 192 GB).
-- If the retry with 600 MB also fails, that is expected for this deliberately
-  starved run — the point is that the retry *happened*. If instead the run
-  aborted on the first failure, or `.nextflow.log` shows a `StackOverflowError`,
-  stop: the retry directives are not being applied on your cluster.
+- The run succeeds, and `/scratch/$USER/uplake_oom/oom/RELEASE_COMPLETE` exists.
+- `trace.txt` lists `SORT_JSONL` and `PARQUET_TRANSFORM` twice each:
+  - first with status `FAILED`, exit `75` and memory 2.5 GB;
+  - then `COMPLETED` with 5 GB (in `prod`, 96 GB → 192 GB).
+- Each failed attempt's `.command.err` says `FATAL — DuckDB ran out of memory`.
+- If the run aborted on the first failure, or `.nextflow.log` shows a
+  `StackOverflowError`, stop: the retry directives are not being applied on
+  your cluster.
 - Clean up: `rm -rf /scratch/$USER/uplake_oom /scratch/$USER/uplake_smoke`.
+
+The kernel's OOM killer (exit 137/140) and SLURM's pre-kill (143) are retried
+the same way. A 143 can also be a wall-time kill, so a retry also gets twice
+its base time, capped at `--max_time` (default 72h). Set that to at most the
+queue's wall-time limit.
 
 If the cluster nodes are very different from the machine you ran stage 4 on,
 repeat stage 4 here with `./run_lake.sh subset --outdir /scratch/$USER/uplake_subset
@@ -510,9 +520,13 @@ NULL or empty in every row: compare with the transform's
 `WARNING: shortcut sources absent from input` lines — a renamed upstream field
 is kept as a new source column, but the shortcut needs a code change.
 
-**PROVENANCE (< 1 min)** — writes `SCHEMA.md` and `provenance.json`; the
-workflow's `onComplete` renames `.RELEASE_COMPLETE.pending` to
-`RELEASE_COMPLETE` after every publish copy has finished.
+**PROVENANCE (< 1 min)** — writes `SCHEMA.md` and `provenance.json` (with the
+size and SHA-256 of every file published beside `lake/`); the workflow's
+`onComplete` runs `bin/verify_release.py` on the published release directory
+once every publish copy has finished, and renames `.RELEASE_COMPLETE.pending`
+to `RELEASE_COMPLETE` only if it passes. Otherwise the log says
+`RELEASE_COMPLETE not written` with the problems, and no marker is left:
+re-run with `-resume` to republish.
 
 ---
 
@@ -566,7 +580,8 @@ head -5 $OUT/SCHEMA.md
 
 | Symptom | What to do |
 |---|---|
-| Head job / login session killed while Nextflow was running | Re-run the identical `run_lake.sh` command; `-resume` reuses every completed process. |
+| Head job / login session killed while Nextflow was running | Re-run the identical `run_lake.sh` command; `-resume` reuses every completed process and republishes every output whole (`overwrite: true`), so a copy cut short mid-publish is repaired, and `RELEASE_COMPLETE` is written only after `bin/verify_release.py` passes on it. Mirrors that want hash-level certainty run `bin/verify_release.py <release> --full`. |
+| Log says `RELEASE_COMPLETE not written: the published copy ... does not match its metadata` | Something changed the release directory during or after publishing (a full disk, another process). Re-run with `-resume`. |
 | A SLURM job hit its wall time | Same: re-submit. If it was `PARQUET_TRANSFORM`, the retry starts from a fresh work dir (Nextflow limitation); the whole transform re-runs. |
 | `PARQUET_TRANSFORM` OOM twice | Raise memory (`MEMORY=` in `run_lake.sh` or `--process_memory`) and re-submit. |
 | `Process requirement exceeds available memory` (local executor) | `--process_memory` is more than the machine has; lower it (DuckDB spills to `--duckdb_temp`). |

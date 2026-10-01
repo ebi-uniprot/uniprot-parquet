@@ -3,7 +3,9 @@
 Generate a release manifest for provenance tracking.
 
 Records everything needed to reproduce and audit a pipeline run:
-  - Input file checksums (MD5)
+  - Input file checksums (MD5, SHA-256)
+  - Size and SHA-256 of every file published beside the lake (--published),
+    which bin/verify_release.py checks the published copy against
   - Pipeline version (git commit)
   - Row counts per table (from lake manifest.json)
   - Timestamps
@@ -15,6 +17,7 @@ Usage:
         --lake /path/to/lake \
         --input-jsonl uniprot.jsonl.zst \
         --release 2026_01 \
+        [--published sorted.jsonl.zst SCHEMA.md validation_report.txt ...] \
         [-o provenance.json]
 """
 
@@ -66,6 +69,11 @@ def main():
         help="Path to the input JSONL(.zst) file",
     )
     parser.add_argument("--release", required=True, help="Release label")
+    parser.add_argument(
+        "--published", nargs="*", default=[],
+        help="Files published beside lake/ in the release directory: their size and "
+             "SHA-256 are recorded under \"published\" (by file name)",
+    )
     parser.add_argument("-o", "--output", default="provenance.json")
     parser.add_argument(
         "--complete-marker", default=None,
@@ -93,6 +101,15 @@ def main():
             "sha256": sha256,          # sorted.jsonl.zst is published beside the lake
             "size_bytes": os.path.getsize(abspath),
         }
+
+    # ── Files published beside the lake (verify_release.py checks them) ──
+    manifest["published"] = {}
+    for path in args.published:
+        abspath = os.path.abspath(path)
+        name = os.path.basename(abspath)
+        known = next((i for i in manifest["inputs"].values() if i["path"] == name), None)
+        sha256 = known["sha256"] if known else hash_file(abspath)[0]
+        manifest["published"][name] = {"size_bytes": os.path.getsize(abspath), "sha256": sha256}
 
     # ── Git info ──
     git = git_info()

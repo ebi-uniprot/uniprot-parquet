@@ -334,7 +334,7 @@ rsync -avm --include='*/' --include='review_status=swissprot/***' --include='*.j
 rsync -av rsync://<host>/<release>/lake/ ./lake/
 ```
 
-A release is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors should check it first. `curl --metalink RELEASE.metalink` works as on the rest of the UniProt FTP. Without downloading, `connect("https://<host>/<release>/lake")` reads only the byte ranges a query needs; use the two-step accession lookup for remote point queries.
+A release is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors should check it first. `python bin/verify_release.py <release> --full` re-checks a downloaded or mirrored copy: every file listed, every SHA-256 matching `SHA256SUMS.txt` and `provenance.json`, no stray Parquet file. `curl --metalink RELEASE.metalink` works as on the rest of the UniProt FTP. Without downloading, `connect("https://<host>/<release>/lake")` reads only the byte ranges a query needs; use the two-step accession lookup for remote point queries.
 
 ---
 
@@ -347,8 +347,10 @@ A release is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors sh
   sorted.jsonl.zst          the source data as sorted JSON lines
   SCHEMA.md                 this release's schema: every column, type, source path, description
   validation_report.txt     the validator's report (also as validation_report.json)
-  provenance.json           input checksums, git commit, row counts
-  RELEASE_COMPLETE          written last, only if validation passed
+  provenance.json           input checksums, git commit, row counts, size and SHA-256 of
+                            every file above (published beside lake/)
+  RELEASE_COMPLETE          written last, only if validation passed and the published
+                            copy matches its checksums (bin/verify_release.py)
 ```
 
 - **`manifest.json`** lists every Parquet file with its size, SHA-256, MD5 and organism_id range, and every table's schema, row count, sort order, partitioning, keys and column categories (`shortcut`, `source`). Tools and LLM agents can read it to discover the data and write correct joins without scanning files.
@@ -425,6 +427,7 @@ nextflow run upjson2lake.nf -profile prod \
 | `--release` | `2026_03` | Release label; output goes to `<outdir>/<release>/` |
 | `--process_memory` | `96 GB` | Memory for the heavy processes |
 | `--duckdb_pct` | `75` | Share of process memory given to DuckDB's buffer pool |
+| `--max_time` | `72h` | Wall-time cap of a retried heavy process; at most the SLURM queue's limit |
 | `--duckdb_temp` | `$TMPDIR` or `/tmp` | DuckDB spill directory for out-of-core sorts |
 | `--expected_count` | `null` | Expected entry count, checked while streaming |
 | `--previous_manifest` | `null` | Previous release's `lake/manifest.json`, for the schema diff in the validation report |
@@ -464,16 +467,16 @@ UniProtKB.json.gz
      v
 +------------+   SCHEMA.md, provenance.json, then RELEASE_COMPLETE — renamed
 | PROVENANCE |   into place by the workflow's onComplete section, after every
-+------------+   publishDir copy has finished
++------------+   publishDir copy has finished and verify_release.py passed on it
 ```
 
 DuckDB does the JSON parsing, the SQL transforms and the sorting; it streams Arrow record batches to PyArrow, which writes zstd-compressed Parquet with a page index. Memory stays bounded whatever the dataset size. The transform is idempotent: re-running it on the same release directory rewrites the tables, and `--skip-existing` skips tables whose completion sentinel (`lake/.complete/<table>.json`) matches the files on disk and was written for the same input (size and modification time) and release.
 
 ### Production notes (SLURM)
 
-- **OOM recovery.** `SORT_JSONL` and `PARQUET_TRANSFORM` retry once on OOM (exit 137/140) or pre-kill SIGTERM (143) with doubled memory, capped at 256 GB. Other failures are terminal.
+- **OOM recovery.** `SORT_JSONL`, `PARQUET_TRANSFORM` and `VALIDATE` retry once on an out-of-memory failure with doubled memory, capped at 256 GB. That covers DuckDB's own out-of-memory error (the scripts exit 75), the OOM killer (137/140), and SLURM's pre-kill SIGTERM (143). A 143 may also be a wall-time kill, so the retry also doubles the time limit, capped at `--max_time` (72h by default; keep it within the queue's limit). Other failures are terminal.
 - **Spill directory.** Point `--duckdb_temp` at a large scratch filesystem (1–2 TB free); node-local NVMe is best. The processes' `disk` directives are not passed to SLURM, so check the space yourself. Each process spills into `<duckdb_temp>/<release>.<process>/`, which is emptied when the process starts, so the spill of an attempt killed by OOM is reclaimed by its retry.
-- **Resume.** Runs use `-resume`; resubmitting after a wall-time kill or preemption picks up from the last completed process.
+- **Resume.** Runs use `-resume`; resubmitting after a wall-time kill or preemption picks up from the last completed process. Every `publishDir` overwrites, so a resumed run republishes cached outputs whole, repairing a copy that an interrupted run left damaged; the marker is written only if `bin/verify_release.py` finds the published copy matches its metadata.
 - **Integrity.** `STREAM_JSONL` writes an entry count, checks the compressed line count against it and, with `--expected_count`, against UniProt's published count. `VALIDATE` checks the lake against the same count.
 - **Memory model.** DuckDB gets 75% of process memory by default; the rest is headroom for Python and PyArrow.
 - **Provisional settings.** zstd level 9 (`--zstd-level`) and a 256 MB file target (`--target-file-bytes`) were chosen on test fixtures; `benchmarks/bench_zstd.py` and `benchmarks/bench_file_size.py` measure them on real data. Both are recorded in `manifest.json`.

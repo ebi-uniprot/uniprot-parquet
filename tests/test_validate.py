@@ -761,3 +761,11 @@ def test_report_shows_both_strata(small_lake, tmp_path):
     assert any(n.startswith("entries shortcut values match the JSONL") and "5 Swiss-Prot + 5 TrEMBL" in n
                for n in names), names
     assert "all 10 sampled accessions found in lake (5 Swiss-Prot + 5 TrEMBL)" in names, names
+
+
+def test_duckdb_out_of_memory_exits_75(small_lake, tmp_path):
+    report = str(tmp_path / "report.txt")
+    result = _run_validator(small_lake["lake_dir"], small_lake["jsonl"], report,
+                            "--memory-limit", "50MB", "--threads", "2")
+    assert result.returncode == 75, result.stderr[-2000:]
+    assert "DuckDB ran out of memory" in result.stderr

@@ -52,8 +52,6 @@ import os
 import re
 import sys
 import argparse
-import atexit
-import tempfile
 import time
 import json
 import shutil
@@ -65,6 +63,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from frictionless import Package
+
+from duckdb_util import run_main, _sql_escape, init_duckdb  # noqa: F401  (re-exported: validate_lake imports init_duckdb from here)
 
 # ─── Release constants ──────────────────────────────────────────────────
 SCHEMA_VERSION = "1.0.0"          # semver of the shortcut columns (see README "Schema versioning")
@@ -124,11 +124,6 @@ def build_sorting_columns(sort_order, arrow_schema):
 
 
 # ─── DuckDB helpers ──────────────────────────────────────────────────────
-
-def _sql_escape(path: str) -> str:
-    """Escape a file path for use inside a DuckDB SQL string literal."""
-    return path.replace("'", "''")
-
 
 # Types DuckDB's JSON reader infers for a string that parses as one.  A
 # JSON string is kept a string (_as_read): converting it would change its
@@ -366,31 +361,6 @@ def discover_json_paths(types: dict[str, object]) -> set[str]:
     type, which readers see as arrow.json and bin/reconstruct.py decodes.
     """
     return {p for p, t in types.items() if _is_json(t)}
-
-
-def init_duckdb(memory_limit: str, threads: int | None,
-                 temp_dir: str | None = None) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect()
-    con.sql(f"SET memory_limit='{_sql_escape(memory_limit)}'")
-    if threads:
-        con.sql(f"SET threads={threads}")
-    # Priority: explicit --temp-dir > $TMPDIR (SLURM local scratch) > /tmp
-    if temp_dir is None:
-        temp_dir = os.environ.get("TMPDIR", "/tmp/duckdb_temp")
-    # Unique per process: concurrent jobs may share --temp-dir (e.g. the
-    # documented /scratch/$USER/duckdb_tmp), and a shared spill path risks
-    # collisions and cross-job cleanup.
-    os.makedirs(temp_dir, exist_ok=True)
-    spill_dir = tempfile.mkdtemp(prefix="duckdb_spill_", dir=temp_dir)
-    atexit.register(shutil.rmtree, spill_dir, ignore_errors=True)
-    con.sql(f"SET temp_directory='{_sql_escape(spill_dir)}'")
-    eprint(f"  DuckDB temp directory: {spill_dir}")
-    # 64-bit Arrow offsets: a batch of long rows (publications, comments)
-    # can hold more than 2 GiB of strings in one column, which the regular
-    # 32-bit offsets cannot address.  stream_to_parquet casts each batch back
-    # to the regular types (_to_regular_types), so the files are unchanged.
-    con.sql("SET arrow_large_buffer_size=true")
-    return con
 
 
 # ─── Output schema: shortcut columns + source columns ───────────────────
@@ -2432,4 +2402,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

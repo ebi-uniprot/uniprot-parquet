@@ -40,9 +40,14 @@ params.notify_email   = null      // Email for SLURM failure notifications (null
 params.duckdb_temp    = null      // DuckDB spill directory (null = use $TMPDIR or /tmp)
 params.expected_count = null      // Expected entry count (from UniProt release stats, null = skip)
 params.previous_manifest = null   // Previous release's lake/manifest.json: schema diff in the validation report
+params.max_time       = '72h'     // Wall-time cap of a retried heavy process: at most the SLURM queue's limit
 
 // Final output directory: <outdir>/<release>/.  Process directives cannot
 // call script functions, so every publishDir spells the same path out.
+// Every publishDir sets overwrite: true.  Nextflow's default is false under
+// -resume, which leaves a published copy damaged by an interrupted run
+// (a missing Parquet file, a truncated sorted.jsonl.zst) as it is; with
+// overwrite, -resume republishes every cached output whole.
 def release_dir() {
     "${params.outdir}/${params.release}"
 }
@@ -53,24 +58,90 @@ def pending_marker() {
     "${release_dir()}/.RELEASE_COMPLETE.pending"
 }
 
+// Checks the published release directory against its own metadata
+// (bin/verify_release.py: every file listed, sizes, no stray Parquet file,
+// the .pending marker's checksum) before onComplete renames the marker.
+// VALIDATE checked the work-directory lake, not the copy publishDir made.
+// Returns null if the release is whole, else why not.  A release_dir that
+// is not on the local file system (an object store) is not verified.
+def verify_release_problems() {
+    def dir = file(release_dir())
+    if (dir.fileSystem != java.nio.file.FileSystems.default) {
+        log.warn "verify_release.py not run: ${release_dir()} is not on a local file system"
+        return null
+    }
+    def cmd = ['python3', "${projectDir}/bin/verify_release.py", dir.toString(),
+               '--marker', file(pending_marker()).toString()]
+    try {
+        def proc = cmd.execute()
+        def out = new StringBuilder()
+        def err = new StringBuilder()
+        proc.waitForProcessOutput(out, err)
+        return proc.exitValue() == 0 ? null : "${out}${err}".trim()
+    }
+    catch (IOException e) {
+        return "cannot run verify_release.py: ${e.message}"
+    }
+}
+
+// The bin/ modules each process's scripts import.  Nextflow hashes a
+// process's script text and inputs, not the modules a script imports:
+// VALIDATE's validate_lake.py imports reconstruct.py, shortcut_reference.py,
+// parquet_transform.py and duckdb_util.py, and without this a fix to any of
+// them would be served from cache under -resume, republishing the old
+// verdict.  Each process takes bin_digest(<process>) as an input, so a
+// change to one of its modules re-runs it.  The lists name exactly the
+// scripts' imports (tests/test_workflow.py checks them against the code):
+// editing the validator never redoes a sort or a transform.
+def bin_modules(String process) {
+    [
+        STREAM_JSONL:      [],
+        SORT_JSONL:        ['duckdb_util.py'],
+        PARQUET_TRANSFORM: ['duckdb_util.py'],
+        VALIDATE:          ['parquet_transform.py', 'duckdb_util.py', 'reconstruct.py', 'shortcut_reference.py'],
+        PROVENANCE:        ['parquet_transform.py', 'duckdb_util.py'],
+    ][process]
+}
+
+// MD5 of bin_modules(process): their names and contents, in list order.
+def bin_digest(String process) {
+    def md = java.security.MessageDigest.getInstance('MD5')
+    bin_modules(process).each { name ->
+        md.update(name.bytes)
+        md.update(file("${projectDir}/bin/${name}").bytes)
+    }
+    md.digest().encodeHex().toString()
+}
+
 def banner_line(String s) {
     "║  ${s.padRight(55)}║"
 }
 
-// DuckDB memory is computed inside each process script block (not here) so that
-// it reacts to task.memory on retry — when Nextflow doubles the allocation after
-// an OOM, DuckDB's buffer pool scales up with it.
-//
 // OOM retry lives on the DuckDB processes themselves (not in a profile) so
-// it applies under every executor.  Exit codes: 137 = SIGKILL (OOM killer),
-// 140 = SLURM OOM, 143 = SIGTERM (SLURM pre-kill before SIGKILL).  Memory is
-// params.process_memory × attempt, capped at 256 GB; non-OOM failures are terminal.
+// it applies under every executor.  Exit codes: 75 = DuckDB's own
+// out-of-memory error (the scripts exit EX_TEMPFAIL, bin/duckdb_util.py),
+// 137 = SIGKILL (OOM killer), 140 = SLURM OOM, 143 = SIGTERM (SLURM's
+// pre-kill, for exceeding memory or wall time: the two cannot be told
+// apart).  A retry gets params.process_memory × attempt, capped at 256 GB,
+// and its base time × attempt, capped at params.max_time, so a wall-time
+// kill is not retried with the same limit.  Other failures are terminal.
 def oom_retry(exit_status) {
-    exit_status in [137, 140, 143] ? 'retry' : 'finish'
+    exit_status in [75, 137, 140, 143] ? 'retry' : 'finish'
 }
 
 def scaled_memory(attempt) {
     [(params.process_memory as MemoryUnit) * attempt, 256.GB].min()
+}
+
+def scaled_time(String base, attempt) {
+    [(base as Duration) * attempt, params.max_time as Duration].min()
+}
+
+// DuckDB's memory_limit: params.duckdb_pct of the task's memory, in MB (whole
+// GB would truncate a small allocation to 0GB).  Evaluated per attempt, so
+// DuckDB's buffer pool doubles with the retry's memory.
+def duckdb_mem(MemoryUnit memory) {
+    "${(memory.toBytes() * params.duckdb_pct / 100 / 1048576).longValue()}MB"
 }
 
 // Shell lines giving a DuckDB process its spill directory under
@@ -156,13 +227,14 @@ process SORT_JSONL {
     memory { scaled_memory(task.attempt) }
     errorStrategy { oom_retry(task.exitStatus) }
     maxRetries 1
-    time '24h'
+    time { scaled_time('24h', task.attempt) }
     disk '1 TB'          // DuckDB spill space for ORDER BY
 
-    publishDir "${params.outdir}/${params.release}", mode: 'copy'
+    publishDir "${params.outdir}/${params.release}", mode: 'copy', overwrite: true
 
     input:
     path jsonl
+    val bin_code         // bin_digest: the imported bin/ modules
 
     output:
     path "sorted.jsonl.zst", emit: sorted_jsonl
@@ -170,15 +242,15 @@ process SORT_JSONL {
     script:
     """
     set -euo pipefail
+    # bin/ modules: ${bin_code}
     echo " .-- SORT_JSONL BEGUN \$(date)"
 
-    DUCKDB_MEM="\$(python3 -c "print(str(int(${task.memory.toBytes()} * ${params.duckdb_pct} / 100 / 1073741824)) + 'GB')")"
 
     ${spill_setup(task.process)}
 
     sort_jsonl.py ${jsonl} \
         -o sorted.jsonl.zst \
-        --memory-limit \${DUCKDB_MEM} \
+        --memory-limit ${duckdb_mem(task.memory)} \
         --threads ${task.cpus} \
         ${spill_flag()}
 
@@ -209,16 +281,17 @@ process PARQUET_TRANSFORM {
     memory { scaled_memory(task.attempt) }
     errorStrategy { oom_retry(task.exitStatus) }
     maxRetries 1
-    time '48h'
+    time { scaled_time('48h', task.attempt) }
     disk '2 TB'          // DuckDB ORDER BY spill + Parquet output.  Every table is sorted in
                          // full (DuckDB does not reuse the input's order): child tables by
                          // (reviewed DESC, organism_id, accession, <x>_index).  xrefs (~5B rows) and
                          // features spill the most, one table at a time.
 
-    publishDir "${params.outdir}/${params.release}", mode: 'copy', pattern: 'lake'
+    publishDir "${params.outdir}/${params.release}", mode: 'copy', overwrite: true, pattern: 'lake'
 
     input:
     path sorted_jsonl
+    val bin_code         // bin_digest: the imported bin/ modules
 
     output:
     path "lake", emit: lake
@@ -226,14 +299,14 @@ process PARQUET_TRANSFORM {
     script:
     """
     set -euo pipefail
+    # bin/ modules: ${bin_code}
     echo " .-- PARQUET_TRANSFORM BEGUN \$(date)"
 
-    DUCKDB_MEM="\$(python3 -c "print(str(int(${task.memory.toBytes()} * ${params.duckdb_pct} / 100 / 1073741824)) + 'GB')")"
     ${spill_setup(task.process)}
 
     parquet_transform.py ${sorted_jsonl} \
         --outdir ./lake \
-        --memory-limit \${DUCKDB_MEM} \
+        --memory-limit ${duckdb_mem(task.memory)} \
         --threads ${task.cpus} \
         --release ${params.release} \
         --skip-existing \
@@ -273,28 +346,28 @@ process VALIDATE {
     memory { scaled_memory(task.attempt) }
     errorStrategy { oom_retry(task.exitStatus) }
     maxRetries 1
-    time '24h'
+    time { scaled_time('24h', task.attempt) }
 
-    publishDir "${params.outdir}/${params.release}", mode: 'copy'
+    publishDir "${params.outdir}/${params.release}", mode: 'copy', overwrite: true
 
     input:
     path lake
     path sorted_jsonl
     path count_file
     path previous_manifest   // [] when unset; staged, so -resume hashes its path, size and mtime (default cache mode)
+    val bin_code             // bin_digest: the imported bin/ modules
 
     output:
     path "validation_report.txt", emit: report
     path "validation_report.json", emit: report_json
-    val true,                     emit: validated
 
     script:
     def previous_flag = previous_manifest ? "--previous-manifest '${previous_manifest}'" : ''
     """
     set -euo pipefail
+    # bin/ modules: ${bin_code}
     echo " .-- VALIDATE BEGUN \$(date)"
 
-    DUCKDB_MEM="\$(python3 -c "print(str(int(${task.memory.toBytes()} * ${params.duckdb_pct} / 100 / 1073741824)) + 'GB')")"
     ${spill_setup(task.process)}
 
     validate_lake.py \
@@ -303,7 +376,7 @@ process VALIDATE {
         --expected-count \$(cat ${count_file}) \
         --spot-check-n 1000 \
         --release \
-        --memory-limit \${DUCKDB_MEM} \
+        --memory-limit ${duckdb_mem(task.memory)} \
         --threads ${task.cpus} \
         ${spill_flag()} \
         ${previous_flag} \
@@ -315,8 +388,10 @@ process VALIDATE {
 
 
 /* ── PROCESS: SCHEMA.md, provenance manifest, release marker ──────── */
-// PROVENANCE depends on VALIDATE (via validation_ok gate) so that it
-// is only published if the data lake passes validation.  SCHEMA.md is
+// PROVENANCE depends on VALIDATE (it takes the validation reports, which
+// exist only if validation passed) so that it is only published for a lake
+// that passed.  It records the size and SHA-256 of every file published
+// beside lake/, which verify_release.py checks before the marker is written.  SCHEMA.md is
 // generated from this build's manifest: source columns follow the input,
 // so the schema document is per release, like the schema.
 process PROVENANCE {
@@ -330,13 +405,14 @@ process PROVENANCE {
     // still being copied there.  It is published as a hidden .pending file
     // and renamed by the workflow's onComplete section, which Nextflow runs
     // only after every pending publish has finished.
-    publishDir "${params.outdir}/${params.release}", mode: 'copy',
+    publishDir "${params.outdir}/${params.release}", mode: 'copy', overwrite: true,
         saveAs: { name -> name == 'RELEASE_COMPLETE' ? '.RELEASE_COMPLETE.pending' : name }
 
     input:
     path lake
     path sorted_jsonl
-    val validation_ok
+    path validation_reports   // validation_report.txt and .json; their arrival is the VALIDATE gate
+    val bin_code              // bin_digest: the imported bin/ modules
 
     output:
     path "SCHEMA.md", emit: schema_doc
@@ -349,6 +425,7 @@ process PROVENANCE {
     script:
     """
     set -euo pipefail
+    # bin/ modules: ${bin_code}
 
     gen_schema_md.py --lake ${lake} -o SCHEMA.md
 
@@ -356,6 +433,7 @@ process PROVENANCE {
         --lake ${lake} \
         --input-jsonl ${sorted_jsonl} \
         --release ${params.release} \
+        --published ${sorted_jsonl} SCHEMA.md ${validation_reports} \
         -o provenance.json \
         --complete-marker RELEASE_COMPLETE
     """
@@ -415,11 +493,11 @@ workflow {
     STREAM_JSONL(input_ch)
 
     // 2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (lines kept as they are)
-    SORT_JSONL(STREAM_JSONL.out.jsonl)
+    SORT_JSONL(STREAM_JSONL.out.jsonl, bin_digest('SORT_JSONL'))
 
     // 3. Transform sorted JSONL → Parquet tables
     //    DuckDB infers the input schema from the whole file (read_json_auto).
-    PARQUET_TRANSFORM(SORT_JSONL.out.sorted_jsonl)
+    PARQUET_TRANSFORM(SORT_JSONL.out.sorted_jsonl, bin_digest('PARQUET_TRANSFORM'))
 
     // 4. Validate the Parquet lake (uses sorted JSONL as ground truth —
     //    same entries, same count, just reordered — anchored to the entry
@@ -429,24 +507,33 @@ workflow {
         SORT_JSONL.out.sorted_jsonl,
         STREAM_JSONL.out.count_file,
         params.previous_manifest ? file(params.previous_manifest) : [],
+        bin_digest('VALIDATE'),
     )
 
     // 5. SCHEMA.md and provenance record (only after validation passes)
     PROVENANCE(
         PARQUET_TRANSFORM.out.lake,
         SORT_JSONL.out.sorted_jsonl,
-        VALIDATE.out.validated,
+        VALIDATE.out.report.concat(VALIDATE.out.report_json).collect(),
+        bin_digest('PROVENANCE'),
     )
 
     // 6. RELEASE_COMPLETE is the last file to reach release_dir.
-    //    onComplete runs after every publishDir copy has finished, so a
-    //    mirror that sees the marker sees the whole lake/.  The rename is
+    //    onComplete runs after every publishDir copy has finished, and
+    //    renames the marker only if verify_release.py finds the published
+    //    copy whole, so a mirror that sees the marker sees the whole lake/.  The rename is
     //    atomic within the directory; a failed run leaves no marker (and no
     //    .pending file either — VALIDATE failing means PROVENANCE never ran,
     //    and anything staged by an earlier attempt is removed).
     onComplete:
     def pending = file(pending_marker())
-    if (workflow.success && pending.exists()) {
+    def problems = (workflow.success && pending.exists()) ? verify_release_problems() : null
+    if (problems) {
+        pending.delete()
+        log.error "RELEASE_COMPLETE not written: the published copy in ${release_dir()} " +
+                  "does not match its metadata. Re-run with -resume to republish it.\n${problems}"
+    }
+    else if (workflow.success && pending.exists()) {
         // moveTo overwrites an existing file target atomically
         // (FilesEx.moveTo passes REPLACE_EXISTING), so no delete-first is
         // needed — and none is wanted: a separate delete would open a window

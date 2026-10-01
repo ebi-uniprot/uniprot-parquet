@@ -140,7 +140,10 @@ import pyarrow.parquet as pq
 import pyarrow.dataset as ds
 from concurrent.futures import ThreadPoolExecutor
 
+import duckdb
+
 from parquet_transform import CHILD_TABLES, TABLE_DEFS, hash_file, init_duckdb
+from duckdb_util import run_main
 
 
 def eprint(*args, **kwargs):
@@ -590,6 +593,8 @@ def check_referential_integrity(report, lake_dir, entry_count):
             )
             if orphans:
                 report.checks.append(f"    orphan examples: {orphans[:5]}")
+        except duckdb.OutOfMemoryException:
+            raise                   # exit 75: retried with more memory (run_main)
         except Exception as e:
             report.check(
                 f"all {child_name}.accession exist in entries",
@@ -873,6 +878,8 @@ def check_round_trip(report, lake_dir, sampled_entries, n, n_reviewed=None):
                 "comment_count": row[5],
                 "reference_count": row[6],
             }
+    except duckdb.OutOfMemoryException:
+        raise                   # exit 75: retried with more memory (run_main)
     except Exception as e:
         report.check("round-trip lake lookup", False, f"DuckDB error: {e}")
         return
@@ -1033,6 +1040,8 @@ def check_denormalized_sync(report, lake_dir):
                 reviewed_mismatches == 0,
                 f"{reviewed_mismatches:,} mismatches" if reviewed_mismatches else ""
             )
+        except duckdb.OutOfMemoryException:
+            raise                   # exit 75: retried with more memory (run_main)
         except Exception as e:
             report.check(
                 f"{child_name} denormalized sync",
@@ -1733,4 +1742,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

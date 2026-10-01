@@ -896,6 +896,15 @@ def case_dup_jsonl(tmp_path_factory):
     return path
 
 
+def test_duckdb_out_of_memory_exits_75(small_jsonl, tmp_path):
+    """A DuckDB out-of-memory error exits 75 (EX_TEMPFAIL): the workflow
+    retries it with twice the memory."""
+    result = run_bin("parquet_transform.py", small_jsonl, "--outdir", tmp_path / "lake",
+                     "--memory-limit", "50MB", "--threads", "2")
+    assert result.returncode == 75, result.stderr[-2000:]
+    assert "DuckDB ran out of memory" in result.stderr
+
+
 def test_unknown_entry_type_is_refused(tmp_path):
     """A reworded entryType would put every Swiss-Prot entry in the trembl
     partition with reviewed = false: the build stops, naming the value."""
