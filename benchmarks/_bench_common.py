@@ -1,4 +1,4 @@
-"""Shared helpers for the plan's benchmark scripts (F.4, H.1, Part A Phase 3)."""
+"""Shared helpers for the benchmark scripts (file size, zstd level, point lookup)."""
 
 import os
 import re

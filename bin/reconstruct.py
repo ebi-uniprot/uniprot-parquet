@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-reconstruct.py — rebuild a UniProtKB JSON entry from its lake rows (plan A11).
+reconstruct.py — rebuild a UniProtKB JSON entry from its lake rows.
 
 ``reconstruct_entry`` is the inverse ``g`` of the transform ``f``: given one
 ``entries`` row and the child rows for the same accession, it returns the
@@ -8,41 +8,42 @@ UniProtKB JSON entry.  ``tests/test_reconstruct.py`` and the validator's
 ``check_reconstruction`` assert ``g(f(x)) == x`` for every fixture entry and
 for a sample of every release, so the lake is provably lossless.
 
-Comparison is order-independent inside arrays (``deep_sort``): the child
-tables carry no position index, so array order is not reproduced.  This is
-a known limitation recorded in ``PLAN_SCHEMA_V2.md`` (Results log, Step 10).
+A row's source columns (every column that is not a shortcut) are its JSON
+element, key for key: the entry, feature, cross-reference, comment or
+reference as UniProt ships it.  Shortcut columns are never read.  Child rows
+are placed by their ``*_index`` column, so array order is part of the
+comparison.  Dict key order is ignored (dict ``==``), and an empty
+``features`` / ``uniProtKBCrossReferences`` / ``comments`` / ``references``
+array counts as absent: both are stored as zero child rows
+(``drop_empty_child_arrays``).
 
-``deep_sort`` and ``normalize_value`` live here so the validator and the test
-suite normalise identically.
+A source column whose type differs between entries is stored as JSON text
+(Parquet's JSON type, ``arrow.json`` in Arrow): ``rows_from_arrow`` decodes
+it.  Convert every Arrow table with it before reconstructing.
+
+``normalize_value`` and ``entries_match`` live here so the validator and the
+test suite normalise identically.
 """
 
 import json
+
+import pyarrow as pa
+
+from parquet_transform import CHILD_TABLES, PARTITION_KEY, TABLE_META
 
 
 # ─── Normalisation (shared by tests and validator) ──────────────────────
 
 
-def deep_sort(obj):
-    """Recursively sort dict keys and list elements for order-independent comparison."""
-    if isinstance(obj, dict):
-        return {k: deep_sort(v) for k, v in sorted(obj.items())}
-    if isinstance(obj, list):
-        sorted_items = [deep_sort(item) for item in obj]
-        try:
-            return sorted(sorted_items, key=lambda x: json.dumps(x, sort_keys=True, default=str))
-        except TypeError:
-            return sorted_items
-    return obj
-
-
 def normalize_value(val):
-    """Normalise a value for comparison: drop None-valued dict fields (Parquet
-    unions add nullable fields the source never had), keep numbers, stringify
-    everything else (dates, etc.).
+    """Normalise a value for comparison: drop None-valued dict fields (a
+    STRUCT holds every key any entry has, NULL where this one has none),
+    keep numbers, stringify everything else.
 
-    Callers must convert Arrow rows with ``to_pylist(maps_as_pydicts="strict")``
-    so MAP columns arrive as dicts: the default list-of-tuples form makes an
-    empty MAP indistinguishable from an empty JSON array."""
+    Callers must convert Arrow rows with ``rows_from_arrow`` (or
+    ``to_pylist(maps_as_pydicts="strict")``) so MAP columns arrive as dicts:
+    the default list-of-tuples form makes an empty MAP indistinguishable from
+    an empty JSON array."""
     if val is None:
         return None
     if isinstance(val, dict):
@@ -52,6 +53,16 @@ def normalize_value(val):
     if isinstance(val, (int, float)):
         return val
     return str(val)
+
+
+# Top-level arrays stored as child-table rows: an empty one and an absent
+# one are both zero rows, so the two are not told apart.
+CHILD_ARRAYS = tuple(array for array, _, _ in CHILD_TABLES.values())
+
+
+def drop_empty_child_arrays(entry: dict) -> dict:
+    """``entry`` without its empty child-table arrays (see CHILD_ARRAYS)."""
+    return {k: v for k, v in entry.items() if not (k in CHILD_ARRAYS and v == [])}
 
 
 def first_diff(a, b, path="$"):
@@ -81,82 +92,39 @@ def first_diff(a, b, path="$"):
     return None
 
 
+# ─── Arrow rows ─────────────────────────────────────────────────────────
+
+
+def rows_from_arrow(table: pa.Table, json_columns=()) -> list[dict]:
+    """``table``'s rows as dicts, MAPs as dicts and every JSON column
+    decoded: those typed arrow.json (as read from the Parquet files) and
+    those named in ``json_columns`` (a query result, where DuckDB hands JSON
+    over as plain strings)."""
+    decode = {f.name for f in table.schema if isinstance(f.type, pa.JsonType)} | set(json_columns)
+    rows = table.to_pylist(maps_as_pydicts="strict")
+    if decode:
+        for row in rows:
+            for name in decode & row.keys():
+                if row[name] is not None:
+                    row[name] = json.loads(row[name])
+    return rows
+
+
 # ─── Reconstruction ─────────────────────────────────────────────────────
 
 
-def _date(v):
-    return None if v is None else str(v)
+def _element(row: dict, table: str) -> dict:
+    """The JSON element a row holds: its source columns, NULL ones left out."""
+    skip = set(TABLE_META[table]["columns"]["shortcut"]) | {PARTITION_KEY}
+    return {k: v for k, v in row.items() if k not in skip and v is not None}
 
 
-def _compact(d: dict) -> dict:
-    """Drop None-valued keys."""
-    return {k: v for k, v in d.items() if v is not None}
-
-
-def _residual(v) -> dict:
-    """A residual struct as a dict of its non-None fields ({} when NULL)."""
-    return {k: x for k, x in (v or {}).items() if x is not None}
-
-
-def _organism(e: dict) -> dict:
-    return _compact({
-        "taxonId": e.get("taxid"),
-        "scientificName": e.get("organism_name"),
-        "commonName": e.get("organism_common"),
-        "lineage": e.get("lineage"),
-        **_residual(e.get("organism_residual")),
-    })
-
-
-def _protein_description(e: dict):
-    """proteinDescription is kept whole in the residual except ``flag``
-    (protein_name / alt_protein_names / ec_numbers are projections)."""
-    return _compact({"flag": e.get("protein_flag"), **_residual(e.get("protein_desc_residual"))})
-
-
-def _feature(r: dict) -> dict:
-    location = {
-        "start": _compact({"value": r.get("start_pos"), "modifier": r.get("start_modifier")}),
-        "end": _compact({"value": r.get("end_pos"), "modifier": r.get("end_modifier")}),
-        "sequence": r.get("location_sequence"),
-    }
-    # evidence_codes, original_sequence, alternative_sequences and ligand_* are
-    # projections of the residual's evidences / alternativeSequence / ligand;
-    # they are never read here (no positional zipping).
-    return _compact({
-        "type": r.get("type"),
-        "location": _compact(location),
-        "description": r.get("description"),
-        "featureId": r.get("feature_id"),
-        **_residual(r.get("feature_residual")),
-    })
-
-
-def _reference(r: dict) -> dict:
-    residual = _residual(r.get("reference_residual"))
-    citation = _compact({
-        "citationType": r.get("citation_type"),
-        "id": r.get("citation_id"),
-        "title": r.get("title"),
-        "authors": r.get("authors"),
-        "authoringGroup": r.get("authoring_group"),
-        "publicationDate": r.get("publication_date"),
-        "journal": r.get("journal"),
-        "volume": r.get("volume"),
-        "firstPage": r.get("first_page"),
-        "lastPage": r.get("last_page"),
-        "submissionDatabase": r.get("submission_database"),
-        "citationCrossReferences": r.get("citation_xrefs"),
-        **_residual(residual.pop("citation", None)),
-    })
-    return _compact({
-        "referenceNumber": r.get("reference_number"),
-        "citation": citation,
-        "referencePositions": r.get("reference_positions"),
-        "referenceComments": r.get("reference_comments"),
-        "evidences": r.get("evidences"),
-        **residual,
-    })
+def _in_order(rows, index_column):
+    """Child rows in source-array order (by their *_index column when present)."""
+    rows = list(rows)
+    if rows and rows[0].get(index_column) is not None:
+        rows.sort(key=lambda r: r[index_column])
+    return rows
 
 
 def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
@@ -165,64 +133,24 @@ def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
 
     ``entry_row`` is one ``entries`` row as ``{column: python value}``; the
     other arguments are lists of child rows for the same accession (any
-    order).  Keys whose value is None are dropped, as are None-valued fields
-    inside structs (``normalize_value``).  Convenience columns that are pure
-    projections of a residual field (evidence_codes, ligand_*, gene_names,
-    keyword_ids, ...) are never read: the residual or full struct is the
-    source of truth, so nothing is zipped positionally.
+    order; they are placed by their ``*_index`` column).  Rows come from
+    ``rows_from_arrow``.  The entry is the entries row's source columns plus
+    one array per child table; keys whose value is None are dropped, as are
+    None-valued fields inside structs (``normalize_value``), and a child
+    array with no rows is left out.
     """
-    e = entry_row
-    out = {
-        "entryType": e.get("entry_type"),
-        "primaryAccession": e.get("acc"),
-        "secondaryAccessions": e.get("secondary_accs"),
-        "uniProtkbId": e.get("id"),
-        "entryAudit": {
-            "firstPublicDate": _date(e.get("first_public")),
-            "lastAnnotationUpdateDate": _date(e.get("last_modified")),
-            "lastSequenceUpdateDate": _date(e.get("last_seq_modified")),
-            "entryVersion": e.get("entry_version"),
-            "sequenceVersion": e.get("seq_version"),
-        },
-        "annotationScore": e.get("annotation_score"),
-        "organism": _organism(e),
-        "organismHosts": e.get("organism_hosts"),
-        "proteinExistence": e.get("protein_existence"),
-        "proteinDescription": _protein_description(e),
-        "genes": e.get("genes_full"),
-        "geneLocations": e.get("gene_locations"),
-        "keywords": e.get("keywords_full"),
-        "sequence": {
-            "value": e.get("sequence"),
-            "length": e.get("seq_length"),
-            "molWeight": e.get("seq_mass"),
-            "md5": e.get("seq_md5"),
-            "crc64": e.get("seq_crc64"),
-        },
-        "extraAttributes": e.get("extra_attributes"),
-    }
-    if feature_rows:
-        out["features"] = [_feature(r) for r in feature_rows]
-    if xref_rows:
-        out["uniProtKBCrossReferences"] = [
-            {"database": r["database"], "id": r["id"], "properties": r.get("properties"),
-             "isoformId": r.get("isoform_id"), "evidences": r.get("evidences")}
-            for r in xref_rows
-        ]
-    if comment_rows:
-        out["comments"] = [
-            json.loads(r["comment"]) if isinstance(r["comment"], str) else r["comment"]
-            for r in comment_rows
-        ]
-    if publication_rows:
-        out["references"] = [_reference(r) for r in publication_rows]
-    return normalize_value({k: v for k, v in out.items() if v is not None})
+    out = _element(entry_row, "entries")
+    for table, rows in zip(CHILD_TABLES, (feature_rows, xref_rows, comment_rows, publication_rows)):
+        array, index, _ = CHILD_TABLES[table]
+        if rows:
+            out[array] = [_element(r, table) for r in _in_order(rows, index)]
+    return normalize_value(out)
 
 
 def entries_match(reconstructed, original):
     """(bool, first differing path) for a reconstructed vs original entry."""
-    a = deep_sort(normalize_value(reconstructed))
-    b = deep_sort(normalize_value(original))
+    a = drop_empty_child_arrays(normalize_value(reconstructed))
+    b = drop_empty_child_arrays(normalize_value(original))
     if a == b:
         return True, None
     return False, first_diff(a, b)

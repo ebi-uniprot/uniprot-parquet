@@ -1,11 +1,10 @@
-"""Roundtrip equivalence test: JSONL → Parquet → reconstruct → compare.
+"""Roundtrip equivalence, piece by piece: JSONL → Parquet → compare.
 
-The ultimate data-lake integrity test: load the original JSON entries,
-run the pipeline, then reconstruct each entry from the five Parquet
-tables and verify that every piece of data survived the round trip.
-
-Equivalence is measured set-wise (order-independent) since the pipeline
-sorts rows differently from the input order.
+Loads the original JSON entries, runs the pipeline, then checks each part of
+each entry (accessions, scalars, child arrays, derived columns) against the
+lake, so a failure names the part that broke.  Child arrays are compared
+set-wise here; tests/test_reconstruct.py rebuilds whole entries from the six
+tables and compares them exactly, array order included.
 """
 
 import gzip
@@ -16,7 +15,7 @@ from collections import defaultdict
 import pyarrow.dataset as ds
 import pytest
 
-from reconstruct import deep_sort, normalize_value, _feature, _reference  # shared with the validator
+from reconstruct import CHILD_ARRAYS, normalize_value, _element  # shared with the validator
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────
@@ -27,8 +26,8 @@ from conftest import load_original_entries, open_table  # noqa: F401
 
 # ─── Fixtures ───────────────────────────────────────────────────────────
 # originals, lake, lake_entries, lake_features, lake_xrefs, lake_comments and
-# lake_publications are session fixtures in conftest.py (shared with
-# tests/test_reconstruct.py so the row dicts are built once).
+# lake_publications are module-scoped fixtures in conftest.py (shared with
+# tests/test_reconstruct.py).
 
 
 # ─── Tests: Completeness ───────────────────────────────────────────────
@@ -39,13 +38,13 @@ class TestAccessionMap:
 
     def test_secondaries_resolve(self, originals, lake):
         import duckdb
-        rows = duckdb.sql(f"SELECT acc, primary_acc, is_primary FROM read_parquet('{lake}/accession_map/**/*.parquet')").fetchall()
+        rows = duckdb.sql(f"SELECT accession, primary_accession, is_primary FROM read_parquet('{lake}/accession_map/**/*.parquet')").fetchall()
         secondary = {(a, p) for a, p, is_p in rows if not is_p}
         primary = {a for a, p, is_p in rows if is_p and a == p}
-        for acc, orig in originals.items():
-            assert acc in primary, f"{acc}: no primary row"
+        for accession, orig in originals.items():
+            assert accession in primary, f"{accession}: no primary row"
             for sec in orig.get("secondaryAccessions") or []:
-                assert (sec, acc) in secondary, f"{acc}: secondary {sec} does not resolve"
+                assert (sec, accession) in secondary, f"{accession}: secondary {sec} does not resolve"
 
 
 class TestAccessionCompleteness:
@@ -73,145 +72,61 @@ class TestAccessionCompleteness:
 class TestEntryFields:
     """For each entry, verify that scalar and nested fields survived."""
 
-    def test_entry_type_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            assert lake["entry_type"] == orig["entryType"], (
-                f"{acc}: entry_type {lake['entry_type']!r} != {orig['entryType']!r}"
-            )
+    def test_source_columns_equal_the_json(self, originals, lake_entries):
+        """Every top-level key of an entry (child arrays aside) is a column
+        holding the JSON value as shipped."""
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
+            for key, value in orig.items():
+                if key in CHILD_ARRAYS:
+                    continue
+                assert normalize_value(lake[key]) == normalize_value(value), f"{accession}: {key}"
 
     def test_uniprot_id_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             assert lake["id"] == orig["uniProtkbId"], (
-                f"{acc}: id mismatch"
+                f"{accession}: id mismatch"
             )
 
     def test_taxid_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            assert lake["taxid"] == orig["organism"]["taxonId"], (
-                f"{acc}: taxid {lake['taxid']} != {orig['organism']['taxonId']}"
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
+            assert lake["organism_id"] == orig["organism"]["taxonId"], (
+                f"{accession}: organism_id {lake['organism_id']} != {orig['organism']['taxonId']}"
             )
 
     def test_organism_name_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             assert lake["organism_name"] == orig["organism"]["scientificName"], (
-                f"{acc}: organism_name mismatch"
-            )
-
-    def test_sequence_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            assert lake["sequence"] == orig["sequence"]["value"], (
-                f"{acc}: sequence mismatch"
+                f"{accession}: organism_name mismatch"
             )
 
     def test_seq_length_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            assert lake["seq_length"] == orig["sequence"]["length"], (
-                f"{acc}: seq_length {lake['seq_length']} != {orig['sequence']['length']}"
-            )
-
-    def test_seq_mass_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            assert lake["seq_mass"] == orig["sequence"]["molWeight"], (
-                f"{acc}: seq_mass mismatch"
-            )
-
-    def test_seq_md5_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            assert lake["seq_md5"] == orig["sequence"]["md5"], (
-                f"{acc}: seq_md5 mismatch"
-            )
-
-    def test_annotation_score_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            assert lake["annotation_score"] == orig["annotationScore"], (
-                f"{acc}: annotation_score mismatch"
-            )
-
-    def test_protein_existence_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            assert lake["protein_existence"] == orig["proteinExistence"], (
-                f"{acc}: protein_existence mismatch"
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
+            assert lake["length"] == orig["sequence"]["length"], (
+                f"{accession}: length {lake['length']} != {orig['sequence']['length']}"
             )
 
     def test_reviewed_flag_correct(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             expected = "Swiss-Prot" in orig["entryType"]
             assert lake["reviewed"] == expected, (
-                f"{acc}: reviewed {lake['reviewed']} != expected {expected}"
+                f"{accession}: reviewed {lake['reviewed']} != expected {expected}"
             )
 
-    def test_secondary_accessions_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            orig_sec = orig.get("secondaryAccessions") or []
-            lake_sec = lake.get("secondary_accs") or []
-            assert set(orig_sec) == set(lake_sec), (
-                f"{acc}: secondary_accs mismatch: {orig_sec} vs {lake_sec}"
-            )
-
-    def test_entry_audit_dates_preserved(self, originals, lake_entries):
-        """entryAudit dates and versions survive the flattening."""
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+    def test_entry_audit_dates(self, originals, lake_entries):
+        """The DATE shortcuts are entryAudit's date strings."""
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             audit = orig["entryAudit"]
-            # Dates are stored as DATE type, compare as strings
-            assert str(lake["first_public"]) == audit["firstPublicDate"], (
-                f"{acc}: first_public mismatch"
-            )
-            assert str(lake["last_modified"]) == audit["lastAnnotationUpdateDate"], (
-                f"{acc}: last_modified mismatch"
-            )
-            assert lake["entry_version"] == audit["entryVersion"], (
-                f"{acc}: entry_version mismatch"
-            )
-            assert lake["seq_version"] == audit["sequenceVersion"], (
-                f"{acc}: seq_version mismatch"
-            )
-
-
-# ─── Tests: Nested struct preservation ─────────────────────────────────
-
-
-class TestNestedStructs:
-    """Residual / full nested columns (plan A13). The four struct-equality tests
-    that compared organism / proteinDescription / genes / keywords directly are
-    gone: tests/test_reconstruct.py is the lossless proof."""
-
-    def test_genes_full_and_keywords_full_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            for src, col in (("genes", "genes_full"), ("keywords", "keywords_full")):
-                assert deep_sort(normalize_value(orig.get(src) or [])) == \
-                    deep_sort(normalize_value(lake.get(col) or [])), f"{acc}: {col} mismatch"
-
-    def test_residuals_hold_only_leftovers(self, originals, lake_entries):
-        """Residual structs never carry a promoted field."""
-        for acc in list(originals)[:200]:
-            lake = lake_entries[acc]
-            org = lake.get("organism_residual") or {}
-            assert not {"taxonId", "scientificName", "commonName", "lineage"} & set(org)
-            pdr = lake.get("protein_desc_residual") or {}
-            assert "flag" not in pdr
-
-    def test_extra_attributes_preserved(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
-            orig_ea = normalize_value(orig.get("extraAttributes"))
-            lake_ea = normalize_value(lake.get("extra_attributes"))
-            assert deep_sort(orig_ea) == deep_sort(lake_ea), (
-                f"{acc}: extraAttributes mismatch"
-            )
+            assert str(lake["date_created"]) == audit["firstPublicDate"], f"{accession}: date_created"
+            assert str(lake["date_modified"]) == audit["lastAnnotationUpdateDate"], f"{accession}: date_modified"
+            assert str(lake["date_sequence_modified"]) == audit["lastSequenceUpdateDate"], (
+                f"{accession}: date_sequence_modified")
 
 
 # ─── Tests: Child table counts ─────────────────────────────────────────
@@ -221,35 +136,35 @@ class TestChildTableCounts:
     """Row counts in child tables must match the original array lengths."""
 
     def test_feature_counts(self, originals, lake_features):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             orig_count = len(orig.get("features") or [])
-            lake_count = len(lake_features.get(acc, []))
+            lake_count = len(lake_features.get(accession, []))
             assert orig_count == lake_count, (
-                f"{acc}: features count {lake_count} != original {orig_count}"
+                f"{accession}: features count {lake_count} != original {orig_count}"
             )
 
     def test_xref_counts(self, originals, lake_xrefs):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             orig_count = len(orig.get("uniProtKBCrossReferences") or [])
-            lake_count = len(lake_xrefs.get(acc, []))
+            lake_count = len(lake_xrefs.get(accession, []))
             assert orig_count == lake_count, (
-                f"{acc}: xrefs count {lake_count} != original {orig_count}"
+                f"{accession}: xrefs count {lake_count} != original {orig_count}"
             )
 
     def test_comment_counts(self, originals, lake_comments):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             orig_count = len(orig.get("comments") or [])
-            lake_count = len(lake_comments.get(acc, []))
+            lake_count = len(lake_comments.get(accession, []))
             assert orig_count == lake_count, (
-                f"{acc}: comments count {lake_count} != original {orig_count}"
+                f"{accession}: comments count {lake_count} != original {orig_count}"
             )
 
     def test_publication_counts(self, originals, lake_publications):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             orig_count = len(orig.get("references") or [])
-            lake_count = len(lake_publications.get(acc, []))
+            lake_count = len(lake_publications.get(accession, []))
             assert orig_count == lake_count, (
-                f"{acc}: publications count {lake_count} != original {orig_count}"
+                f"{accession}: publications count {lake_count} != original {orig_count}"
             )
 
 
@@ -257,25 +172,25 @@ class TestChildTableCounts:
 
 
 class TestFeatureContent:
-    """The 'feature' column preserves the full original feature struct."""
+    """A features row's source columns are the original feature."""
 
     def test_all_features_present(self, originals, lake_features):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             orig_features = orig.get("features") or []
-            lake_rows = lake_features.get(acc, [])
+            lake_rows = lake_features.get(accession, [])
 
-            # Rebuild each feature from convenience columns + residual (order-independent)
+            # Each row's source columns, compared order-independently
             orig_set = {
-                json.dumps(deep_sort(normalize_value(f)), sort_keys=True, default=str)
+                json.dumps(normalize_value(f), sort_keys=True, default=str)
                 for f in orig_features
             }
             lake_set = {
-                json.dumps(deep_sort(normalize_value(_feature(row))), sort_keys=True, default=str)
+                json.dumps(normalize_value(_element(row, "features")), sort_keys=True, default=str)
                 for row in lake_rows
             }
             missing = orig_set - lake_set
             assert not missing, (
-                f"{acc}: {len(missing)} features missing from lake"
+                f"{accession}: {len(missing)} features missing from lake"
             )
 
 
@@ -283,84 +198,80 @@ class TestXrefContent:
     """Cross-references are preserved at the field level."""
 
     def test_all_xrefs_present(self, originals, lake_xrefs):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             orig_xrefs = orig.get("uniProtKBCrossReferences") or []
-            lake_rows = lake_xrefs.get(acc, [])
+            lake_rows = lake_xrefs.get(accession, [])
 
             # Build comparable tuples: (database, id)
             orig_keys = {(x["database"], x["id"]) for x in orig_xrefs}
             lake_keys = {(row["database"], row["id"]) for row in lake_rows}
             missing = orig_keys - lake_keys
             assert not missing, (
-                f"{acc}: {len(missing)} xrefs missing from lake, e.g. {list(missing)[:3]}"
+                f"{accession}: {len(missing)} xrefs missing from lake, e.g. {list(missing)[:3]}"
             )
 
 
 class TestCommentContent:
-    """The 'comment' column preserves the full original comment as JSON."""
+    """A comments row's source columns are the original comment."""
 
     def test_all_comments_present(self, originals, lake_comments):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             orig_comments = orig.get("comments") or []
-            lake_rows = lake_comments.get(acc, [])
+            lake_rows = lake_comments.get(accession, [])
 
-            # Parse the stored JSON and compare (order-independent)
+            # Each row's source columns, compared order-independently
             orig_set = {
-                json.dumps(deep_sort(normalize_value(c)), sort_keys=True, default=str)
+                json.dumps(normalize_value(c), sort_keys=True, default=str)
                 for c in orig_comments
             }
-            lake_set = set()
-            for row in lake_rows:
-                comment = row["comment"]
-                if isinstance(comment, str):
-                    comment = json.loads(comment)
-                lake_set.add(
-                    json.dumps(deep_sort(normalize_value(comment)), sort_keys=True, default=str)
-                )
+            lake_set = {
+                json.dumps(normalize_value(_element(row, "comments")), sort_keys=True, default=str)
+                for row in lake_rows
+            }
             missing = orig_set - lake_set
             assert not missing, (
-                f"{acc}: {len(missing)} comments missing from lake"
+                f"{accession}: {len(missing)} comments missing from lake"
             )
 
     def test_text_value_matches_texts(self, originals, lake_comments):
         """text_value is the double-newline join of texts[*].value, else NULL."""
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             by_type = defaultdict(list)
-            for row in lake_comments.get(acc, []):
-                by_type[row["comment_type"]].append(row["text_value"])
+            for row in lake_comments.get(accession, []):
+                by_type[row["commentType"]].append(row["text_value"])
             for c in orig.get("comments") or []:
                 lake_values = by_type[c["commentType"]]
                 if "texts" in c:
                     expected = "\n\n".join(t["value"] for t in c["texts"])
                     assert expected in lake_values, (
-                        f"{acc}: {c['commentType']} text_value not found"
+                        f"{accession}: {c['commentType']} text_value not found"
                     )
                 else:
                     assert all(v is None for v in lake_values), (
-                        f"{acc}: {c['commentType']} has no texts but text_value is set"
+                        f"{accession}: {c['commentType']} has no texts but text_value is set"
                     )
 
 
 class TestPublicationContent:
-    """The 'reference' column preserves the full original reference struct."""
+    """A publications row's source columns are the original reference."""
 
     def test_all_publications_present(self, originals, lake_publications):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             orig_refs = orig.get("references") or []
-            lake_rows = lake_publications.get(acc, [])
+            lake_rows = lake_publications.get(accession, [])
 
-            # Rebuild each reference from convenience columns + residual (order-independent)
+            # Each row's source columns, compared order-independently
             orig_set = {
-                json.dumps(deep_sort(normalize_value(r)), sort_keys=True, default=str)
+                json.dumps(normalize_value(r), sort_keys=True, default=str)
                 for r in orig_refs
             }
             lake_set = {
-                json.dumps(deep_sort(normalize_value(_reference(row))), sort_keys=True, default=str)
+                json.dumps(normalize_value(_element(row, "publications")), sort_keys=True, default=str)
                 for row in lake_rows
             }
             missing = orig_set - lake_set
             assert not missing, (
-                f"{acc}: {len(missing)} references missing from lake"
+                f"{accession}: {len(missing)} references missing from lake"
             )
 
 
@@ -371,8 +282,8 @@ class TestConvenienceColumns:
     """Convenience columns must be correctly derived from the source data."""
 
     def test_gene_names_match(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             orig_genes = [
                 g["geneName"]["value"]
                 for g in (orig.get("genes") or [])
@@ -380,122 +291,117 @@ class TestConvenienceColumns:
             ]
             # The SQL list_transform produces NULL for genes without geneName;
             # filter those out for comparison.
-            lake_genes = [g for g in (lake.get("gene_names") or []) if g is not None]
+            lake_genes = [g for g in (lake.get("gene_primary") or []) if g is not None]
             assert set(orig_genes) == set(lake_genes), (
-                f"{acc}: gene_names mismatch: {orig_genes} vs {lake_genes}"
+                f"{accession}: gene_primary mismatch: {orig_genes} vs {lake_genes}"
             )
 
     def test_go_ids_match(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             orig_go = {
                 x["id"]
                 for x in (orig.get("uniProtKBCrossReferences") or [])
                 if x["database"] == "GO"
             }
-            lake_go = set(lake.get("go_ids") or [])
+            lake_go = set(lake.get("go_id") or [])
             assert orig_go == lake_go, (
-                f"{acc}: go_ids mismatch"
+                f"{accession}: go_id mismatch"
             )
 
-    def test_gene_name_matches(self, originals, lake_entries):
-        for acc in originals:
-            lake = lake_entries[acc]
-            assert lake["gene_name"] == (lake["gene_names"] or [None])[0], f"{acc}: gene_name"
-
     def test_go_terms_match_go_ids(self, originals, lake_entries):
-        for acc in originals:
-            lake = lake_entries[acc]
+        for accession in originals:
+            lake = lake_entries[accession]
             go_terms = lake.get("go_terms") or []
-            go_ids = lake.get("go_ids") or []
-            assert {t["id"] for t in go_terms} == set(go_ids), f"{acc}: go_terms ids"
-            assert len(go_terms) == len(go_ids), f"{acc}: go_terms length"
+            go_id = lake.get("go_id") or []
+            assert {t["id"] for t in go_terms} == set(go_id), f"{accession}: go_terms ids"
+            assert len(go_terms) == len(go_id), f"{accession}: go_terms length"
             for t in go_terms:
-                assert t["aspect"] in {"P", "F", "C", None}, f"{acc}: aspect {t['aspect']!r}"
+                assert t["aspect"] in {"P", "F", "C", None}, f"{accession}: aspect {t['aspect']!r}"
                 if t["aspect"] is not None:
-                    assert t["term"], f"{acc}: empty term"
+                    assert t["term"], f"{accession}: empty term"
 
     def test_pubmed_ids_match(self, originals, lake_entries):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             ids = set()
             for r in orig.get("references") or []:
                 for c in (r.get("citation") or {}).get("citationCrossReferences") or []:
                     if c["database"] == "PubMed":
                         ids.add(c["id"])
             expected = sorted(ids, key=int)
-            assert (lake_entries[acc].get("pubmed_ids") or []) == expected, f"{acc}: pubmed_ids"
+            assert (lake_entries[accession].get("lit_pubmed_id") or []) == expected, f"{accession}: lit_pubmed_id"
 
     def test_proteome_ids_match(self, originals, lake_entries):
-        for acc, orig in originals.items():
+        for accession, orig in originals.items():
             expected = sorted({
                 x["id"] for x in (orig.get("uniProtKBCrossReferences") or [])
                 if x["database"] == "Proteomes"
             })
-            assert (lake_entries[acc].get("proteome_ids") or []) == expected, f"{acc}: proteome_ids"
+            assert (lake_entries[accession].get("xref_proteomes") or []) == expected, f"{accession}: xref_proteomes"
 
     def test_division_values(self, originals, lake_entries):
         allowed = {"archaea", "bacteria", "fungi", "human", "invertebrates", "mammals",
                    "plants", "rodents", "vertebrates", "viruses", "unclassified"}
-        for acc in originals:
-            lake = lake_entries[acc]
-            assert lake["division"] in allowed, f"{acc}: division {lake['division']!r}"
-            if lake["taxid"] == 9606:
-                assert lake["division"] == "human", acc
+        for accession in originals:
+            lake = lake_entries[accession]
+            assert lake["division"] in allowed, f"{accession}: division {lake['division']!r}"
+            if lake["organism_id"] == 9606:
+                assert lake["division"] == "human", accession
 
     def test_xref_dbs_match(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             orig_dbs = {
                 x["database"]
                 for x in (orig.get("uniProtKBCrossReferences") or [])
             }
             lake_dbs = set(lake.get("xref_dbs") or [])
             assert orig_dbs == lake_dbs, (
-                f"{acc}: xref_dbs mismatch"
+                f"{accession}: xref_dbs mismatch"
             )
 
     def test_keyword_ids_match(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             orig_kw = [kw["id"] for kw in (orig.get("keywords") or [])]
-            lake_kw = lake.get("keyword_ids") or []
+            lake_kw = lake.get("keywordid") or []
             assert set(orig_kw) == set(lake_kw), (
-                f"{acc}: keyword_ids mismatch"
+                f"{accession}: keywordid mismatch"
             )
 
     def test_keyword_names_match(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             orig_kw = [kw["name"] for kw in (orig.get("keywords") or [])]
-            lake_kw = lake.get("keyword_names") or []
+            lake_kw = lake.get("keyword") or []
             assert set(orig_kw) == set(lake_kw), (
-                f"{acc}: keyword_names mismatch"
+                f"{accession}: keyword mismatch"
             )
 
     def test_feature_count_matches_source(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             assert lake["feature_count"] == len(orig.get("features") or []), (
-                f"{acc}: feature_count mismatch"
+                f"{accession}: feature_count mismatch"
             )
 
     def test_xref_count_matches_source(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             assert lake["xref_count"] == len(orig.get("uniProtKBCrossReferences") or []), (
-                f"{acc}: xref_count mismatch"
+                f"{accession}: xref_count mismatch"
             )
 
     def test_comment_count_matches_source(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             assert lake["comment_count"] == len(orig.get("comments") or []), (
-                f"{acc}: comment_count mismatch"
+                f"{accession}: comment_count mismatch"
             )
 
     def test_reference_count_matches_source(self, originals, lake_entries):
-        for acc, orig in originals.items():
-            lake = lake_entries[acc]
+        for accession, orig in originals.items():
+            lake = lake_entries[accession]
             assert lake["reference_count"] == len(orig.get("references") or []), (
-                f"{acc}: reference_count mismatch"
+                f"{accession}: reference_count mismatch"
             )

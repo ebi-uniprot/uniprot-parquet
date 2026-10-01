@@ -6,8 +6,13 @@ then organism taxon ID, then accession.
 Uses DuckDB's out-of-core sorting — spills to disk when the dataset exceeds
 memory, so it handles the full 160GB+ UniProtKB in bounded memory.
 
-Output is a zstd-compressed JSONL file with the same content, reordered.
-DuckDB handles JSON serialisation and zstd compression natively via COPY.
+Output is a zstd-compressed JSONL file holding the input's lines, byte for
+byte, reordered.  Each line is read as raw text (read_ndjson_objects) and
+the sort keys are extracted from it; nothing is parsed into DuckDB's
+inferred schema and serialised again, which would add a null for every key
+an entry lacks, reorder keys and rewrite numbers.  The lines are written
+back with a CSV COPY that neither quotes nor escapes: JSON text never holds
+the \x01 delimiter or a raw line break, so each line is one field as is.
 
 Usage:
     sort_jsonl.py <input.jsonl.zst> -o <sorted.jsonl.zst> \
@@ -23,21 +28,22 @@ import time
 
 # Allow importing from the same bin/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from parquet_transform import build_read_clause, init_duckdb, _sql_escape
+from parquet_transform import init_duckdb, _sql_escape
 
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
+# maximum_object_size=512 MB: the largest UniProtKB entries (titin) exceed
+# DuckDB's 16 MB default (as in parquet_transform.build_read_clause).
 SORT_SQL = """
-SELECT *
-FROM {read_clause} e
+SELECT json
+FROM read_ndjson_objects('{path}', maximum_object_size=536870912)
 ORDER BY
-    CASE WHEN e.entryType LIKE '%Swiss-Prot%'
-         THEN true ELSE false END DESC,
-    e.organism.taxonId,
-    e.primaryAccession
+    coalesce(json_extract_string(json, '$.entryType') LIKE '%Swiss-Prot%', false) DESC,
+    TRY_CAST(json_extract(json, '$.organism.taxonId') AS BIGINT),
+    json_extract_string(json, '$.primaryAccession')
 """
 
 
@@ -71,18 +77,17 @@ def main():
 
     con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
     try:
-        read_clause = build_read_clause(jsonl_path)
-
-        sql = SORT_SQL.format(read_clause=read_clause)
+        sql = SORT_SQL.format(path=_sql_escape(jsonl_path))
         safe_output = _sql_escape(output_path)
 
-        eprint("Sorting (reviewed DESC, taxid ASC, acc ASC) and writing...")
+        eprint("Sorting (reviewed DESC, organism_id ASC, accession ASC) and writing...")
         eprint("  DuckDB will spill to disk if the dataset exceeds memory.")
         t0 = time.time()
 
         con.sql(f"""
             COPY ({sql}) TO '{safe_output}'
-            (FORMAT JSON, COMPRESSION ZSTD)
+            (FORMAT CSV, HEADER false, QUOTE '', ESCAPE '', DELIMITER chr(1),
+             COMPRESSION ZSTD)
         """)
 
         elapsed = time.time() - t0

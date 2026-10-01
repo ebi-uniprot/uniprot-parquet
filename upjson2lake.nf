@@ -3,34 +3,28 @@
 // UniProtKB JSON → JSONL.zst + sorted Parquet data lake
 //
 // Produces (inside <outdir>/<release>/):
-//   sorted.jsonl.zst                  (reviewed+taxid-sorted JSONL archive)
-//   lake/entries/entries_*.parquet     (one row per protein)
-//   lake/features/features_*.parquet  (one row per feature)
-//   lake/xrefs/xrefs_*.parquet        (one row per cross-reference)
-//   lake/comments/comments_*.parquet  (one row per comment annotation)
-//   lake/publications/publications_*.parquet  (one row per citation)
-//   lake/manifest.json                (file list, schemas, row counts, sort orders)
-//   lake/datapackage.json             (Frictionless Data Package — FAIR metadata)
-//   validation_report.txt             (12-check production validation)
+//   sorted.jsonl.zst                  (reviewed+organism_id-sorted JSONL archive)
+//   lake/<table>/review_status=swissprot|trembl/<table>_NNNNN.parquet
+//       for entries, features, xrefs, comments, publications, accession_map
+//   lake/manifest.json  datapackage.json  LICENSE  SHA256SUMS.txt  RELEASE.metalink
+//   validation_report.txt / .json     (production validation; see bin/validate_lake.py)
+//   SCHEMA.md                         (this release's schema, generated from the lake)
 //   provenance.json                   (checksums, git commit, row counts)
+//   RELEASE_COMPLETE                  (written last, only after validation passed)
 //
 // Architecture:
 //   1. Stream JSON(.gz) → single zstd-compressed JSONL
-//   2. Sort JSONL by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
+//   2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (Swiss-Prot first)
 //   3. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow
-//      (DuckDB infers the schema from the data via read_json_auto;
-//       pre-sorted input makes DuckDB ORDER BY nearly free for entries;
-//       child tables inherit (reviewed, taxid, acc) order from LATERAL unnest
-//       with no additional sort — avoids ~1.2 TB spill at production scale)
-//   4. Production validation: completeness, referential integrity,
-//      sort order, round-trip spot checks, Parquet integrity
-//   5. Generate provenance manifest (only if validation passes)
+//   4. Production validation against the sorted JSONL (lossless reconstruction
+//      of a sample, counts, keys, sort order, checksums, partitions, ...)
+//   5. SCHEMA.md, provenance and the release marker (only if validation passes)
 //
-// Schema management: DuckDB infers types directly from the data via
-// read_json_auto.  The data is a JSON dump from production — whatever
-// schema it has is what we use.  Each release is a full rebuild.
-// All tables sorted by reviewed DESC, taxid ASC, acc ASC (Swiss-Prot first)
-// for query locality via Parquet row group statistics.
+// Schema: the input schema is never declared — DuckDB infers it from the whole
+// dump on every run.  Source columns are UniProt's JSON keys, one per key, typed
+// as the input, so a field UniProt adds is a new column, never a failure;
+// shortcut columns have fixed names and declared types.
+// Each release is a full rebuild.
 
 // Written in the Nextflow strict syntax (the default parser since 26.04):
 // only declarations at script level, so the release directory is a function
@@ -45,6 +39,7 @@ params.duckdb_pct     = 75        // % of process_memory allocated to DuckDB buf
 params.notify_email   = null      // Email for SLURM failure notifications (null = disabled)
 params.duckdb_temp    = null      // DuckDB spill directory (null = use $TMPDIR or /tmp)
 params.expected_count = null      // Expected entry count (from UniProt release stats, null = skip)
+params.previous_manifest = null   // Previous release's lake/manifest.json: schema diff in the validation report
 
 // Final output directory: <outdir>/<release>/.  Process directives cannot
 // call script functions, so every publishDir spells the same path out.
@@ -66,7 +61,7 @@ def banner_line(String s) {
 // it reacts to task.memory on retry — when Nextflow doubles the allocation after
 // an OOM, DuckDB's buffer pool scales up with it.
 //
-// OOM retry lives on the two heavy processes themselves (not in a profile) so
+// OOM retry lives on the DuckDB processes themselves (not in a profile) so
 // it applies under every executor.  Exit codes: 137 = SIGKILL (OOM killer),
 // 140 = SLURM OOM, 143 = SIGTERM (SLURM pre-kill before SIGKILL).  Memory is
 // params.process_memory × attempt, capped at 256 GB; non-OOM failures are terminal.
@@ -76,6 +71,25 @@ def oom_retry(exit_status) {
 
 def scaled_memory(attempt) {
     [(params.process_memory as MemoryUnit) * attempt, 256.GB].min()
+}
+
+// Shell lines giving a DuckDB process its spill directory under
+// --duckdb_temp: one per release and process, emptied before use.  An
+// attempt killed by the OOM killer never runs its own cleanup, so its spill
+// (up to ~1-2 TB) stays behind; the retry, or a later run of the same
+// release, reclaims it here instead of adding a second one.  Only runs of
+// this release and process use the directory, and those never overlap.
+// '' with no --duckdb_temp: DuckDB then spills under $TMPDIR or /tmp.
+// Read through a function, so the spill location is not part of a task's
+// -resume hash: moving the scratch directory does not redo a sort.
+def spill_setup(process) {
+    if (!params.duckdb_temp) return ''
+    def dir = "${params.duckdb_temp}/${params.release}.${process}"
+    return "SPILL='${dir}'\n    rm -rf \"\$SPILL\"\n    mkdir -p \"\$SPILL\""
+}
+
+def spill_flag() {
+    params.duckdb_temp ? '--temp-dir "$SPILL"' : ''
 }
 
 // Scripts live in bin/ which Nextflow adds to $PATH automatically.
@@ -131,10 +145,10 @@ process STREAM_JSONL {
 }
 
 
-/* ── PROCESS: Sort JSONL by reviewed DESC, taxid ASC, acc ASC ──────────────── */
-// Sorts the raw JSONL before the Parquet transform.  Pre-sorted input
-// makes DuckDB's ORDER BY nearly free for the entries table and improves
-// locality for child table sorts after LATERAL unnest.
+/* ── PROCESS: Sort JSONL by reviewed DESC, organism_id ASC, accession ASC ──────────────── */
+// Sorts the JSONL lines, each kept byte for byte, before the Parquet
+// transform.  Pre-sorted input gives the transform's ORDER BYs locality;
+// each table is still sorted (and spilled) in full.
 // Also the published deliverable for end users.
 process SORT_JSONL {
     tag 'sort_jsonl'
@@ -160,11 +174,13 @@ process SORT_JSONL {
 
     DUCKDB_MEM="\$(python3 -c "print(str(int(${task.memory.toBytes()} * ${params.duckdb_pct} / 100 / 1073741824)) + 'GB')")"
 
+    ${spill_setup(task.process)}
+
     sort_jsonl.py ${jsonl} \
         -o sorted.jsonl.zst \
         --memory-limit \${DUCKDB_MEM} \
         --threads ${task.cpus} \
-        ${params.duckdb_temp ? "--temp-dir ${params.duckdb_temp}" : ''}
+        ${spill_flag()}
 
     echo " '-- SORT_JSONL ENDED \$(date)"
     """
@@ -173,11 +189,10 @@ process SORT_JSONL {
 
 /* ── PROCESS: Transform sorted JSONL → Parquet tables ───────────── */
 // Stages the sorted JSONL to Parquet once (single JSON parse), then all
-// five table queries read from the staged Parquet — roughly 2× faster than
-// re-parsing JSON for each table.  DuckDB's ORDER BY on entries is nearly
-// a no-op since the input is already in (reviewed DESC, taxid ASC, acc ASC) order.
-// Child tables (features, xrefs, comments, publications) still need their own sort
-// after LATERAL unnest, but benefit from the input locality.
+// six table queries read from the staged Parquet — roughly 2× faster than
+// re-parsing JSON for each table.  Every table has its own ORDER BY; the
+// pre-sorted input gives them locality (child tables add the element's
+// array position as the last key).
 //
 // NOTE on --skip-existing and retries:
 //   --skip-existing is useful for manual re-runs (e.g. fix root cause, then
@@ -195,9 +210,10 @@ process PARQUET_TRANSFORM {
     errorStrategy { oom_retry(task.exitStatus) }
     maxRetries 1
     time '48h'
-    disk '2 TB'          // DuckDB ORDER BY spill + Parquet output.  accession_map is the one
-                         // table with a real sort (reviewed DESC, acc): ~250M + secondaries rows
-                         // of five narrow columns, expect low tens of GB of spill for it alone.
+    disk '2 TB'          // DuckDB ORDER BY spill + Parquet output.  Every table is sorted in
+                         // full (DuckDB does not reuse the input's order): child tables by
+                         // (reviewed DESC, organism_id, accession, <x>_index).  xrefs (~5B rows) and
+                         // features spill the most, one table at a time.
 
     publishDir "${params.outdir}/${params.release}", mode: 'copy', pattern: 'lake'
 
@@ -213,6 +229,7 @@ process PARQUET_TRANSFORM {
     echo " .-- PARQUET_TRANSFORM BEGUN \$(date)"
 
     DUCKDB_MEM="\$(python3 -c "print(str(int(${task.memory.toBytes()} * ${params.duckdb_pct} / 100 / 1073741824)) + 'GB')")"
+    ${spill_setup(task.process)}
 
     parquet_transform.py ${sorted_jsonl} \
         --outdir ./lake \
@@ -220,7 +237,11 @@ process PARQUET_TRANSFORM {
         --threads ${task.cpus} \
         --release ${params.release} \
         --skip-existing \
-        ${params.duckdb_temp ? "--temp-dir ${params.duckdb_temp}" : ''}
+        ${spill_flag()}
+
+    # The completion sentinels only serve a manual --skip-existing re-run of
+    # this directory (a retry gets a fresh work directory): not published.
+    rm -rf lake/.complete
 
     echo " '-- PARQUET_TRANSFORM ENDED \$(date)"
     """
@@ -228,28 +249,31 @@ process PARQUET_TRANSFORM {
 
 
 /* ── PROCESS: Production validation of the Parquet data lake ─────── */
-// Validates completeness, uniqueness, referential integrity, sort order,
-// round-trip spot checks against the source JSONL, Parquet file integrity,
-// manifest consistency, and optionally schema evolution against a baseline.
-// Exits 1 on ANY failure.  Uses the sorted JSONL as ground truth (same entries, same count),
-// anchored to STREAM_JSONL's entry_count.txt so a row lost in SORT_JSONL is caught.
+// Validates completeness, uniqueness, referential integrity, sort order and
+// array positions, lossless reconstruction of a sample against the source
+// JSONL, Parquet file integrity, manifest and checksums, partitions.
+// Exits 1 on ANY failure.  Uses the sorted JSONL as ground truth: its lines are
+// STREAM_JSONL's, byte for byte, each holding its dump entry's exact data (not
+// DuckDB's parse of it), anchored to entry_count.txt so a row lost in SORT_JSONL
+// is caught.
 //
-// SCHEMA EVOLUTION GUARD (intentionally disabled):
-//   A schema_baseline.json exists in the repo and validate_lake.py supports
-//   --schema-baseline, but the check is deliberately not wired in.
-//   Reason: if UniProt changes their JSON schema, it's already in production —
-//   failing the pipeline doesn't help; we need to adapt our SQL templates.
-//   Renamed fields break the SQL directly (DuckDB BinderError), dropped fields
-//   are handled by the optional-fields mechanism (NULLed out), and new fields
-//   are picked up automatically by read_json_auto.  The one case it could
-//   catch (silent type changes) isn't detected by the baseline anyway, since
-//   it only compares column names, not types.
-//   For cross-release change tracking, compare manifest.json files instead.
+// With --previous_manifest, the report also lists how this release's schema
+// differs from the previous one (tables / columns added, removed, retyped).
+// That section is informational and never fails: source columns follow
+// UniProt's JSON by design.
+//
+// At full scale it decompresses the whole JSONL once, hashes every Parquet
+// file (cpus at a time) and runs DuckDB joins over the child tables (xrefs
+// ~5B rows), so it gets the heavy processes' memory, OOM retry and spill
+// directory, and DuckDB is sized to the task.  Not yet timed on a full
+// release: time is generous.
 process VALIDATE {
     tag 'validate'
-    cpus 2
-    memory params.process_memory
-    time '4h'
+    cpus 8
+    memory { scaled_memory(task.attempt) }
+    errorStrategy { oom_retry(task.exitStatus) }
+    maxRetries 1
+    time '24h'
 
     publishDir "${params.outdir}/${params.release}", mode: 'copy'
 
@@ -257,6 +281,7 @@ process VALIDATE {
     path lake
     path sorted_jsonl
     path count_file
+    path previous_manifest   // [] when unset; staged, so -resume hashes its path, size and mtime (default cache mode)
 
     output:
     path "validation_report.txt", emit: report
@@ -264,18 +289,23 @@ process VALIDATE {
     val true,                     emit: validated
 
     script:
-    // Schema evolution check deliberately disabled — see comment above VALIDATE process.
-    def schema_baseline_flag = ''
+    def previous_flag = previous_manifest ? "--previous-manifest '${previous_manifest}'" : ''
     """
     set -euo pipefail
     echo " .-- VALIDATE BEGUN \$(date)"
+
+    DUCKDB_MEM="\$(python3 -c "print(str(int(${task.memory.toBytes()} * ${params.duckdb_pct} / 100 / 1073741824)) + 'GB')")"
+    ${spill_setup(task.process)}
 
     validate_lake.py \
         --lake ${lake} \
         --jsonl ${sorted_jsonl} \
         --expected-count \$(cat ${count_file}) \
         --spot-check-n 1000 \
-        ${schema_baseline_flag} \
+        --memory-limit \${DUCKDB_MEM} \
+        --threads ${task.cpus} \
+        ${spill_flag()} \
+        ${previous_flag} \
         -o validation_report.txt
 
     echo " '-- VALIDATE ENDED \$(date)"
@@ -283,9 +313,11 @@ process VALIDATE {
 }
 
 
-/* ── PROCESS: Generate provenance manifest ───────────────────────── */
+/* ── PROCESS: SCHEMA.md, provenance manifest, release marker ──────── */
 // PROVENANCE depends on VALIDATE (via validation_ok gate) so that it
-// is only published if the data lake passes validation.
+// is only published if the data lake passes validation.  SCHEMA.md is
+// generated from this build's manifest: source columns follow the input,
+// so the schema document is per release, like the schema.
 process PROVENANCE {
     tag 'provenance'
     cpus 1
@@ -306,15 +338,18 @@ process PROVENANCE {
     val validation_ok
 
     output:
+    path "SCHEMA.md", emit: schema_doc
     path "provenance.json", emit: provenance
-    // RELEASE_COMPLETE is written by release_manifest.py as its last action
-    // (plan H.5).  This process runs only after VALIDATE passed, so the
-    // marker cannot appear for a failed release; mirrors check it first.
+    // RELEASE_COMPLETE is written by release_manifest.py as its last action.
+    // This process runs only after VALIDATE passed, so the marker cannot
+    // appear for a failed release; mirrors check it first.
     path "RELEASE_COMPLETE", emit: complete
 
     script:
     """
     set -euo pipefail
+
+    gen_schema_md.py --lake ${lake} -o SCHEMA.md
 
     release_manifest.py \
         --lake ${lake} \
@@ -340,12 +375,24 @@ workflow {
     DuckDB mem: ${params.duckdb_pct}% of task.memory (scales on retry)
     DuckDB tmp: ${params.duckdb_temp ?: '(default: \$TMPDIR or /tmp)'}
     Expected:   ${params.expected_count ?: '(not set — post-hoc verification only)'}
+    Previous:   ${params.previous_manifest ?: '(not set — no schema diff)'}
     ${'─' * 59}
     """.stripIndent()
 
     // Validate inputs
     if (!file(params.inputfile).exists()) {
         error "Input file not found: ${params.inputfile}"
+    }
+    if (params.previous_manifest && !file(params.previous_manifest).exists()) {
+        error "Previous manifest not found: ${params.previous_manifest}"
+    }
+    // PARQUET_TRANSFORM republishes into release_dir while VALIDATE reads the
+    // previous manifest, so one from inside it would be diffed against itself
+    // (and its new mtime would re-run VALIDATE on every -resume).
+    def this_release = file(release_dir())
+    if (params.previous_manifest && this_release.exists()
+            && file(params.previous_manifest).toRealPath().startsWith(this_release.toRealPath())) {
+        error "Previous manifest is inside the release being built (${release_dir()}): ${params.previous_manifest}"
     }
 
     // A re-run republishes into an existing release_dir, so a marker left by
@@ -366,14 +413,11 @@ workflow {
     def input_ch = channel.fromPath(params.inputfile)
     STREAM_JSONL(input_ch)
 
-    // 2. Sort JSONL by reviewed DESC, taxid ASC, acc ASC
-    //    Pre-sorting means DuckDB's ORDER BY in the transform is nearly free.
+    // 2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (lines kept as they are)
     SORT_JSONL(STREAM_JSONL.out.jsonl)
 
     // 3. Transform sorted JSONL → Parquet tables
-    //    DuckDB infers schema from the data via read_json_auto.
-    //    Reads pre-sorted input; entries ORDER BY is a no-op,
-    //    child tables benefit from input locality after unnest.
+    //    DuckDB infers the input schema from the whole file (read_json_auto).
     PARQUET_TRANSFORM(SORT_JSONL.out.sorted_jsonl)
 
     // 4. Validate the Parquet lake (uses sorted JSONL as ground truth —
@@ -383,16 +427,17 @@ workflow {
         PARQUET_TRANSFORM.out.lake,
         SORT_JSONL.out.sorted_jsonl,
         STREAM_JSONL.out.count_file,
+        params.previous_manifest ? file(params.previous_manifest) : [],
     )
 
-    // 5. Generate provenance record (only after validation passes)
+    // 5. SCHEMA.md and provenance record (only after validation passes)
     PROVENANCE(
         PARQUET_TRANSFORM.out.lake,
         SORT_JSONL.out.sorted_jsonl,
         VALIDATE.out.validated,
     )
 
-    // 6. RELEASE_COMPLETE is the last file to reach release_dir (plan H.5).
+    // 6. RELEASE_COMPLETE is the last file to reach release_dir.
     //    onComplete runs after every publishDir copy has finished, so a
     //    mirror that sees the marker sees the whole lake/.  The rename is
     //    atomic within the directory; a failed run leaves no marker (and no

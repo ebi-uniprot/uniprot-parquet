@@ -6,7 +6,7 @@ Captures four dimensions:
   1. Query latency   — common analytical queries, cold + warm timings
   2. Storage         — file sizes, compression ratios, column-level breakdown
   3. Pipeline        — end-to-end transform time from JSONL → Parquet
-  4. Schema metrics  — column counts, convenience vs nested, LOC complexity
+  4. Schema metrics  — column counts, shortcut vs source columns, LOC complexity
 
 Usage:
     python benchmarks/bench_baseline.py [--lake demo/lake/2026_01/lake] [--input demo/input.json.gz]
@@ -79,23 +79,23 @@ QUERY_SUITE = [
         "name": "point_lookup_by_acc",
         "description": "Single protein lookup by accession",
         "table": "entries",
-        "sql": "SELECT * FROM entries WHERE acc = '{acc}'",
-        "setup": "SELECT acc FROM entries WHERE reviewed LIMIT 1",
+        "sql": "SELECT * FROM entries WHERE accession = '{accession}'",
+        "setup": "SELECT accession FROM entries WHERE reviewed LIMIT 1",
     },
     {
         "name": "protein_card_macro",
         "description": "protein_card() macro — single accession",
         "table": "entries",
-        "sql": "SELECT * FROM protein_card('{acc}')",
-        "setup": "SELECT acc FROM entries WHERE reviewed LIMIT 1",
+        "sql": "SELECT * FROM protein_card('{accession}')",
+        "setup": "SELECT accession FROM entries WHERE reviewed LIMIT 1",
     },
 
     # ── Organism filters ──
     {
         "name": "organism_filter_human",
-        "description": "All human entries (taxid=9606)",
+        "description": "All human entries (organism_id=9606)",
         "table": "entries",
-        "sql": "SELECT acc, gene_names, protein_name FROM entries WHERE taxid = 9606",
+        "sql": "SELECT accession, gene_primary, protein_name_primary FROM entries WHERE organism_id = 9606",
     },
     {
         "name": "organism_features",
@@ -109,13 +109,13 @@ QUERY_SUITE = [
         "name": "keyword_search",
         "description": "Entries with keyword 'Kinase'",
         "table": "entries",
-        "sql": "SELECT acc, protein_name FROM entries WHERE list_contains(keyword_names, 'Kinase')",
+        "sql": "SELECT accession, protein_name_primary FROM entries WHERE list_contains(keyword, 'Kinase')",
     },
     {
         "name": "go_term_search",
         "description": "Entries with a specific GO term (GO:0005524 = ATP binding)",
         "table": "entries",
-        "sql": "SELECT acc, protein_name FROM entries WHERE list_contains(go_ids, 'GO:0005524')",
+        "sql": "SELECT accession, protein_name_primary FROM entries WHERE list_contains(go_id, 'GO:0005524')",
     },
 
     # ── Aggregations ──
@@ -123,7 +123,7 @@ QUERY_SUITE = [
         "name": "count_by_organism",
         "description": "Entry count per organism (top 10)",
         "table": "entries",
-        "sql": "SELECT taxid, organism_name, count(*) AS n FROM entries GROUP BY taxid, organism_name ORDER BY n DESC LIMIT 10",
+        "sql": "SELECT organism_id, organism_name, count(*) AS n FROM entries GROUP BY organism_id, organism_name ORDER BY n DESC LIMIT 10",
     },
     {
         "name": "feature_type_distribution",
@@ -141,13 +141,13 @@ QUERY_SUITE = [
     # ── Joins ──
     {
         "name": "entries_join_features",
-        "description": "Join entries with features on acc (human only)",
+        "description": "Join entries with features on accession (human only)",
         "table": "entries+features",
         "sql": """
-            SELECT e.acc, e.protein_name, f.type, f.start_pos, f.end_pos, f.description
+            SELECT e.accession, e.protein_name_primary, f.type, f.start_pos, f.end_pos, f.description
             FROM entries e
-            JOIN features f ON e.acc = f.acc
-            WHERE e.taxid = 9606
+            JOIN features f ON e.accession = f.accession
+            WHERE e.organism_id = 9606
         """,
     },
 
@@ -170,13 +170,13 @@ QUERY_SUITE = [
         "name": "nested_organism_access",
         "description": "Access nested organism struct directly",
         "table": "entries",
-        "sql": "SELECT acc, taxid, organism_name, organism_residual.synonyms FROM entries WHERE taxid = 9606",
+        "sql": "SELECT accession, organism_id, organism_name, organism.synonyms FROM entries WHERE organism_id = 9606",
     },
     {
         "name": "nested_protein_desc_access",
         "description": "Access nested proteinDescription struct",
         "table": "entries",
-        "sql": "SELECT acc, protein_desc_residual.recommendedName.fullName.value FROM entries WHERE protein_desc_residual IS NOT NULL LIMIT 50",
+        "sql": "SELECT accession, proteinDescription.recommendedName.fullName.value FROM entries WHERE proteinDescription.recommendedName IS NOT NULL LIMIT 50",
     },
 
     # ── Comment / publication queries ──
@@ -184,13 +184,13 @@ QUERY_SUITE = [
         "name": "comment_function_search",
         "description": "FUNCTION comments for a specific organism",
         "table": "comments",
-        "sql": "SELECT acc, text_value FROM comments WHERE comment_type = 'FUNCTION' AND taxid = 9606",
+        "sql": "SELECT accession, text_value FROM comments WHERE commentType = 'FUNCTION' AND organism_id = 9606",
     },
     {
         "name": "publication_count_per_entry",
         "description": "Top 10 most-cited entries",
         "table": "publications",
-        "sql": "SELECT acc, count(*) AS n FROM publications GROUP BY acc ORDER BY n DESC LIMIT 10",
+        "sql": "SELECT accession, count(*) AS n FROM publications GROUP BY accession ORDER BY n DESC LIMIT 10",
     },
 ]
 
@@ -212,17 +212,17 @@ def run_query_benchmarks(con, lake_path):
         sql = query["sql"]
 
         # Handle parameterised queries
-        if "{acc}" in sql:
+        if "{accession}" in sql:
             if "setup" in query:
                 setup_result = con.sql(query["setup"]).fetchone()
                 if setup_result:
-                    acc = setup_result[0]
-                    sql = sql.replace("{acc}", acc)
+                    accession = setup_result[0]
+                    sql = sql.replace("{accession}", accession)
                 else:
                     results[query["name"]] = {"skipped": "no data for setup query"}
                     continue
             else:
-                results[query["name"]] = {"skipped": "no acc parameter available"}
+                results[query["name"]] = {"skipped": "no accession parameter available"}
                 continue
 
         try:
@@ -399,26 +399,25 @@ def benchmark_pipeline(input_path, repo_root):
 # ---------------------------------------------------------------------------
 
 def analyze_schema_complexity(lake_path, repo_root):
-    """Measure schema complexity: column counts, convenience vs nested, LOC."""
+    """Measure schema complexity: column counts, shortcut vs source columns, LOC."""
     results = {}
 
-    # Column classification comes from the transform's own metadata so the
-    # benchmark cannot drift from the schema (plan A13 renamed the nested layer).
-    from parquet_transform import TABLE_META
-    convenience_columns = {t: m["columns"]["convenience"] for t, m in TABLE_META.items()}
-    nested_columns = {t: m["columns"]["nested"] for t, m in TABLE_META.items()}
+    # Column classification comes from the lake's manifest (source columns
+    # are the input's keys, so only a build knows them).
+    with open(os.path.join(lake_path, "manifest.json")) as f:
+        categories = {t: info["column_categories"] for t, info in json.load(f)["tables"].items()}
 
     table_metrics = {}
     for table in ["entries", "features", "xrefs", "comments", "publications"]:
-        conv = convenience_columns.get(table, [])
-        nest = nested_columns.get(table, [])
+        conv = categories.get(table, {}).get("shortcut", [])
+        nest = categories.get(table, {}).get("source", [])
         table_metrics[table] = {
             "total_columns": len(conv) + len(nest),
-            "convenience_columns": len(conv),
-            "nested_columns": len(nest),
-            "convenience_ratio": round(len(conv) / (len(conv) + len(nest)), 2) if (len(conv) + len(nest)) > 0 else 0,
-            "convenience_list": conv,
-            "nested_list": nest,
+            "shortcut_columns": len(conv),
+            "source_columns": len(nest),
+            "shortcut_ratio": round(len(conv) / (len(conv) + len(nest)), 2) if (len(conv) + len(nest)) > 0 else 0,
+            "shortcut_list": conv,
+            "source_list": nest,
         }
 
     results["tables"] = table_metrics
@@ -470,17 +469,16 @@ def analyze_schema_complexity(lake_path, repo_root):
         }
 
     # Summary
-    total_conv = sum(m["convenience_columns"] for m in table_metrics.values())
-    total_nest = sum(m["nested_columns"] for m in table_metrics.values())
+    total_conv = sum(m["shortcut_columns"] for m in table_metrics.values())
+    total_nest = sum(m["source_columns"] for m in table_metrics.values())
     results["summary"] = {
-        "total_convenience_columns": total_conv,
-        "total_nested_columns": total_nest,
+        "total_shortcut_columns": total_conv,
+        "total_source_columns": total_nest,
         "total_columns": total_conv + total_nest,
-        "overall_convenience_ratio": round(total_conv / (total_conv + total_nest), 2),
+        "overall_shortcut_ratio": round(total_conv / (total_conv + total_nest), 2),
         "description": (
-            f"{total_conv} convenience columns (manually extracted) vs "
-            f"{total_nest} nested columns across 5 tables. "
-            f"VARIANT shredding would auto-extract the {total_conv} convenience columns."
+            f"{total_conv} shortcut columns vs {total_nest} source columns "
+            f"(UniProt's JSON keys) across 5 tables."
         ),
     }
 
@@ -589,19 +587,19 @@ def format_report(all_results):
 
     summary_s = schema.get("summary", {})
     if summary_s:
-        lines.append(f"  Convenience columns: {summary_s.get('total_convenience_columns', '?')}")
-        lines.append(f"  Nested columns:      {summary_s.get('total_nested_columns', '?')}")
-        lines.append(f"  Convenience ratio:   {summary_s.get('overall_convenience_ratio', '?')}")
+        lines.append(f"  Shortcut columns:    {summary_s.get('total_shortcut_columns', '?')}")
+        lines.append(f"  Source columns:      {summary_s.get('total_source_columns', '?')}")
+        lines.append(f"  Shortcut ratio:      {summary_s.get('overall_shortcut_ratio', '?')}")
 
-    lines.append(f"\n  {'Table':<15} {'Conv':>6} {'Nested':>8} {'Total':>7} {'Ratio':>7}")
+    lines.append(f"\n  {'Table':<15} {'Short':>6} {'Source':>8} {'Total':>7} {'Ratio':>7}")
     lines.append(f"  {'─'*15} {'─'*6} {'─'*8} {'─'*7} {'─'*7}")
 
     for table, info in schema.get("tables", {}).items():
         lines.append(
-            f"  {table:<15} {info['convenience_columns']:>6} "
-            f"{info['nested_columns']:>8} "
+            f"  {table:<15} {info['shortcut_columns']:>6} "
+            f"{info['source_columns']:>8} "
             f"{info['total_columns']:>7} "
-            f"{info['convenience_ratio']:>6.0%}"
+            f"{info['shortcut_ratio']:>6.0%}"
         )
 
     lines.append("\n" + "=" * 72)

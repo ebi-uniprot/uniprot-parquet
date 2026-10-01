@@ -51,7 +51,7 @@ def test_validate_passes_on_good_lake(small_jsonl, parquet_lake, tmp_path):
     assert "ALL CHECKS PASSED" in report
     assert "[FAIL]" not in report
 
-    # validation_report.json beside the text report (plan F.2.1)
+    # validation_report.json beside the text report
     json_path = os.path.splitext(report_path)[0] + ".json"
     assert os.path.exists(json_path)
     with open(json_path) as f:
@@ -63,11 +63,9 @@ def test_validate_passes_on_good_lake(small_jsonl, parquet_lake, tmp_path):
 
 
 def _run_validator(lake, jsonl, report_path, *extra):
-    return subprocess.run(
-        [sys.executable, os.path.join(BIN_DIR, "validate_lake.py"), "--lake", lake, "--jsonl", jsonl,
-         "--spot-check-n", "10", "-o", report_path, *extra],
-        capture_output=True, text=True,
-    )
+    from conftest import run_bin
+    return run_bin("validate_lake.py", "--lake", lake, "--jsonl", jsonl,
+                   "--spot-check-n", "10", "-o", report_path, *extra)
 
 
 def _checks(report_path):
@@ -113,8 +111,246 @@ def test_validate_fails_on_file_outside_manifest(small_jsonl, parquet_lake, tmp_
     assert checks["entries manifest files match disk"]["passed"] is False
 
 
+def test_schema_diff_is_informational(small_jsonl, parquet_lake, tmp_path):
+    """--previous-manifest reports removed, added and retyped columns as
+    warnings; the lake still passes."""
+    with open(os.path.join(parquet_lake["lake_dir"], "manifest.json")) as f:
+        previous = json.load(f)
+    cols = previous["tables"]["entries"]["columns"]
+    by_name = {c["name"]: c for c in cols}
+    by_name["organism"]["type"] = "struct<taxonId: int64, oldField: string>"
+    previous["tables"]["entries"]["columns"] = [c for c in cols if c["name"] != "gene_primary"] + [
+        {"name": "retired_column", "type": "string", "nullable": True}]
+    prev_path = str(tmp_path / "previous_manifest.json")
+    with open(prev_path, "w") as f:
+        json.dump(previous, f)
+
+    report_path = str(tmp_path / "report.txt")
+    result = _run_validator(parquet_lake["lake_dir"], small_jsonl, report_path,
+                            "--previous-manifest", prev_path)
+    with open(report_path) as f:
+        text = f.read()
+    assert result.returncode == 0, text
+    assert "[WARN] entries: SHORTCUT column added: gene_primary" in text
+    assert "[WARN] entries: column removed: retired_column" in text
+    assert "[WARN] entries: column retyped: organism" in text
+    assert "fields removed: oldField" in text
+    assert "[WARN] shortcut schema changed but schema_version did not" in text
+    with open(os.path.splitext(report_path)[0] + ".json") as f:
+        data = json.load(f)
+    assert data["passed"] is True and len(data["warnings"]) >= 4
+
+
+def test_schema_diff_flags_removed_curated_column(small_jsonl, parquet_lake, tmp_path):
+    """A shortcut removed since the previous release is tagged SHORTCUT (from
+    the previous manifest's column_categories: it is no longer in
+    TABLE_META) and flags the unchanged schema_version."""
+    with open(os.path.join(parquet_lake["lake_dir"], "manifest.json")) as f:
+        previous = json.load(f)
+    entries = previous["tables"]["entries"]
+    entries["columns"].append({"name": "old_curated_col", "type": "string", "nullable": True})
+    entries["column_categories"]["shortcut"].append("old_curated_col")
+    prev_path = str(tmp_path / "previous_manifest.json")
+    with open(prev_path, "w") as f:
+        json.dump(previous, f)
+
+    report_path = str(tmp_path / "report.txt")
+    result = _run_validator(parquet_lake["lake_dir"], small_jsonl, report_path,
+                            "--previous-manifest", prev_path)
+    with open(report_path) as f:
+        text = f.read()
+    assert result.returncode == 0, text
+    assert "[WARN] entries: SHORTCUT column removed: old_curated_col" in text
+    assert "[WARN] shortcut schema changed but schema_version did not" in text
+
+
+@pytest.mark.parametrize("change", ["added", "removed", "retyped"])
+def test_schema_diff_source_column_needs_no_version(small_jsonl, parquet_lake, tmp_path, change):
+    """A source column follows UniProt's JSON: one added (UniProt added a
+    key), removed or retyped is reported but needs no schema_version bump."""
+    with open(os.path.join(parquet_lake["lake_dir"], "manifest.json")) as f:
+        previous = json.load(f)
+    cols = previous["tables"]["entries"]["columns"]
+    if change == "added":
+        previous["tables"]["entries"]["columns"] = [c for c in cols if c["name"] != "geneLocations"]
+    elif change == "removed":
+        cols.append({"name": "retiredKey", "type": "string", "nullable": True})
+    else:
+        next(c for c in cols if c["name"] == "organism")["type"] = "struct<oldField: string>"
+    prev_path = str(tmp_path / "previous_manifest.json")
+    with open(prev_path, "w") as f:
+        json.dump(previous, f)
+
+    report_path = str(tmp_path / "report.txt")
+    result = _run_validator(parquet_lake["lake_dir"], small_jsonl, report_path,
+                            "--previous-manifest", prev_path)
+    with open(report_path) as f:
+        text = f.read()
+    assert result.returncode == 0, text
+    assert f"entries: column {change}:" in text
+    assert "but schema_version did not" not in text, text
+
+
+def test_arrow_type_paths_keep_bracketed_parameters():
+    """Commas inside [...] and (...) do not split a struct's fields."""
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    from parquet_transform import _split_top
+    from validate_lake import _arrow_type_paths
+    t = "struct<updated: timestamp[us, tz=UTC], price: decimal128(10, 2), s: struct<x: int64, y: string>>"
+    assert _split_top(t[len("struct<"):-1]) == [
+        "updated: timestamp[us, tz=UTC]", "price: decimal128(10, 2)", "s: struct<x: int64, y: string>"]
+    assert _arrow_type_paths(t) == {"updated", "price", "s", "s.x", "s.y"}
+
+
+@pytest.mark.xfail(strict=True, reason="Arrow type strings do not quote field names, so a key "
+                   "containing ', ' reads as two fields; the schema diff is informational")
+def test_arrow_type_paths_key_with_comma():
+    import pyarrow as pa
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    from validate_lake import _arrow_type_paths
+    assert _arrow_type_paths(str(pa.struct([("x, y", pa.int64())]))) == {"x, y"}
+
+
+def test_reconstruction_error_is_a_failed_check(small_lake, monkeypatch):
+    """An exception while rebuilding an entry fails check 16 for that entry
+    instead of crashing the validator before it writes a report."""
+    import gzip
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    import reconstruct
+    import validate_lake
+    from conftest import SMALL_JSON_GZ
+
+    def broken(*args, **kwargs):
+        raise ValueError("boom")
+    monkeypatch.setattr(reconstruct, "reconstruct_entry", broken)
+    with gzip.open(SMALL_JSON_GZ, "rt") as f:
+        sampled = json.load(f)["results"]
+    report = validate_lake.ValidationReport()
+    validate_lake.check_reconstruction(report, small_lake["lake_dir"], sampled, 5)
+    failed = [r for r in report.records if not r["passed"]]
+    assert failed and "rebuild raised ValueError: boom" in failed[0]["detail"]
+
+
+def test_schema_diff_missing_previous_manifest_warns(small_jsonl, parquet_lake, tmp_path):
+    report_path = str(tmp_path / "report.txt")
+    result = _run_validator(parquet_lake["lake_dir"], small_jsonl, report_path,
+                            "--previous-manifest", str(tmp_path / "nope.json"))
+    assert result.returncode == 0
+    with open(report_path) as f:
+        assert "[WARN] schema diff skipped: cannot read a manifest" in f.read()
+
+
+def _rewrite_first_file(lake, table, transform):
+    """Rewrite a table's first Parquet file through ``transform(arrow_table)``
+    and refresh the manifest's details for it, so only the data check can fail."""
+    import pyarrow.parquet as pq
+    from conftest import table_files
+    from parquet_transform import _file_details
+    path = table_files(lake, table)[0]
+    tbl = pq.read_table(path)
+    pq.write_table(transform(tbl), path)
+    with open(os.path.join(lake, "manifest.json")) as f:
+        manifest = json.load(f)
+    table_dir = os.path.join(lake, table)
+    rel = os.path.relpath(path, table_dir)
+    manifest["tables"][table]["file_details"][rel].update(_file_details(table_dir, rel))
+    with open(os.path.join(lake, "manifest.json"), "w") as f:
+        json.dump(manifest, f)
+
+
+def test_validate_fails_on_broken_array_positions(small_jsonl, parquet_lake, tmp_path):
+    """A duplicated *_index within an accession fails check 5."""
+    import pyarrow as pa
+    lake = str(tmp_path / "lake")
+    shutil.copytree(parquet_lake["lake_dir"], lake)
+
+    def zero_second_index(tbl):
+        idx = tbl.column("feature_index").to_pylist()
+        idx[1] = idx[0]
+        i = tbl.schema.get_field_index("feature_index")
+        return tbl.set_column(i, tbl.schema.field(i), pa.array(idx, pa.int32()))
+    _rewrite_first_file(lake, "features", zero_second_index)
+
+    report_path = str(tmp_path / "report.txt")
+    assert _run_validator(lake, small_jsonl, report_path).returncode != 0
+    checks = _checks(report_path)
+    assert checks["features.feature_index is 0..feature_count-1 for every accession"]["passed"] is False
+
+
+def test_validate_fails_on_child_count_mismatch(small_jsonl, parquet_lake, tmp_path):
+    """Contiguous indices are not enough: an accession's number of child rows
+    must equal its entries count (here one entry claims an extra feature)."""
+    import pyarrow as pa
+    lake = str(tmp_path / "lake")
+    shutil.copytree(parquet_lake["lake_dir"], lake)
+
+    def bump_first_feature_count(tbl):
+        counts = tbl.column("feature_count").to_pylist()
+        i = next(k for k, n in enumerate(counts) if n > 0)
+        counts[i] += 1
+        col = tbl.schema.get_field_index("feature_count")
+        return tbl.set_column(col, tbl.schema.field(col), pa.array(counts, pa.int32()))
+    _rewrite_first_file(lake, "entries", bump_first_feature_count)
+
+    report_path = str(tmp_path / "report.txt")
+    assert _run_validator(lake, small_jsonl, report_path).returncode != 0
+    check = _checks(report_path)["features.feature_index is 0..feature_count-1 for every accession"]
+    assert check["passed"] is False and "rows for" in check["detail"]
+
+
+def test_validate_fails_on_unsorted_child_table(small_jsonl, parquet_lake, tmp_path):
+    """Check 5's single pass over a child table still sees rows out of
+    (reviewed, organism_id, accession, *_index) order: here two accessions' runs swap."""
+    import pyarrow as pa
+    lake = str(tmp_path / "lake")
+    shutil.copytree(parquet_lake["lake_dir"], lake)
+
+    def swap_first_two_runs(tbl):
+        accession = tbl.column("accession").to_pylist()
+        first, second = accession[0], next(a for a in accession if a != accession[0])
+        run = lambda a: [i for i, x in enumerate(accession) if x == a]  # noqa: E731
+        order = run(second) + run(first) + [i for i in range(len(accession)) if accession[i] not in (first, second)]
+        return tbl.take(pa.array(order))
+    _rewrite_first_file(lake, "features", swap_first_two_runs)
+
+    report_path = str(tmp_path / "report.txt")
+    assert _run_validator(lake, small_jsonl, report_path).returncode != 0
+    checks = _checks(report_path)
+    check = checks["features sorted by (reviewed DESC, organism_id ASC, accession ASC, feature_index ASC)"]
+    assert check["passed"] is False and "disorder at row" in check["detail"]
+
+
+def test_sort_check_reads_each_child_table_once(small_lake, monkeypatch):
+    """Check 5 streams each child table once (the sort order and the array
+    positions come from the same pass): a child table is billions of rows."""
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    import validate_lake
+
+    reads = {}
+    real_open = validate_lake.open_table
+
+    class Counting:
+        def __init__(self, name, dataset):
+            self._name, self._dataset = name, dataset
+
+        def to_batches(self, *args, **kwargs):
+            reads[self._name] = reads.get(self._name, 0) + 1
+            return self._dataset.to_batches(*args, **kwargs)
+
+        def __getattr__(self, attr):
+            return getattr(self._dataset, attr)
+
+    monkeypatch.setattr(validate_lake, "open_table",
+                        lambda lake, name: Counting(name, real_open(lake, name)))
+    report = validate_lake.ValidationReport()
+    validate_lake.check_sort_order(report, small_lake["lake_dir"])
+    assert report.passed(), report.full_report()
+    for child in validate_lake.CHILD_INDEX:
+        assert reads[child] == 1, f"{child} read {reads[child]} times"
+
+
 def test_release_manifest_writes_complete_marker_last(small_jsonl, parquet_lake, tmp_path):
-    """bin/release_manifest.py writes provenance.json, then RELEASE_COMPLETE (plan H.5)."""
+    """bin/release_manifest.py writes provenance.json, then RELEASE_COMPLETE."""
     import hashlib
     import time
 
@@ -224,3 +460,104 @@ def test_validator_decompresses_jsonl_once(small_lake, tmp_path, monkeypatch):
         validate_lake.main()
     assert exc.value.code == 0
     assert calls["open"] == 1, f"JSONL decompressed {calls['open']} times, expected 1"
+
+
+def _small_entries():
+    import gzip
+    from conftest import SMALL_JSON_GZ
+    with gzip.open(SMALL_JSON_GZ, "rt") as f:
+        return json.load(f)["results"]
+
+
+def test_validator_catches_a_value_the_lake_cannot_hold(tmp_path):
+    """The ground truth is the dump's data, not DuckDB's parse of it: an
+    integer too wide for BIGINT/HUGEINT is inferred DOUBLE and stored rounded,
+    and reconstruction (check 16) must report it, as it would if SORT_JSONL
+    wrote the same rounded value into sorted.jsonl.zst."""
+    from conftest import run_bin, run_transform
+    entries = _small_entries()
+    entries[0]["bigCount"] = 12345678901234567890123
+    src = tmp_path / "in.jsonl"
+    src.write_text("".join(json.dumps(e) + "\n" for e in entries))   # orjson cannot write it
+    sorted_jsonl = tmp_path / "sorted.jsonl.zst"
+    result = run_bin("sort_jsonl.py", src, "-o", sorted_jsonl, "--memory-limit", "4GB")
+    assert result.returncode == 0, result.stderr
+    lake = str(tmp_path / "lake")
+    run_transform(sorted_jsonl, lake)
+    report = str(tmp_path / "report.txt")
+    result = run_bin("validate_lake.py", "--lake", lake, "--jsonl", sorted_jsonl,
+                     "--spot-check-n", "100", "-o", report)
+    assert result.returncode == 1
+    failed = [name for name, c in _checks(report).items() if not c["passed"]]
+    assert any(name.startswith("reconstruction matches JSONL") for name in failed), failed
+
+
+def test_check_15_requires_text_on_every_row(tmp_path):
+    """README check 15: every text-bearing comment has a text_value.  One
+    FUNCTION comment without texts fails it, however many others have one."""
+    from conftest import run_transform, write_jsonl_zst
+    entries = _small_entries()
+    functions = [c for e in entries for c in e.get("comments", [])
+                 if c["commentType"] == "FUNCTION"]
+    assert len(functions) > 1
+    del functions[0]["texts"]
+    jsonl = write_jsonl_zst(entries, str(tmp_path / "in.jsonl.zst"))
+    lake = str(tmp_path / "lake")
+    run_transform(jsonl, lake)
+    report = str(tmp_path / "report.txt")
+    result = _run_validator(lake, jsonl, report, "--spot-check-n", "100")
+    assert result.returncode == 1
+    failed = [name for name, c in _checks(report).items() if not c["passed"]]
+    assert failed == ["comments.text_value populated for FUNCTION"], failed
+
+
+def test_validator_duckdb_settings(small_lake, tmp_path, monkeypatch):
+    """--memory-limit / --threads / --temp-dir reach every DuckDB connection
+    the validator opens (VALIDATE sizes DuckDB to its task, not the node)."""
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    import validate_lake
+
+    calls = []
+    real_init = validate_lake.init_duckdb
+
+    def spy(memory_limit, threads, temp_dir=None):
+        calls.append((memory_limit, threads, temp_dir))
+        return real_init(memory_limit, threads, temp_dir)
+
+    monkeypatch.setattr(validate_lake, "init_duckdb", spy)
+    report = str(tmp_path / "report.txt")
+    monkeypatch.setattr(sys, "argv", [
+        "validate_lake.py", "--lake", small_lake["lake_dir"], "--jsonl", small_lake["jsonl"],
+        "--spot-check-n", "5", "--memory-limit", "1GB", "--threads", "2",
+        "--temp-dir", str(tmp_path / "spill"), "-o", report,
+    ])
+    with pytest.raises(SystemExit) as exc:
+        validate_lake.main()
+    assert exc.value.code == 0
+    assert calls and set(calls) == {("1GB", 2, str(tmp_path / "spill"))}
+    with open(validate_lake.__file__) as f:
+        assert "duckdb.connect(" not in f.read()
+    with open(report) as f:
+        assert "DuckDB: memory_limit 1GB, threads 2" in f.read()
+
+
+@pytest.mark.parametrize("digest", ["sha256", "md5"])
+def test_validate_fails_on_wrong_file_digest(small_lake, tmp_path, digest):
+    """A file whose SHA-256 or MD5 differs from the manifest's fails check 8."""
+    lake = str(tmp_path / "lake")
+    shutil.copytree(small_lake["lake_dir"], lake)
+    manifest_path = os.path.join(lake, "manifest.json")
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    details = manifest["tables"]["xrefs"]["file_details"]
+    rel = sorted(details)[0]
+    details[rel][digest] = "0" * len(details[rel][digest])
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f)
+    report_path = str(tmp_path / "report.txt")
+    result = _run_validator(lake, small_lake["jsonl"], report_path, "--threads", "3")
+    assert result.returncode != 0
+    failed = [c for name, c in _checks(report_path).items()
+              if name.startswith("xrefs:") and "file hashes match" in name]
+    assert failed and failed[0]["passed"] is False
+    assert f"{rel}: {digest}" in failed[0]["detail"]

@@ -1,4 +1,4 @@
-"""Tests for bin/sample_jsonl.py (the F.1 slice sampler)."""
+"""Tests for bin/sample_jsonl.py (the measurement-slice sampler)."""
 
 import os
 import sys

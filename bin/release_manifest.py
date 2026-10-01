@@ -21,30 +21,15 @@ Usage:
 import os
 import sys
 import json
-import hashlib
 import argparse
 import subprocess
 from datetime import datetime, timezone
 
+from parquet_transform import hash_file
+
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
-
-
-def hash_file(path, chunk_size=8 * 1024 * 1024):
-    """(sha256, md5) of a file in one streamed pass.
-
-    Return order matches _hash_file in parquet_transform.py — keep the two
-    in sync."""
-    md5, sha = hashlib.md5(), hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            md5.update(chunk)
-            sha.update(chunk)
-    return sha.hexdigest(), md5.hexdigest()
 
 
 def git_info():
@@ -85,7 +70,7 @@ def main():
     parser.add_argument(
         "--complete-marker", default=None,
         help="Path of the RELEASE_COMPLETE marker (default: RELEASE_COMPLETE next to -o). "
-             "Written last; mirrors test for it before reading anything else (plan H.5).",
+             "Written last; mirrors test for it before reading anything else.",
     )
     args = parser.parse_args()
 
@@ -105,7 +90,7 @@ def main():
         manifest["inputs"][label] = {
             "path": os.path.basename(abspath),
             "md5": md5,
-            "sha256": sha256,          # sorted.jsonl.zst is published beside the lake (plan F.7)
+            "sha256": sha256,          # sorted.jsonl.zst is published beside the lake
             "size_bytes": os.path.getsize(abspath),
         }
 
@@ -165,7 +150,7 @@ def main():
     eprint(f"  Release {args.release}: {manifest['total_rows']:,} total rows "
            f"across {len(manifest.get('tables', {}))} tables")
 
-    # ── RELEASE_COMPLETE: the last action (plan H.5) ──
+    # ── RELEASE_COMPLETE: the last action ──
     write_complete_marker(args, lake_manifest if os.path.exists(lake_manifest_path) else {})
 
 

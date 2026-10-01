@@ -10,7 +10,7 @@ Streams: never holds more than --n lines in memory.
 on the raw line ("UniProtKB reviewed (Swiss-Prot)" / "UniProtKB unreviewed
 (TrEMBL)") so the JSON is never parsed.
 
-Built for the F.1 measurement slice (PLAN_SCHEMA_V2.md):
+Built for the measurement slice (README, "Open decisions and pending work"):
     pigz -dc UniProtKB.json.gz | python3 stream_jsonl.py \\
       | python3 sample_jsonl.py --n 1000000 --where trembl --seed 1 > trembl_1m.jsonl
 

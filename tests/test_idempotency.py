@@ -65,6 +65,12 @@ def _get_row_counts(outdir):
     return counts
 
 
+def _read_table(outdir, name):
+    """A table's rows in file order (swissprot partition first)."""
+    from conftest import open_table
+    return open_table(outdir, name).to_table()
+
+
 def test_idempotency(small_jsonl, fixture_json_gz, tmp_path_factory):
     """Running the pipeline twice on the same output should not duplicate data."""
     lake_dir = tmp_path_factory.mktemp("idempotency")
@@ -75,6 +81,7 @@ def test_idempotency(small_jsonl, fixture_json_gz, tmp_path_factory):
     if result1.returncode != 0:
         pytest.fail(f"First run failed:\n{result1.stderr}")
     counts1 = _get_row_counts(outdir)
+    content1 = {name: _read_table(outdir, name) for name in TABLE_NAMES}
 
     # Second run — same output directory
     result2 = _run_transform(small_jsonl, outdir)
@@ -88,6 +95,10 @@ def test_idempotency(small_jsonl, fixture_json_gz, tmp_path_factory):
             f"{name}: first run had {counts1[name]} rows, "
             f"second run had {counts2[name]} rows (expected identical)"
         )
+    # Every table has a total sort order (child tables end on *_index), so
+    # a rebuild writes the same rows in the same order.
+    for name in TABLE_NAMES:
+        assert _read_table(outdir, name).equals(content1[name]), f"{name}: content differs between runs"
 
     # Sanity: entries count should match expected
     assert counts2["entries"] == _expected_entries(fixture_json_gz)
@@ -215,3 +226,37 @@ def test_rebuild_removes_leftover_tmp_files(small_jsonl, tmp_path):
     _run_transform(small_jsonl, outdir)
     assert not os.path.exists(os.path.dirname(stale))
     assert duckdb.sql(f"SELECT count(*) FROM read_parquet('{entries_dir}/**/*.parquet')").fetchone()[0] == n
+
+
+def test_skip_existing_rebuilds_for_a_different_input(small_jsonl, tmp_path):
+    """A sentinel is proof only for the input that wrote it: a manual re-run
+    on another JSONL into the same outdir rebuilds every table instead of
+    mixing the old tables with a manifest for the new input."""
+    from conftest import SMALL_JSON_GZ, write_jsonl_zst
+    outdir = str(tmp_path / "lake")
+    assert _run_transform(small_jsonl, outdir).returncode == 0
+    with gzip.open(SMALL_JSON_GZ, "rt") as f:
+        ten = write_jsonl_zst(json.load(f)["results"][:10], str(tmp_path / "ten.jsonl.zst"))
+    result = _run_transform(ten, outdir, extra_args=["--skip-existing"])
+    assert result.returncode == 0, result.stderr
+    for name in TABLE_NAMES:
+        assert f"REBUILD {name}" in result.stderr, name
+        assert f"SKIP {name}" not in result.stderr, name
+    assert _get_row_counts(outdir)["entries"] == 10
+
+
+def test_skip_existing_rebuilds_on_sentinel_without_input(small_jsonl, tmp_path):
+    """A sentinel that does not record its input (written before it did)
+    cannot vouch for the table."""
+    outdir = str(tmp_path / "lake")
+    assert _run_transform(small_jsonl, outdir).returncode == 0
+    path = _sentinel(outdir, "entries")
+    with open(path) as f:
+        sentinel = json.load(f)
+    sentinel.pop("input", None)
+    with open(path, "w") as f:
+        json.dump(sentinel, f)
+    result = _run_transform(small_jsonl, outdir, extra_args=["--skip-existing"])
+    assert result.returncode == 0, result.stderr
+    assert "REBUILD entries" in result.stderr
+    assert "SKIP features" in result.stderr

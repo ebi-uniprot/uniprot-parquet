@@ -1,5 +1,7 @@
 # Evaluation of DuckDB VARIANT for Semi-Structured Protein Data in uniprot-parquet
 
+> **Dated record (April 2026, DuckDB 1.5.1, the 5,378-entry `2026_01` demo lake).** It was measured against an earlier schema (before `accession_map`, Hive partitioning, the `*_index` columns and today's layout of UniProt's JSON keys as source columns beside typed shortcuts) and has not been rerun. It is kept as the only measured comparison of a schema-free layout. The summary's "no layout outperformed baseline on any query" is too strong: Layout D ran 0.5–0.9× baseline time on six queries and was 9% smaller. The published schema has no VARIANT columns, PyArrow 23 cannot write them anyway, and the pipeline's evaluation-only `--variant-children` flag has been removed.
+
 ## 1. Introduction
 
 uniprot-parquet transforms UniProtKB JSON releases into a columnar Parquet data lake organised as a star schema: a central entries table joined to four child tables (features, cross-references, comments, publications) pre-unnested at build time. The current pipeline hand-extracts 88 typed convenience columns across these five tables using 500 lines of SQL builder code that must evolve with every schema change in the upstream UniProtKB JSON format.
@@ -399,11 +401,10 @@ python benchmarks/build_variant_lake.py \
 
 # Run VARIANT benchmarks (includes Layout D)
 python benchmarks/bench_variant.py
-
-# Build a Layout D lake using the pipeline directly
-python bin/parquet_transform.py demo/lake/2026_01/sorted.jsonl.zst \
-    --outdir my_layout_d_lake --variant-children --memory-limit 3GB
 ```
+
+(`bin/parquet_transform.py` no longer has a `--variant-children` flag: Layout D
+lakes are built by `benchmarks/build_variant_lake.py` only.)
 
 ### S6. Key files
 

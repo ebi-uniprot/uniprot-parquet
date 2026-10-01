@@ -23,7 +23,7 @@ import pytest
 BIN_DIR = os.path.join(os.path.dirname(__file__), "..", "bin")
 sys.path.insert(0, BIN_DIR)
 
-PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 DIVERSE_JSON_GZ = os.path.join(FIXTURE_DIR, "diverse.json.gz")
 STRESS_JSON_GZ = os.path.join(FIXTURE_DIR, "diverse_stress.json.gz")
@@ -59,38 +59,35 @@ def fixture_json_gz(request):
     return _ensure_fixture(scale)
 
 
-def _json_gz_to_jsonl_zst(src, dst):
-    """Convert a {"results": [...]} JSON.gz fixture to JSONL.zst."""
-    with gzip.open(src, "rt") as f:
-        data = json.load(f)
-
+def write_jsonl_zst(entries, dst):
+    """Write ``entries`` to ``dst`` as JSONL.zst; ``dst``."""
     import orjson
     import zstandard as zstd
 
-    cctx = zstd.ZstdCompressor(level=3)
-    with open(dst, "wb") as fout:
-        with cctx.stream_writer(fout) as writer:
-            for entry in data["results"]:
-                writer.write(orjson.dumps(entry) + b"\n")
+    with open(dst, "wb") as fout, zstd.ZstdCompressor(level=3).stream_writer(fout) as writer:
+        for entry in entries:
+            writer.write(orjson.dumps(entry) + b"\n")
     return dst
+
+
+def _json_gz_to_jsonl_zst(src, dst):
+    """Convert a {"results": [...]} JSON.gz fixture to JSONL.zst."""
+    with gzip.open(src, "rt") as f:
+        return write_jsonl_zst(json.load(f)["results"], dst)
+
+
+def run_bin(script, *args):
+    """Run bin/``script`` with ``args`` (bin/ importable); the CompletedProcess."""
+    env = {**os.environ, "PYTHONPATH": BIN_DIR + ":" + os.environ.get("PYTHONPATH", "")}
+    return subprocess.run([sys.executable, os.path.join(BIN_DIR, script), *map(str, args)],
+                          env=env, capture_output=True, text=True)
 
 
 def run_transform(jsonl_path, outdir, release="test_2026", extra_args=()):
     """Run bin/parquet_transform.py as a subprocess; fail the test on error."""
-    transform_script = os.path.join(BIN_DIR, "parquet_transform.py")
-    env = os.environ.copy()
-    env["PYTHONPATH"] = BIN_DIR + ":" + env.get("PYTHONPATH", "")
-
-    cmd = [
-        sys.executable, transform_script, jsonl_path,
-        "--outdir", outdir,
-        "--memory-limit", "4GB",
-        "--batch-size", "500",
-        "--release", release,
-        *extra_args,
-    ]
-
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    result = run_bin("parquet_transform.py", jsonl_path, "--outdir", outdir,
+                     "--memory-limit", "4GB", "--batch-size", "500", "--release", release,
+                     *extra_args)
     if result.returncode != 0:
         pytest.fail(f"parquet_transform failed:\n{result.stderr}")
     return result
@@ -118,7 +115,7 @@ def parquet_lake(small_jsonl, tmp_path_factory):
 @pytest.fixture(scope="session")
 def small_lake(tmp_path_factory):
     """A lake built from tests/fixtures/small.json.gz (52 entries, no
-    geneLocations); exercises the typed-NULL fallbacks (plan G.2)."""
+    geneLocations); exercises the typed-NULL fallbacks."""
     out_dir = tmp_path_factory.mktemp("small")
     jsonl_path = _json_gz_to_jsonl_zst(SMALL_JSON_GZ, str(out_dir / "small.jsonl.zst"))
     outdir = str(out_dir / "lake")
@@ -153,13 +150,19 @@ def open_table(lake_dir, name):
     return ds.dataset(table_files(lake_dir, name), format="parquet")
 
 
+def group_by_acc(table):
+    """An Arrow table's rows as dicts (reconstruct.rows_from_arrow: JSON
+    columns decoded), grouped by accession: {accession: [row, ...]}."""
+    from reconstruct import rows_from_arrow
+    grouped = {}
+    for row in rows_from_arrow(table):
+        grouped.setdefault(row["accession"], []).append(row)
+    return grouped
+
+
 def _rows_by_acc(lake_dir, name):
-    """All rows of a child table as dicts, grouped by accession."""
-    from collections import defaultdict
-    grouped = defaultdict(list)
-    for row in open_table(lake_dir, name).to_table().to_pylist(maps_as_pydicts="strict"):
-        grouped[row["acc"]].append(row)
-    return dict(grouped)
+    """All rows of a table as dicts, grouped by accession."""
+    return group_by_acc(open_table(lake_dir, name).to_table())
 
 
 @pytest.fixture(scope="module")
@@ -176,8 +179,8 @@ def lake(parquet_lake):
 @pytest.fixture(scope="module")
 def lake_entries(lake):
     """All entries from the Parquet lake, keyed by accession."""
-    return {row["acc"]: row
-            for row in open_table(lake, "entries").to_table().to_pylist(maps_as_pydicts="strict")}
+    from reconstruct import rows_from_arrow
+    return {row["accession"]: row for row in rows_from_arrow(open_table(lake, "entries").to_table())}
 
 
 @pytest.fixture(scope="module")

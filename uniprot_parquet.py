@@ -9,7 +9,7 @@ Usage (local):
     from uniprot_parquet import connect
     con = connect("/data/uniprot/2026_01/lake")
 
-    con.sql("SELECT * FROM entries WHERE taxid = 9606 LIMIT 5").show()
+    con.sql("SELECT * FROM entries WHERE organism_id = 9606 LIMIT 5").show()
     con.sql("SELECT * FROM protein_card('P04637')").show()
     con.sql("SELECT * FROM organism_features(9606, 'Domain')").show()
 
@@ -33,25 +33,22 @@ import duckdb
 
 
 # ── Views ───────────────────────────────────────────────────────────────
-# Every table is Hive-partitioned as <table>/review_status=swissprot|trembl/
-# (plan Part D).  Views read the files with hive_partitioning = true and
-# REPLACE the stored `reviewed` column with (review_status = 'swissprot'): the
-# two are equal by construction (validator check 19), and deriving `reviewed`
-# from the path lets DuckDB prune whole files on `WHERE reviewed = true`
-# before opening any TrEMBL footer (verified with EXPLAIN ANALYZE, D.3 spike,
-# 2026-09-17: 1 file read vs 2 without the partition key).  `review_status`
-# itself is EXCLUDEd so the view schema equals the stored schema.
+# Every table is Hive-partitioned as <table>/review_status=swissprot|trembl/.
+# Views read the files with hive_partitioning = true and REPLACE the stored
+# `reviewed` column with (review_status = 'swissprot'): the two are equal by
+# construction (validator check 19), and deriving `reviewed` from the path
+# lets DuckDB prune whole files on `WHERE reviewed = true` before opening any
+# TrEMBL footer (verified with EXPLAIN ANALYZE, 2026-09-17: 1 file read vs 2
+# without the partition key).  `review_status` itself is EXCLUDEd so the view
+# schema equals the stored schema.
 #
 # connect() builds each view over the explicit file list from manifest.json
-# (plan F.2.2) so a partial copy of the lake (e.g. entries/ only) works and a
+# so a partial copy of the lake (e.g. entries/ only) works and a
 # plain HTTP server needs no directory listing; the glob form below is the
 # fallback when the manifest cannot be read.
 TABLE_NAMES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
 
-_VIEW_REPLACE = {
-    # comments: the stored VARCHAR JSON is exposed as JSON so -> / ->> work
-    "comments": "(review_status = 'swissprot') AS reviewed, comment::JSON AS comment",
-}
+_VIEW_REPLACE = {}   # per-table REPLACE list, when one differs from the default
 
 
 def _q(s) -> str:
@@ -81,90 +78,88 @@ def _missing_view_sql(table: str, columns: list[str]) -> str:
 
 
 # ── Macros (embedded so this file is entirely self-contained) ───────────
-# Macros are bound at call time, so they can be created even when a table
-# they join is missing; calling one then fails with the stub view's message.
+# Macros are bound when they are created, so they name only columns every
+# lake has: shortcut columns and the source keys every UniProtKB element
+# carries (parquet_transform REQUIRED_PATHS / REQUIRED_CHILD_PATHS); other
+# source columns are reached through x.* or the row's JSON.  A missing table
+# is a stub view (_missing_view_sql), so creation still succeeds and calling
+# the macro fails with the stub's message.
 
 _MACRO_SQL = """\
 
 -- Annotation card for a single protein
 CREATE OR REPLACE MACRO protein_card(target_acc) AS TABLE (
     SELECT
-        e.acc, e.gene_name, e.protein_name, e.organism_name, e.taxid,
-        e.reviewed, e.seq_length, e.protein_existence, e.annotation_score,
-        e.go_ids, e.keyword_names, e.ec_numbers,
+        e.accession, e.gene_primary, e.protein_name_primary, e.organism_name, e.organism_id,
+        e.reviewed, e.length, e.proteinExistence, e.annotationScore,
+        e.go_id, e.keyword, e.ec,
         e.feature_count, e.xref_count, e.comment_count, e.reference_count
     FROM entries e
-    WHERE e.acc = target_acc
+    WHERE e.accession = target_acc
 );
 
--- Features by type for an organism
+-- Features by type for an organism (every features column)
 CREATE OR REPLACE MACRO organism_features(target_taxid, feature_type) AS TABLE (
-    SELECT f.acc, f.type, f.start_pos, f.end_pos, f.description,
-           f.feature_id, f.evidence_codes
+    SELECT f.*
     FROM features f
-    WHERE f.taxid = target_taxid AND f.type = feature_type
-    ORDER BY f.acc, f.start_pos
+    WHERE f.organism_id = target_taxid AND f.type = feature_type
+    ORDER BY f.accession, f.start_pos
 );
 
 -- Cross-references filtered by database(s) for an organism
 CREATE OR REPLACE MACRO organism_xrefs(target_taxid, databases) AS TABLE (
-    SELECT x.acc, x.database, x.id, x.properties
+    SELECT x.* EXCLUDE (reviewed, organism_id, xref_index)
     FROM xrefs x
-    WHERE x.taxid = target_taxid AND list_contains(databases, x.database)
-    ORDER BY x.acc, x.database
+    WHERE x.organism_id = target_taxid AND list_contains(databases, x.database)
+    ORDER BY x.accession, x.database
 );
 
 -- Comments by type for an organism (plain strings: 'FUNCTION', 'SUBCELLULAR LOCATION', etc.)
 CREATE OR REPLACE MACRO organism_comments(target_taxid, ctype) AS TABLE (
-    SELECT c.acc, c.comment_type, c.text_value
+    SELECT c.accession, c.commentType, c.text_value
     FROM comments c
-    WHERE c.taxid = target_taxid AND c.comment_type = ctype
-    ORDER BY c.acc
+    WHERE c.organism_id = target_taxid AND c.commentType = ctype
+    ORDER BY c.accession
 );
 
 -- Entries joined with features for an organism (filter first, join second)
 CREATE OR REPLACE MACRO entries_with_features(target_taxid) AS TABLE (
-    SELECT e.acc, e.gene_name, e.protein_name, e.reviewed,
-           f.type, f.start_pos, f.end_pos, f.description, f.feature_id
+    SELECT e.accession, e.gene_primary, e.protein_name_primary, e.reviewed,
+           f.* EXCLUDE (accession, reviewed, organism_id, organism_name, length)
     FROM entries e
-    JOIN features f ON f.acc = e.acc AND f.taxid = e.taxid
-    WHERE e.taxid = target_taxid
-    ORDER BY e.acc, f.start_pos
+    JOIN features f ON f.accession = e.accession AND f.organism_id = e.organism_id
+    WHERE e.organism_id = target_taxid
+    ORDER BY e.accession, f.start_pos
 );
 
 -- Entries joined with xrefs for an organism + specific databases
 CREATE OR REPLACE MACRO entries_with_xrefs(target_taxid, databases) AS TABLE (
-    SELECT e.acc, e.gene_name, e.protein_name, e.reviewed,
-           x.database, x.id, x.properties
+    SELECT e.accession, e.gene_primary, e.protein_name_primary, e.reviewed,
+           x.* EXCLUDE (accession, reviewed, organism_id, xref_index)
     FROM entries e
-    JOIN xrefs x ON x.acc = e.acc AND x.taxid = e.taxid
-    WHERE e.taxid = target_taxid AND list_contains(databases, x.database)
-    ORDER BY e.acc, x.database
+    JOIN xrefs x ON x.accession = e.accession AND x.organism_id = e.organism_id
+    WHERE e.organism_id = target_taxid AND list_contains(databases, x.database)
+    ORDER BY e.accession, x.database
 );
 
 -- Unnest isoforms for a single protein (from ALTERNATIVE PRODUCTS comments)
 CREATE OR REPLACE MACRO unnest_isoforms(target_acc) AS TABLE (
     SELECT
-        i.acc,
-        e.gene_name,
+        i.accession,
+        e.gene_primary,
         iso.name.value                  AS isoform_name,
         unnest(iso.isoformIds)          AS isoform_id,
         iso.isoformSequenceStatus       AS sequence_status,
         iso.sequenceIds                 AS variant_sequence_ids
     FROM (
         SELECT
-            acc,
-            unnest(
-                from_json(
-                    comment->'$.isoforms',
-                    '[{"name":{"value":"VARCHAR"},"isoformIds":["VARCHAR"],"isoformSequenceStatus":"VARCHAR","sequenceIds":["VARCHAR"]}]'
-                )
-            ) AS iso
-        FROM comments
-        WHERE comment_type = 'ALTERNATIVE PRODUCTS'
-          AND acc = target_acc
+            c.accession,
+            unnest(from_json(to_json(c)->'$.isoforms', '[{"name":{"value":"VARCHAR"},"isoformIds":["VARCHAR"],"isoformSequenceStatus":"VARCHAR","sequenceIds":["VARCHAR"]}]')) AS iso
+        FROM comments c
+        WHERE c.commentType = 'ALTERNATIVE PRODUCTS'
+          AND c.accession = target_acc
     ) i
-    JOIN entries e ON e.acc = i.acc
+    JOIN entries e ON e.accession = i.accession
 );
 """
 
@@ -395,13 +390,13 @@ def tables(lake_path: str) -> dict[str, dict]:
     return out
 
 
-def files_for_taxid(lake_path: str, taxid: int, table: str = "entries") -> list[str]:
+def files_for_taxid(lake_path: str, organism_id: int, table: str = "entries") -> list[str]:
     """Relative paths of the files that can contain rows for one organism.
 
-    Every partition is sorted (taxid ASC, acc ASC) and manifest.json records
-    each file's taxid range, so the files holding one organism are contiguous
+    Every partition is sorted (organism_id ASC, accession ASC) and manifest.json records
+    each file's organism_id range, so the files holding one organism are contiguous
     and usually one or two per side — an organism-level download without a
-    layout change (plan D.5).
+    layout change.
 
     >>> files_for_taxid("/data/uniprot/2026_01/lake", 9606)
     ['entries/review_status=swissprot/entries_00001.parquet', 'entries/review_status=trembl/entries_00017.parquet']
@@ -410,7 +405,7 @@ def files_for_taxid(lake_path: str, taxid: int, table: str = "entries") -> list[
     fd = m["tables"][table]["file_details"]
     return [f"{table}/{rel}" for rel, d in fd.items()
             if d.get("taxid_min") is not None and d.get("taxid_max") is not None
-            and d["taxid_min"] <= taxid <= d["taxid_max"]]
+            and d["taxid_min"] <= organism_id <= d["taxid_max"]]
 
 
 def schema(lake_path: str, table: str | None = None) -> dict | str:
@@ -420,7 +415,8 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
     descriptions, row counts, keys, and relationships.
 
     With a table name, returns detailed column info for that table,
-    distinguishing convenience columns from full nested structs.
+    distinguishing shortcut columns (typed, snake_case) from source columns
+    (UniProt's JSON keys, as shipped).
 
     Parameters
     ----------
@@ -485,10 +481,10 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
             "nullable": col.get("nullable", True),
             "description": desc_map.get(col_name, ""),
         }
-        if col_name in cats.get("convenience", []):
-            entry["category"] = "convenience"
-        elif col_name in cats.get("nested", []):
-            entry["category"] = "nested"
+        if col_name in cats.get("shortcut", []):
+            entry["category"] = "shortcut"
+        elif col_name in cats.get("source", []):
+            entry["category"] = "source"
         columns.append(entry)
 
     return {
@@ -497,8 +493,8 @@ def schema(lake_path: str, table: str | None = None) -> dict | str:
         "primary_key": info.get("primary_key", []),
         "foreign_keys": info.get("foreign_keys", {}),
         "sort_order": info.get("sort_order", []),
-        "convenience_columns": cats.get("convenience", []),
-        "nested_columns": cats.get("nested", []),
+        "shortcut_columns": cats.get("shortcut", []),
+        "source_columns": cats.get("source", []),
         "all_columns": [c["name"] for c in info.get("columns", [])],
         "columns": columns,
     }

@@ -1,4 +1,4 @@
-"""Client tests (AUDIT A15, plan F.2.2): uniprot_parquet.connect() on full and
+"""Client tests: uniprot_parquet.connect() on full and
 partial lakes, the helpers, and every README example that is cheap to run."""
 
 import os
@@ -18,9 +18,9 @@ def full_lake(parquet_lake):
 @pytest.fixture(scope="module")
 def fixture_acc(full_lake):
     con = up.connect(full_lake)
-    acc, taxid = con.sql("SELECT acc, taxid FROM entries WHERE reviewed ORDER BY acc LIMIT 1").fetchone()
-    iso = con.sql("SELECT acc FROM comments WHERE comment_type = 'ALTERNATIVE PRODUCTS' LIMIT 1").fetchone()
-    return {"acc": acc, "taxid": taxid, "isoform_acc": iso[0] if iso else None}
+    accession, organism_id = con.sql("SELECT accession, organism_id FROM entries WHERE reviewed ORDER BY accession LIMIT 1").fetchone()
+    iso = con.sql("SELECT accession FROM comments WHERE commentType = 'ALTERNATIVE PRODUCTS' LIMIT 1").fetchone()
+    return {"accession": accession, "organism_id": organism_id, "isoform_acc": iso[0] if iso else None}
 
 
 def test_connect_full_lake(full_lake, fixture_acc):
@@ -28,18 +28,18 @@ def test_connect_full_lake(full_lake, fixture_acc):
     m = up.manifest(full_lake)
     for name, info in m["tables"].items():
         assert con.sql(f"SELECT count(*) FROM {name}").fetchone()[0] == info["row_count"], name
-    acc, taxid = fixture_acc["acc"], fixture_acc["taxid"]
-    assert len(con.sql(f"SELECT * FROM protein_card('{acc}')").fetchall()) == 1
-    con.sql(f"SELECT * FROM organism_features({taxid}, 'Chain')").fetchall()
-    con.sql(f"SELECT * FROM organism_xrefs({taxid}, ['GO'])").fetchall()
-    con.sql(f"SELECT * FROM organism_comments({taxid}, 'FUNCTION')").fetchall()
-    con.sql(f"SELECT * FROM entries_with_features({taxid})").fetchall()
-    con.sql(f"SELECT * FROM entries_with_xrefs({taxid}, ['GO'])").fetchall()
+    accession, organism_id = fixture_acc["accession"], fixture_acc["organism_id"]
+    assert len(con.sql(f"SELECT * FROM protein_card('{accession}')").fetchall()) == 1
+    con.sql(f"SELECT * FROM organism_features({organism_id}, 'Chain')").fetchall()
+    con.sql(f"SELECT * FROM organism_xrefs({organism_id}, ['GO'])").fetchall()
+    con.sql(f"SELECT * FROM organism_comments({organism_id}, 'FUNCTION')").fetchall()
+    con.sql(f"SELECT * FROM entries_with_features({organism_id})").fetchall()
+    con.sql(f"SELECT * FROM entries_with_xrefs({organism_id}, ['GO'])").fetchall()
     iso = fixture_acc["isoform_acc"]
     if iso:
         assert len(con.sql(f"SELECT * FROM unnest_isoforms('{iso}')").fetchall()) > 0
     else:
-        assert con.sql(f"SELECT count(*) FROM unnest_isoforms('{acc}')").fetchone()[0] == 0
+        assert con.sql(f"SELECT count(*) FROM unnest_isoforms('{accession}')").fetchone()[0] == 0
 
 
 def _copy_partial(src, dst, tables):
@@ -55,11 +55,11 @@ def test_connect_entries_only(full_lake, fixture_acc, tmp_path):
     con = up.connect(lake)
     m = up.manifest(lake)
     assert con.sql("SELECT count(*) FROM entries").fetchone()[0] == m["tables"]["entries"]["row_count"]
-    assert len(con.sql(f"SELECT * FROM protein_card('{fixture_acc['acc']}')").fetchall()) == 1
+    assert len(con.sql(f"SELECT * FROM protein_card('{fixture_acc['accession']}')").fetchall()) == 1
     with pytest.raises(Exception, match="not in this lake copy"):
         con.sql("SELECT count(*) FROM features").fetchall()
     with pytest.raises(Exception, match="not in this lake copy"):
-        con.sql(f"SELECT * FROM organism_features({fixture_acc['taxid']}, 'Chain')").fetchall()
+        con.sql(f"SELECT * FROM organism_features({fixture_acc['organism_id']}, 'Chain')").fetchall()
     t = up.tables(lake)
     assert t["entries"]["present"] is True and t["features"]["present"] is False
     assert t["features"]["row_count"] == m["tables"]["features"]["row_count"]
@@ -87,16 +87,16 @@ def test_connect_swissprot_only_copy(full_lake, tmp_path):
 
 def test_connect_files_for_taxid_copy(full_lake, fixture_acc, tmp_path):
     """A per-organism download (files_for_taxid) of entries + accession_map works."""
-    lake = str(tmp_path / "taxid")
-    files = up.files_for_taxid(full_lake, fixture_acc["taxid"]) + \
-        up.files_for_taxid(full_lake, fixture_acc["taxid"], table="accession_map")
+    lake = str(tmp_path / "organism_id")
+    files = up.files_for_taxid(full_lake, fixture_acc["organism_id"]) + \
+        up.files_for_taxid(full_lake, fixture_acc["organism_id"], table="accession_map")
     for rel in files:
         os.makedirs(os.path.dirname(os.path.join(lake, rel)), exist_ok=True)
         shutil.copy(os.path.join(full_lake, rel), os.path.join(lake, rel))
     for f in ("manifest.json", "datapackage.json"):
         shutil.copy(os.path.join(full_lake, f), os.path.join(lake, f))
     con = up.connect(lake)
-    assert con.sql(f"SELECT count(*) FROM entries WHERE taxid = {fixture_acc['taxid']}").fetchone()[0] > 0
+    assert con.sql(f"SELECT count(*) FROM entries WHERE organism_id = {fixture_acc['organism_id']}").fetchone()[0] > 0
 
 
 def test_connect_without_manifest(full_lake, tmp_path):
@@ -109,13 +109,13 @@ def test_connect_without_manifest(full_lake, tmp_path):
 
 
 def test_files_for_taxid(full_lake, fixture_acc):
-    taxid = fixture_acc["taxid"]
-    files = up.files_for_taxid(full_lake, taxid)
+    organism_id = fixture_acc["organism_id"]
+    files = up.files_for_taxid(full_lake, organism_id)
     assert files
     fd = up.manifest(full_lake)["tables"]["entries"]["file_details"]
     for f in files:
         rel = f.split("/", 1)[1]
-        assert fd[rel]["taxid_min"] <= taxid <= fd[rel]["taxid_max"]
+        assert fd[rel]["taxid_min"] <= organism_id <= fd[rel]["taxid_max"]
     assert up.files_for_taxid(full_lake, -1) == []
 
 
@@ -144,10 +144,10 @@ def test_connect_path_with_quote(full_lake, tmp_path):
     assert con.sql("SELECT count(*) FROM entries").fetchone()[0] > 0
 
 
-def test_entries_view_has_single_gene_name(full_lake):
+def test_entries_view_has_no_duplicate_or_partition_column(full_lake):
     con = up.connect(full_lake)
     names = [r[0] for r in con.sql("DESCRIBE entries").fetchall()]
-    assert names.count("gene_name") == 1
+    assert len(names) == len(set(names))
     assert "review_status" not in names
 
 
@@ -160,8 +160,9 @@ def test_schema_helper(full_lake):
     overview = up.schema(full_lake)
     assert set(overview) >= {"entries", "features", "accession_map"}
     detail = up.schema(full_lake, "entries")
-    assert "gene_name" in detail["convenience_columns"]
-    assert "organism_residual" in detail["nested_columns"]
+    assert "gene_primary" in detail["shortcut_columns"]
+    assert "proteinDescription" in detail["source_columns"]
+    assert {c["name"]: c["category"] for c in detail["columns"]}["sequence"] == "source"
 
 
 README = os.path.join(os.path.dirname(__file__), "..", "README.md")

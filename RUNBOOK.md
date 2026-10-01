@@ -1,20 +1,33 @@
 # RUNBOOK — from unit tests to the full UniProtKB build
 
-A staged path from your laptop to the production run. Each stage ends with
-checks; do not move to the next stage until they pass. Commands assume you are
-in the repo root with the conda env active.
+A staged path to the production run. **Part A runs everything on your own
+machine** with Nextflow's `local` executor: tests, the small lake, the demo,
+a ~200K-entry rehearsal and, optionally, a slice of the real dump. **Part B
+moves to the SLURM cluster** only once Part A is clean: a short plumbing check,
+then the full build. Each stage ends with checks; do not move to the next stage
+until they pass. Commands assume you are in the repo root with the conda env
+active.
 
-Stages:
+**Part A — local**
 
 0. Environment
-1. Unit tests (laptop)
-2. Small lake, local executor (laptop)
-3. SLURM smoke test (52 entries on the `short` queue)
-4. SLURM subset (~100K–200K entries on the `short` queue)
-5. Full UniProtKB build (`prod` queue)
-6. After the run: publish checks and recovery
+1. Unit tests
+2. Small lake (52-entry committed fixture)
+3. Demo lake and notebook (~5K entries)
+4. Local subset rehearsal (~200K entries)
+5. (Optional) Real-data slice and benchmarks
+
+**Part B — SLURM cluster**
+
+6. Cluster environment
+7. SLURM smoke test and OOM retry (`short` queue)
+8. Full UniProtKB build (`prod` queue)
+9. After the run
+10. Recovery cheatsheet
 
 ---
+
+# Part A — local
 
 ## 0. Environment
 
@@ -32,37 +45,42 @@ which pigz zstd                          # both must resolve — STREAM_JSONL ne
 python -c "import pyarrow, duckdb, orjson, ijson, zstandard, frictionless; print(pyarrow.__version__, duckdb.__version__)"
                                          # pyarrow 23.x, duckdb 1.5.x
 nextflow lint upjson2lake.nf nextflow.config
-                                         # "no errors"; one Channel.fromPath deprecation warning is expected
+                                         # "no errors"
 ```
 
-On SLURM, run the same checks **inside an interactive job on a compute node**
-(`srun --pty bash`) — the active conda env must carry over to the nodes, as
-`run_lake.sh` relies on that rather than a container.
+The `local` executor refuses a task that asks for more memory than the machine
+has (`Process requirement exceeds available memory`). The small and demo stages
+ask for 8 GB; stage 4 asks for what you give it.
 
 ---
 
-## 1. Unit tests (laptop)
+## 1. Unit tests
 
 ```bash
-python -m pytest tests/ -q               # ~2.5 min; fetches a ~4K-entry fixture from rest.uniprot.org on first run
-python -m pytest tests/ -q --stress      # ~8 min; ~15K entries (one-time ~60 MB fetch)
+python -m pytest tests/ -q               # ~3 min; fetches a ~4.6K-entry fixture from rest.uniprot.org on first run
+python -m pytest tests/ -q --stress      # ~8 min; ~14K entries (one-time ~60 MB fetch); needs ~8 GB RAM
 ```
 
 **Checks**
 
-- `192 passed`, no skips, no failures (the `--stress` count is the same).
+- `301 passed, 1 xfailed`, no skips, no failures (the `--stress` count is the same).
+  Without `nextflow` on the PATH, 5 workflow tests are skipped:
+  `296 passed, 5 skipped, 1 xfailed`.
 - If the fixture fetch fails (no network), run `python tests/fetch_fixtures.py`
   from a machine that can reach `rest.uniprot.org` and copy
   `tests/fixtures/diverse*.json.gz` over.
 - Optional: confirm the suite exercises the recent fixes —
   `python -m pytest tests/ -q -k "sentinel or expected_count or interrupt or git_info or OptionalPathGuards or map_columns or EmptyChildTables or decompresses_jsonl_once or sql_parity or path_with_quote or null_bounds"`
-  should report 27 passed.
+  should all pass; and the schema design (source columns are the JSON keys,
+  new fields kept, fields changing shape, array order, schema diff) —
+  `python -m pytest tests/ -q -k "ShortcutAndSourceColumns or NewUniProtFields or ArrayPositions or UpstreamShape or schema_diff or array_positions or child_count or source_columns or swapped or placed_by_index or empty_child_array or reconstruction_error or bracketed"`
+  should all pass.
 
 ---
 
-## 2. Small lake, local executor (laptop)
+## 2. Small lake (52-entry committed fixture)
 
-### 2a. Committed 52-entry fixture (no download needed)
+### 2a. Build
 
 ```bash
 ./run_lake.sh                            # small mode: tests/fixtures/small.json.gz, -profile local, 8 GB
@@ -80,7 +98,7 @@ grep -c "Execution complete -- Goodbye" .nextflow.log     # 1
 ls datalake/small/RELEASE_COMPLETE
 
 # 3. Validation: all checks passed, including the pre-sort entry-count anchor
-grep VERDICT datalake/small/validation_report.txt          # VERDICT: ALL CHECKS PASSED (165/165 ...)
+grep VERDICT datalake/small/validation_report.txt          # VERDICT: ALL CHECKS PASSED (172/172 ...)
 grep "expected count" datalake/small/validation_report.txt # [PASS] ... expected=52, jsonl=52, entries=52
 
 # 4. Provenance recorded THIS checkout, whatever directory the task ran in
@@ -88,9 +106,10 @@ python -c "import json; p=json.load(open('datalake/small/provenance.json')); pri
 git rev-parse HEAD                                         # must match p['pipeline']['commit']; 'dirty' reflects git status
 
 # 5. Lake layout and checksums
-ls -a datalake/small/lake                                  # .complete/ entries/ ... manifest.json SHA256SUMS.txt RELEASE.metalink LICENSE
+ls -a datalake/small/lake                                  # entries/ ... manifest.json SHA256SUMS.txt RELEASE.metalink LICENSE datapackage.json
 (cd datalake/small/lake && sha256sum -c --quiet SHA256SUMS.txt && echo CHECKSUMS_OK)
-ls datalake/small/lake/.complete                           # one <table>.json per table (skip-existing sentinels)
+test ! -e datalake/small/lake/.complete && echo NO_SENTINELS  # build sentinels stay in the work dir, never published
+head -3 datalake/small/SCHEMA.md                           # this release's schema, generated by PROVENANCE
 
 # 6. Diagnostic reports landed under the outdir, not ./null/
 ls datalake/reports                                        # dag.html report.html timeline.html trace.txt
@@ -113,29 +132,207 @@ print(con.sql('SELECT reviewed, count(*) FROM entries GROUP BY 1').fetchall())"
 - Console shows `cached=5` (every process resumed from cache, nothing re-ran).
 - `datalake/reports/report.html` was overwritten (mtime is now), not left stale.
 
-### 2c. Demo-sized input (~5K entries, needs network)
+### 2c. A second release: the schema diff
+
+Build the same input as a second release and compare it with the first. This
+is how every production release after the first is run (stage 8).
 
 ```bash
-cd demo && ./run_demo.sh && cd ..        # downloads demo/input.json.gz, builds demo/lake/2026_03
-# or, through the wrapper:
-./run_lake.sh --input demo/input.json.gz
+./run_lake.sh --release small2 --previous-manifest datalake/small/lake/manifest.json
 ```
 
-**Checks**: same as 2a against `demo/lake/2026_03/` (or `datalake/small/`);
-the expected-count line should read `expected=<N>, jsonl=<N>, entries=<N>` with
-N equal to the download's entry count printed by `run_demo.sh`.
+**Checks**
+
+```bash
+grep VERDICT datalake/small2/validation_report.txt         # ALL CHECKS PASSED
+grep -A2 "^--- 14" datalake/small2/validation_report.txt
+#   [INFO] previous: release small, ...
+#   [INFO] no table or column differences                   (same input, same schema)
+```
 
 ---
 
-## 3. SLURM smoke test (52 entries, `short` queue)
-
-The goal here is to prove the cluster plumbing, not the data. Run the tiny
-fixture through the `subset` mode (which selects the `short` SLURM profile;
-that profile caps every process at 4h wall time and 16 GB, so it is only for
-subsets):
+## 3. Demo lake and notebook (~5K entries)
 
 ```bash
-./run_lake.sh subset --input tests/fixtures/small.json.gz --outdir /scratch/$USER/uplake_smoke
+cd demo && ./run_demo.sh && cd ..        # downloads demo/input.json.gz (needs network), builds demo/lake/2026_03
+```
+
+**Checks**
+
+```bash
+# 1. Same end state as stage 2a, against demo/lake/2026_03/
+ls demo/lake/2026_03/RELEASE_COMPLETE
+grep -E "VERDICT|expected count" demo/lake/2026_03/validation_report.txt
+#   ALL CHECKS PASSED; expected == jsonl == entries == the entry count run_demo.sh printed
+
+# 2. The notebook runs top to bottom (what end users will do first)
+jupyter nbconvert --to notebook --execute demo/demo.ipynb --output-dir /tmp --output demo_run
+#   exits 0; any cell error stops it with the traceback (the committed notebook is not modified)
+
+# 3. What a schema diff with real differences looks like: the demo lake against
+#    the 52-entry lake. Keys (source columns) and sub-fields that one input has and
+#    the other lacks show up as warnings; the lake still passes.
+python bin/validate_lake.py --lake demo/lake/2026_03/lake \
+    --jsonl demo/lake/2026_03/sorted.jsonl.zst \
+    --previous-manifest datalake/small/lake/manifest.json -o /tmp/demo_vs_small.txt
+grep -E "WARN|VERDICT" /tmp/demo_vs_small.txt
+#   [WARN] entries: column retyped: organism  —  fields removed: synonyms
+#   ... (a handful more)
+#   VERDICT: ALL CHECKS PASSED  (... 0 failed, N warnings)
+```
+
+---
+
+## 4. Local subset rehearsal (~200K entries)
+
+This is the last local stage: a varied input large enough that DuckDB spills,
+sorts for real and writes multi-row-group files. Its `trace.txt` is what you
+size the full run from.
+
+### 4a. Make the input
+
+Any UniProtKB REST `stream` query returning roughly 100K–500K entries in the
+`{"results": [...]}` JSON format works; human is a convenient, varied choice
+(~200K entries, mostly TrEMBL):
+
+```bash
+curl --globoff -o ~/uniprot100k.json.gz \
+  "https://rest.uniprot.org/uniprotkb/stream?query=organism_id:9606&format=json&compressed=true"
+N_SUBSET=$(pigz -dc ~/uniprot100k.json.gz | python bin/stream_jsonl.py | wc -l); echo $N_SUBSET
+```
+
+**Checks**: the download is a valid gzip (`pigz -t ~/uniprot100k.json.gz`),
+`N_SUBSET` is what you expect, and `stream_jsonl.py` exited 0 with no
+`FATAL` line on stderr.
+
+(`~/uniprot100k.json.gz` is also the default input of `run_lake.sh subset`, if
+you ever want to repeat this stage on the cluster.)
+
+### 4b. Build
+
+`run_lake.sh`'s small mode is capped at 8 GB, so call Nextflow directly and give
+the heavy processes most of the machine (here 16 GB; DuckDB gets 75% of it):
+
+```bash
+mkdir -p datalake/reports
+nextflow run upjson2lake.nf -profile local \
+    --inputfile ~/uniprot100k.json.gz \
+    --outdir $(pwd)/datalake --release subset \
+    --process_memory '16 GB' \
+    --duckdb_temp /path/with/space/duckdb_tmp \
+    --expected_count $N_SUBSET \
+    -resume
+```
+
+**Checks**
+
+```bash
+OUT=datalake/subset
+
+# 1. End state, as in stage 2a
+ls $OUT/RELEASE_COMPLETE
+grep -E "VERDICT|expected count" $OUT/validation_report.txt          # ALL CHECKS PASSED; expected == jsonl == entries == N_SUBSET
+(cd $OUT/lake && sha256sum -c --quiet SHA256SUMS.txt && echo CHECKSUMS_OK)
+
+# 2. Row counts are plausible for the query you chose
+python -c "
+import json; m=json.load(open('$OUT/lake/manifest.json'))
+for t,v in m['tables'].items(): print(f'{t:15} {v[\"row_count\"]:>12,}  files={len(v[\"files\"])}')"
+#    entries == N_SUBSET; xrefs and features are 10–50x entries; accession_map >= entries
+
+# 3. Resource headroom — this is what you extrapolate the full run from
+column -t -s $'\t' datalake/reports/trace.txt | cut -c1-200
+#    peak_rss of SORT_JSONL and PARQUET_TRANSFORM under the 16 GB you gave
+#    realtime per process × (250M / N_SUBSET) is a rough full-run estimate; compare it with
+#    the README time budgets (STREAM 2–4h, SORT 4–8h, TRANSFORM 6–12h), allowing for the
+#    difference between this machine and the cluster nodes
+
+# 4. Spill went where you pointed it
+ls -d /path/with/space/duckdb_tmp/duckdb_spill_* 2>/dev/null        # one per task while running; removed on exit
+
+# 5. Resume: the same nextflow command again
+#    -> cached=5
+
+# 6. Upstream fields no column claims (usually none) and warnings
+grep "\[WARN\]" $OUT/validation_report.txt
+
+# 7. Query it the way users will
+python -c "
+from uniprot_parquet import connect
+con = connect('$OUT/lake')
+print(con.sql(\"SELECT accession, id, protein_name_primary FROM entries WHERE id = 'INS_HUMAN'\").fetchall())
+print(con.sql('SELECT division, count(*) FROM entries GROUP BY 1 ORDER BY 2 DESC').fetchall())
+print(con.sql(\"SELECT feature_index, type, start_pos FROM features WHERE accession = 'P01308' ORDER BY feature_index\").fetchall()[:5])"
+```
+
+---
+
+## 5. (Optional) Real-data slice and benchmarks
+
+If you have the full dump on a local machine with the disk for it, a
+1–5M-entry slice is the best predictor of full-run memory and disk, and the
+input the provisional settings are waiting for (README, "Open decisions"). Cut
+it from the dump's JSONL rather than the REST API:
+
+```bash
+pigz -dc /path/to/UniProtKB.json.gz | python bin/stream_jsonl.py \
+  | python bin/sample_jsonl.py --n 2000000 --seed 1 > slice_2m.jsonl
+```
+
+`sample_jsonl.py` emits JSONL, not the `{"results": [...]}` JSON the pipeline
+ingests, so run the Python stages directly on it instead of the workflow:
+
+```bash
+python bin/sort_jsonl.py slice_2m.jsonl -o slice_2m.sorted.jsonl.zst --memory-limit 12GB --threads 4
+python bin/parquet_transform.py slice_2m.sorted.jsonl.zst --outdir slice_2m_lake --memory-limit 12GB --threads 4 --release slice
+python bin/validate_lake.py --lake slice_2m_lake --jsonl slice_2m.sorted.jsonl.zst --expected-count 2000000
+
+# the measurements the provisional settings wait for
+python benchmarks/bench_zstd.py --jsonl slice_2m.sorted.jsonl.zst --out benchmarks/results/
+python benchmarks/bench_file_size.py --jsonl slice_2m.sorted.jsonl.zst --out benchmarks/results/
+python benchmarks/bench_point_lookup.py --lake slice_2m_lake --serve --label slice
+```
+
+**Checks**: validator exit 0; `du -sh slice_2m_lake` × 125 is your full-lake
+size estimate; `/usr/bin/time -v` peak RSS × (250M / 2M) is *not* linear for
+DuckDB (it spills), but should stay under the 96 GB the full run requests.
+
+**Part A is done** when stages 1–4 pass on a commit you are happy to run in
+production. Commit (or at least note) that state now; stage 8 checks for it.
+
+---
+
+# Part B — SLURM cluster
+
+## 6. Cluster environment
+
+Check out the same commit on the cluster, create the environment as in stage 0,
+then repeat the stage 0 checks **inside an interactive job on a compute node**
+(`srun --pty bash`): the active conda env must carry over to the nodes, as
+`run_lake.sh` relies on that rather than a container.
+
+```bash
+git rev-parse HEAD                       # the commit Part A passed on
+srun --pty bash
+#   on the node: the stage 0 checks, then
+python -m pytest tests/ -q               # optional: 260 passed, 1 xfailed (as in step 1), proves the node's libraries
+```
+
+---
+
+## 7. SLURM smoke test and OOM retry (`short` queue)
+
+### 7a. Smoke test (52 entries)
+
+The goal is to prove the cluster plumbing, not the data: jobs reach SLURM, the
+nodes see the tools, spill goes where you point it, and resume works. The
+`subset` mode selects the `short` SLURM profile (4 h wall time and 16 GB per
+process), which is enough for the fixture:
+
+```bash
+./run_lake.sh subset --input tests/fixtures/small.json.gz \
+    --outdir /scratch/$USER/uplake_smoke --duckdb-tmp /scratch/$USER/duckdb_tmp
 ```
 
 Run `run_lake.sh` from a `tmux`/`screen` session on the login node (or submit
@@ -154,17 +351,21 @@ grep "SLURM Job ID" $WD/.command.log                       # beforeScript ran on
 grep -L "command not found" work/*/*/.command.err          # no missing pigz/zstd/python on nodes
 
 # 3. Same end-state checks as stage 2a on /scratch/$USER/uplake_smoke/subset/
-#    (RELEASE_COMPLETE, VERDICT, expected count, provenance commit, checksums)
+#    (RELEASE_COMPLETE, VERDICT, expected count, provenance commit, checksums, SCHEMA.md)
 
-# 4. Resource accounting works (needed to size the next stages)
+# 4. Resource accounting works (needed to read the full run's trace)
 column -t -s $'\t' /scratch/$USER/uplake_smoke/reports/trace.txt | cut -c1-160
 #    every row: status COMPLETED, exit 0, peak_rss populated
+
+# 5. Resume works on the cluster: the same command again
+#    -> cached=5
 ```
 
-### 3b. Prove the OOM retry on the cluster (recommended, ~5 min)
+### 7b. Prove the OOM retry (recommended, ~5 min)
 
-Force an OOM by giving the heavy processes far too little memory via a direct
-invocation (the wrapper pins 16 GB for `subset`):
+This can only be checked under SLURM: the local executor does not enforce
+memory limits. Force an OOM by giving the heavy processes far too little memory
+via a direct invocation (the wrapper pins 16 GB for `subset`):
 
 ```bash
 nextflow run upjson2lake.nf -profile short \
@@ -181,108 +382,20 @@ nextflow run upjson2lake.nf -profile short \
   starved run — the point is that the retry *happened*. If instead the run
   aborted on the first failure, or `.nextflow.log` shows a `StackOverflowError`,
   stop: the retry directives are not being applied on your cluster.
-- Clean up: `rm -rf /scratch/$USER/uplake_oom`.
+- Clean up: `rm -rf /scratch/$USER/uplake_oom /scratch/$USER/uplake_smoke`.
+
+If the cluster nodes are very different from the machine you ran stage 4 on,
+repeat stage 4 here with `./run_lake.sh subset --outdir /scratch/$USER/uplake_subset
+--duckdb-tmp /scratch/$USER/duckdb_tmp` and size the full run from that trace.
 
 ---
 
-## 4. SLURM subset (~100K–200K entries, `short` queue)
+## 8. Full UniProtKB build (`prod` queue)
 
-### 4a. Make the input
-
-`subset` mode expects `~/uniprot100k.json.gz`. Any UniProtKB REST `stream`
-query returning roughly 100K–500K entries in the `{"results": [...]}` JSON
-format works; human is a convenient, varied choice (~200K entries, mostly TrEMBL):
+### 8a. Before submitting
 
 ```bash
-curl --globoff -o ~/uniprot100k.json.gz \
-  "https://rest.uniprot.org/uniprotkb/stream?query=organism_id:9606&format=json&compressed=true"
-pigz -dc ~/uniprot100k.json.gz | python bin/stream_jsonl.py | wc -l     # note this number: N_SUBSET
-```
-
-**Checks**: the download is a valid gzip (`pigz -t ~/uniprot100k.json.gz`),
-`N_SUBSET` is what you expect, and `stream_jsonl.py` exited 0 with no
-`SKIPPED entry` lines on stderr.
-
-### 4b. Build
-
-```bash
-./run_lake.sh subset --outdir /scratch/$USER/uplake_subset --duckdb-tmp /scratch/$USER/duckdb_tmp
-```
-
-(Add `--expected-count N_SUBSET` if you want the stream step itself to assert
-the count; VALIDATE anchors on the streamed count regardless.)
-
-**Checks**
-
-```bash
-OUT=/scratch/$USER/uplake_subset/subset
-
-# 1. End state, as in stage 2a
-ls $OUT/RELEASE_COMPLETE
-grep -E "VERDICT|expected count" $OUT/validation_report.txt          # ALL CHECKS PASSED; expected == jsonl == entries == N_SUBSET
-(cd $OUT/lake && sha256sum -c --quiet SHA256SUMS.txt && echo CHECKSUMS_OK)
-
-# 2. Row counts are plausible for the query you chose
-python -c "
-import json; m=json.load(open('$OUT/lake/manifest.json'))
-for t,v in m['tables'].items(): print(f'{t:15} {v[\"row_count\"]:>12,}  files={len(v[\"files\"])}')"
-#    entries == N_SUBSET; xrefs and features are 10–50x entries; accession_map >= entries
-
-# 3. Resource headroom — this is what you extrapolate the full run from
-column -t -s $'\t' /scratch/$USER/uplake_subset/reports/trace.txt | cut -c1-200
-#    peak_rss of SORT_JSONL and PARQUET_TRANSFORM well under the 16 GB allocation
-#    (DuckDB is capped at 75% = 12 GB; if peak_rss is near 16 GB, raise --process_memory for the full run)
-#    realtime per process: multiply by (250M / N_SUBSET) for a rough full-run estimate and
-#    compare with the README time budgets (STREAM 2–4h, SORT 4–8h, TRANSFORM 6–12h)
-
-# 4. Spill went where you pointed it
-ls -d /scratch/$USER/duckdb_tmp/duckdb_spill_* 2>/dev/null            # one per job while running; removed on exit
-
-# 5. Resume works on the cluster
-./run_lake.sh subset --outdir /scratch/$USER/uplake_subset --duckdb-tmp /scratch/$USER/duckdb_tmp
-#    -> cached=5
-
-# 6. Query it the way users will
-python -c "
-from uniprot_parquet import connect
-con = connect('$OUT/lake')
-print(con.sql(\"SELECT acc, id, protein_name FROM entries WHERE id = 'INS_HUMAN'\").fetchall())
-print(con.sql('SELECT division, count(*) FROM entries GROUP BY 1 ORDER BY 2 DESC').fetchall())"
-```
-
-### 4c. (Optional) Bigger rehearsal before committing 24+ hours
-
-If you have the full dump already, a 1–5M-entry slice on the `short` queue
-(16 GB, 4 h) is the best predictor of full-run memory and disk. Cut it from
-the dump's JSONL rather than the REST API:
-
-```bash
-pigz -dc /path/to/UniProtKB.json.gz | python bin/stream_jsonl.py \
-  | python bin/sample_jsonl.py --n 2000000 --seed 1 > /scratch/$USER/slice_2m.jsonl
-```
-
-`sample_jsonl.py` emits JSONL, not the `{"results": [...]}` JSON the pipeline
-ingests, so run the two Python stages directly on it instead of the workflow:
-
-```bash
-python bin/sort_jsonl.py /scratch/$USER/slice_2m.jsonl -o /scratch/$USER/slice_2m.sorted.jsonl.zst --memory-limit 12GB --threads 4
-python bin/parquet_transform.py /scratch/$USER/slice_2m.sorted.jsonl.zst --outdir /scratch/$USER/slice_2m_lake --memory-limit 12GB --threads 4 --release slice
-python bin/validate_lake.py --lake /scratch/$USER/slice_2m_lake --jsonl /scratch/$USER/slice_2m.sorted.jsonl.zst --expected-count 2000000
-```
-
-**Checks**: validator exit 0; `du -sh /scratch/$USER/slice_2m_lake` × 125 is
-your full-lake size estimate; `/usr/bin/time -v` peak RSS × (250M / 2M) is
-*not* linear for DuckDB (it spills), but should stay under the 96 GB you will
-request.
-
----
-
-## 5. Full UniProtKB build (`prod` queue)
-
-### 5a. Before submitting
-
-```bash
-# 1. Commit your working tree: provenance.json records the commit and a dirty flag.
+# 1. The commit Part A passed on, with a clean tree: provenance.json records the commit and a dirty flag.
 git status --short                      # empty
 git rev-parse HEAD                      # write this down
 
@@ -308,7 +421,7 @@ sinfo -p production -o "%P %l %m %c"
 sacctmgr show qos format=name,maxwall,maxtres | grep -i production
 ```
 
-### 5b. Submit
+### 8b. Submit
 
 Run from `tmux`/`screen` on the login node, or wrap the command in a small
 `sbatch` head job with a wall time longer than the whole pipeline (2–3 days):
@@ -319,17 +432,25 @@ Run from `tmux`/`screen` on the login node, or wrap the command in a small
     --release 2026_03 \
     --input /path/to/UniProtKB.json.gz \
     --outdir /scratch/$USER/uniprot_parquet \
-    --duckdb-tmp /scratch/$USER/duckdb_tmp
+    --duckdb-tmp /scratch/$USER/duckdb_tmp \
+    --previous-manifest /scratch/$USER/uniprot_parquet/<previous release>/lake/manifest.json
 ```
 
 `--release` defaults to the label in `run_lake.sh` (currently `2026_03`); pass
 it explicitly so the output directory unambiguously matches the dump you are
 building from.
 
-To get failure emails, invoke Nextflow directly with `--notify_email you@example.org`
-(see README "Direct Nextflow invocation"); `run_lake.sh` does not pass it.
+`--previous-manifest` makes the validation report list how this release's
+schema differs from the previous one, as in stage 2c. The diff never fails the
+run, but full mode requires the flag: for the very first release, pass
+`--first-release` instead. `run_lake.sh` stops before launching if the file
+does not exist, or if it lies inside the release being built (a re-run would
+diff the release against itself).
 
-### 5c. While it runs — checks per process
+To get failure emails, invoke Nextflow directly with `--notify_email you@example.org`
+(see README "Nextflow directly"); `run_lake.sh` does not pass it.
+
+### 8c. While it runs — checks per process
 
 Find each task's work dir with `nextflow log <run name> -f process,workdir,status`
 (or from `.nextflow.log`).
@@ -360,8 +481,15 @@ ls -l /scratch/$USER/uniprot_parquet/2026_03/sorted.jsonl.zst   # appears (publi
 ```bash
 grep -E "^--- |rows so far|rows in" $WD/.command.log | tail -5
 #   "--- ENTRIES ---", then "entries: 250,000,000 rows in N files", then FEATURES, XREFS, ...
+grep -E "New UniProt fields|stored as JSON" $WD/.command.log
+#   keys UniProt added (new source columns, listed per table until they get a
+#   description), and fields whose type varies between entries (their source
+#   column is stored as JSON); informational — the build carries on and stores
+#   them. If such a field feeds a shortcut column, the build stops instead (see
+#   the recovery cheatsheet)
 ls $WD/lake/.complete/                  # a <table>.json appears as each table finishes — the
-                                        # sentinel that a later --skip-existing run trusts
+                                        # sentinel that a later --skip-existing run trusts;
+                                        # removed once the transform succeeds (not published)
 ```
 
 If it OOMs: expect exit 137/140 in `.exitcode`, then a second attempt with
@@ -369,16 +497,22 @@ If it OOMs: expect exit 137/140 in `.exitcode`, then a second attempt with
 `MEMORY` in `run_lake.sh`'s `full` mode (or `--process_memory`) and re-submit —
 `-resume` restarts from the transform, not from the stream.
 
-**VALIDATE (< 1 h; was 1–2 h when it decompressed the JSONL four times —
-it now makes a single count+sample pass)** — watch `$WD/.command.log` for
-`[PASS]` lines; a single `[FAIL]` exits 1 and PROVENANCE does not run, so no
-`RELEASE_COMPLETE` appears.
+**VALIDATE (not yet timed at full scale; 8 cpus, 24 h limit, OOM retry)** —
+watch `$WD/.command.log` for `[PASS]` lines; a single `[FAIL]` exits 1 and
+PROVENANCE does not run, so no `RELEASE_COMPLETE` appears. Its DuckDB gets
+`--duckdb_pct` of the task memory and `--duckdb_temp` for spill, like the
+transform. `[WARN] <table>.<column> has no values` means a shortcut column is
+NULL or empty in every row: compare with the transform's
+`WARNING: shortcut sources absent from input` lines — a renamed upstream field
+is kept as a new source column, but the shortcut needs a code change.
 
-**PROVENANCE (< 1 min)** — the workflow's `onComplete` renames
-`.RELEASE_COMPLETE.pending` to `RELEASE_COMPLETE` after every publish copy has
-finished.
+**PROVENANCE (< 1 min)** — writes `SCHEMA.md` and `provenance.json`; the
+workflow's `onComplete` renames `.RELEASE_COMPLETE.pending` to
+`RELEASE_COMPLETE` after every publish copy has finished.
 
-### 5d. After the run
+---
+
+## 9. After the run
 
 ```bash
 OUT=/scratch/$USER/uniprot_parquet/2026_03
@@ -409,26 +543,38 @@ column -t -s $'\t' /scratch/$USER/uniprot_parquet/reports/trace.txt | cut -c1-22
 python -c "
 from uniprot_parquet import connect
 con = connect('$OUT/lake')
-print(con.sql(\"SELECT acc, protein_name FROM entries WHERE acc = 'P01308'\").fetchall())      # human insulin
+print(con.sql(\"SELECT accession, protein_name_primary FROM entries WHERE accession = 'P01308'\").fetchall())      # human insulin
 print(con.sql('SELECT reviewed, count(*) FROM entries GROUP BY 1').fetchall())
 print(con.sql(\"SELECT count(*) FROM accession_map WHERE NOT is_primary\").fetchall())"
+
+# 7. What changed upstream: warnings never fail a release, but read them
+grep "\[WARN\]" $OUT/validation_report.txt
+#   "... new UniProt fields (source columns without a description)": UniProt added
+#   keys, each now a column — describe them in COLUMN_DESCRIPTIONS, and decide
+#   whether any deserves a shortcut
+#   "... SHORTCUT column ...": the shortcut contract changed — was schema_version bumped?
+head -5 $OUT/SCHEMA.md
 ```
 
 ---
 
-## 6. Recovery cheatsheet
+## 10. Recovery cheatsheet
 
 | Symptom | What to do |
 |---|---|
 | Head job / login session killed while Nextflow was running | Re-run the identical `run_lake.sh` command; `-resume` reuses every completed process. |
 | A SLURM job hit its wall time | Same: re-submit. If it was `PARQUET_TRANSFORM`, the retry starts from a fresh work dir (Nextflow limitation); the whole transform re-runs. |
 | `PARQUET_TRANSFORM` OOM twice | Raise memory (`MEMORY=` in `run_lake.sh` or `--process_memory`) and re-submit. |
+| `Process requirement exceeds available memory` (local executor) | `--process_memory` is more than the machine has; lower it (DuckDB spills to `--duckdb_temp`). |
 | `STREAM_JSONL` count mismatch (`FATAL — count mismatch`) | The dump is not the release you think, or is truncated: re-check `EXPECTED` and `pigz -t`. |
+| `STREAM_JSONL` stops with `FATAL — LoneSurrogate` or `Integer exceeds 64-bit range` | The dump holds data a JSON line cannot carry exactly (a `\uD800`-style escape without its pair, an integer outside −2^63 … 2^64−1). The message names the entry number (and the byte offset for a surrogate). Report it to UniProt; the pipeline refuses rather than change the data. |
 | `VALIDATE` fails | Read `validation_report.txt`; the lake was not marked complete. Fix, then re-submit — VALIDATE alone re-runs. |
-| Manual re-run of the transform on an existing `lake/` (outside Nextflow) | `parquet_transform.py ... --skip-existing` skips only tables whose `.complete/<table>.json` matches the files on disk; anything else is rebuilt, with a `REBUILD <table>` line on stderr. |
+| `PARQUET_TRANSFORM` stops with `Input lacks fields every UniProtKB entry carries` | UniProt removed or renamed a field a shortcut column is built from (or the input is not a UniProtKB dump). Update the SQL builder and `REQUIRED_PATHS` in `bin/parquet_transform.py`; this is a shortcut-schema change. New fields, and retyped fields that no shortcut reads, never stop the build: they are source columns. |
+| `PARQUET_TRANSFORM` stops with `Shortcut columns whose source field has a different type in different entries` | UniProt ships a field a shortcut is built from with more than one type (for example a string in some entries and an object in others), so DuckDB inferred JSON. The message names the column and the source path. Decide how the shortcut should read the field, update its SQL builder in `bin/parquet_transform.py`, and bump `schema_version` if the column's type or meaning changes. |
+| `PARQUET_TRANSFORM` stops with `input key(s) [...] have the name of a shortcut column` | UniProt added a key named like one of the table's shortcuts (compared case-insensitively). Rename the shortcut in `bin/parquet_transform.py` (a major schema version change). |
+| Manual re-run of the transform on an existing `lake/` (outside Nextflow) | `parquet_transform.py ... --skip-existing` skips only tables whose `.complete/<table>.json` matches the files on disk and records the same input (size, mtime) and release; anything else is rebuilt, with a `REBUILD <table>: ..., <reason>` line on stderr. |
 | Reports in `<outdir>/reports/` look stale | They are overwritten on every run; check the mtime, then `.nextflow.log` for `Failed to render` (should not appear). |
 
 A subset in which *no* entry has, say, comments produces a zero-row `comments`
 table holding one empty schema-valid Parquet file, so `**/*.parquet` globs,
-dataset readers, and the validator all still work (previously the table got no
-files at all and the validator's glob failed).
+dataset readers, and the validator all still work.

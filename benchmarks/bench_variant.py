@@ -815,7 +815,7 @@ def format_comparison(all_results):
     sc = baseline.get("schema_complexity", {})
     code = sc.get("code_complexity", {})
     lines.append(f"  Baseline:  {code.get('total_pipeline_loc', '?')} LOC, {code.get('sql_builder_loc', '?')} SQL builder LOC ({code.get('sql_builder_pct', '?')}%)")
-    lines.append(f"             {sc.get('summary', {}).get('total_convenience_columns', '?')} convenience cols, {sc.get('summary', {}).get('total_nested_columns', '?')} nested cols")
+    lines.append(f"             {sc.get('summary', {}).get('total_shortcut_columns', '?')} shortcut cols, {sc.get('summary', {}).get('total_source_columns', '?')} source cols")
     lines.append(f"  VARIANT:   ~{bm.get('estimated_variant_loc', '?')} LOC, 0 SQL builder LOC")
     lines.append(f"             0 convenience cols (VARIANT shredding replaces them)")
 

@@ -1,0 +1,133 @@
+"""Tests for run_lake.sh's argument handling, against a stub ``nextflow``
+that records its arguments instead of running the pipeline."""
+
+import os
+import subprocess
+
+import pytest
+
+from conftest import PROJECT_ROOT
+
+
+@pytest.fixture
+def stub(tmp_path):
+    """(run(*args, mode="small") -> CompletedProcess, path of the recorded
+    nextflow args)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    args_file = tmp_path / "nextflow_args"
+    nextflow = bin_dir / "nextflow"
+    nextflow.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{args_file}"\n')
+    nextflow.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+    def run(*args, mode="small"):
+        return subprocess.run(
+            ["bash", os.path.join(PROJECT_ROOT, "run_lake.sh"), mode,
+             "--outdir", str(tmp_path / "out"), *args],
+            cwd=PROJECT_ROOT, env=env, capture_output=True, text=True)
+    return run, args_file
+
+
+class TestPreviousManifest:
+    def test_missing_file_is_refused_by_name(self, stub):
+        run, args_file = stub
+        result = run("--previous-manifest", "datalake/2026_3/lake/manifest.json")
+        assert result.returncode != 0
+        assert "datalake/2026_3/lake/manifest.json" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+    def test_existing_file_reaches_nextflow(self, stub):
+        run, args_file = stub
+        manifest = "tests/fixtures/small.json.gz"   # any existing file, relative to the launch dir
+        result = run("--previous-manifest", manifest)
+        assert result.returncode == 0, result.stdout + result.stderr
+        args = args_file.read_text().splitlines()
+        passed = args[args.index("--previous_manifest") + 1]
+        assert os.path.samefile(os.path.join(PROJECT_ROOT, passed), os.path.join(PROJECT_ROOT, manifest))
+
+    def test_manifest_of_the_release_being_built_is_refused(self, stub, tmp_path):
+        """The run republishes that manifest while VALIDATE reads it, so the
+        schema diff would compare the release with itself."""
+        run, args_file = stub
+        manifest = tmp_path / "out" / "rel" / "lake" / "manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}")
+        result = run("--release", "rel", "--previous-manifest", str(manifest))
+        assert result.returncode != 0
+        assert "inside the release being built" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+    def test_manifest_of_another_release_in_outdir_is_accepted(self, stub, tmp_path):
+        run, args_file = stub
+        manifest = tmp_path / "out" / "rel_2" / "lake" / "manifest.json"   # shares a prefix with "rel"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}")
+        result = run("--release", "rel", "--previous-manifest", str(manifest))
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+class TestFullModeSchemaDiff:
+    """A full release's report always compares its schema with the previous
+    release's (README §2), unless it is declared the first release."""
+
+    FULL = ("--expected-count", "52", "--input", "tests/fixtures/small.json.gz")
+
+    def test_refused_without_previous_manifest(self, stub):
+        run, args_file = stub
+        result = run(*self.FULL, mode="full")
+        assert result.returncode != 0
+        assert "--previous-manifest" in result.stdout + result.stderr
+        assert "--first-release" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+    def test_first_release_launches_without_diff(self, stub):
+        run, args_file = stub
+        result = run(*self.FULL, "--first-release", mode="full")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "--previous_manifest" not in args_file.read_text().splitlines()
+
+    def test_previous_manifest_launches(self, stub):
+        run, args_file = stub
+        result = run(*self.FULL, "--previous-manifest", "tests/fixtures/small.json.gz", mode="full")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "--previous_manifest" in args_file.read_text().splitlines()
+
+    def test_both_flags_are_refused(self, stub):
+        run, args_file = stub
+        result = run(*self.FULL, "--first-release",
+                     "--previous-manifest", "tests/fixtures/small.json.gz", mode="full")
+        assert result.returncode != 0
+        assert not args_file.exists(), "nextflow was launched"
+
+    def test_small_mode_needs_neither(self, stub):
+        run, args_file = stub
+        assert run().returncode == 0
+
+
+def _header_examples(mode):
+    """The ``./run_lake.sh <mode> ...`` usage lines of run_lake.sh's header,
+    as argument lists (lines abbreviated with '...' excluded)."""
+    import shlex
+    with open(os.path.join(PROJECT_ROOT, "run_lake.sh")) as f:
+        header = [line.lstrip("#").split("#")[0].strip() for line in f
+                  if line.startswith("#   ./run_lake.sh")]
+    return [shlex.split(line)[1:] for line in header
+            if line.split()[1:2] == [mode] and "..." not in line]
+
+
+@pytest.mark.parametrize("example", _header_examples("full"), ids=" ".join)
+def test_full_mode_header_examples_launch(example, stub, tmp_path):
+    """Each full-mode example in the header works as written, from a
+    directory holding the dump and the previous release under the default
+    outdir (datalake/)."""
+    run, args_file = stub
+    cwd = tmp_path / "launch"
+    (cwd / "datalake" / "2026_03" / "lake").mkdir(parents=True)
+    (cwd / "datalake" / "2026_03" / "lake" / "manifest.json").write_text("{}")
+    (cwd / "UniProtKB.json.gz").write_bytes(b"")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}"}
+    result = subprocess.run(["bash", os.path.join(PROJECT_ROOT, "run_lake.sh"), *example],
+                            cwd=cwd, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert args_file.exists(), "nextflow was not launched"

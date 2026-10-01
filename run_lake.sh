@@ -4,10 +4,10 @@
 #   ./run_lake.sh                                         # small: 52-entry committed fixture, local
 #   ./run_lake.sh --input demo/input.json.gz              # small: ~5K demo entries (after demo/run_demo.sh)
 #   ./run_lake.sh subset                                  # subset: 100K entries, SLURM short
-#   ./run_lake.sh full --expected-count 248799253          # full UniProtKB, SLURM prod
-#   ./run_lake.sh full --expected-count 248799253 --input /path/to/UniProtKB.json.gz
-#   ./run_lake.sh full --expected-count 248799253 --outdir /scratch/results
-#   ./run_lake.sh full --expected-count 248799253 --release 2026_04
+#   ./run_lake.sh full --expected-count 248799253 --release 2026_04 --previous-manifest datalake/2026_03/lake/manifest.json
+#                                                         # full UniProtKB, SLURM prod
+#   ./run_lake.sh full --expected-count 248799253 --first-release   # no previous release to diff against
+#   ./run_lake.sh full ... --input /path/to/UniProtKB.json.gz --outdir /scratch/results --release 2026_04
 
 # Prerequisites:
 #   Activate your conda/mamba environment before running this script.
@@ -33,6 +33,8 @@ OUTDIR_OVERRIDE=""
 DUCKDB_TEMP_OVERRIDE=""
 EXPECTED_COUNT=""
 RELEASE_OVERRIDE=""
+PREVIOUS_MANIFEST=""
+FIRST_RELEASE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -41,6 +43,8 @@ while [[ $# -gt 0 ]]; do
         --duckdb-tmp)     DUCKDB_TEMP_OVERRIDE="$2"; shift 2 ;;
         --expected-count) EXPECTED_COUNT="$2";        shift 2 ;;
         --release)        RELEASE_OVERRIDE="$2";      shift 2 ;;
+        --previous-manifest) PREVIOUS_MANIFEST="$2";  shift 2 ;;
+        --first-release)  FIRST_RELEASE=1;            shift ;;
         *)                echo "Unknown flag: $1"; exit 1  ;;
     esac
 done
@@ -69,7 +73,7 @@ case "$MODE" in
         PROFILE="prod"
         ;;
     *)
-        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL]"
+        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL] [--previous-manifest FILE | --first-release]"
         exit 1
         ;;
 esac
@@ -80,6 +84,18 @@ if [[ "$MODE" == "full" && -z "$EXPECTED_COUNT" ]]; then
     echo "ERROR: --expected-count is required for full mode."
     echo "  Get the entry count from the UniProt release notes, then run:"
     echo "    $0 full --expected-count <N>"
+    exit 1
+fi
+
+# In full mode, every release's validation report compares its schema with
+# the previous release's (README §2): say which one, or that there is none.
+if [[ -n "$PREVIOUS_MANIFEST" && -n "$FIRST_RELEASE" ]]; then
+    echo "ERROR: --previous-manifest and --first-release contradict each other."
+    exit 1
+fi
+if [[ "$MODE" == "full" && -z "$PREVIOUS_MANIFEST" && -z "$FIRST_RELEASE" ]]; then
+    echo "ERROR: full mode needs --previous-manifest <previous release>/lake/manifest.json"
+    echo "  (the validation report's schema diff), or --first-release if there is none."
     exit 1
 fi
 
@@ -111,6 +127,22 @@ if [[ ! -f "$INPUTFILE" ]]; then
     fi
     exit 1
 fi
+if [[ -n "$PREVIOUS_MANIFEST" && ! -f "$PREVIOUS_MANIFEST" ]]; then
+    echo "ERROR: Previous manifest not found: $PREVIOUS_MANIFEST" >&2
+    echo "  (resolved from working directory: $(pwd))" >&2
+    exit 1
+fi
+# The run republishes into $OUTDIR/$RELEASE while VALIDATE reads the previous
+# manifest, so one from inside it would be diffed against itself.
+if [[ -n "$PREVIOUS_MANIFEST" && -d "$OUTDIR/$RELEASE" ]]; then
+    MANIFEST_REAL="$(cd "$(dirname "$PREVIOUS_MANIFEST")" && pwd -P)/$(basename "$PREVIOUS_MANIFEST")"
+    RELEASE_REAL="$(cd "$OUTDIR/$RELEASE" && pwd -P)"
+    if [[ "$MANIFEST_REAL" == "$RELEASE_REAL"/* ]]; then
+        echo "ERROR: Previous manifest is inside the release being built ($RELEASE_REAL): $PREVIOUS_MANIFEST" >&2
+        echo "  Pass the previous release's lake/manifest.json." >&2
+        exit 1
+    fi
+fi
 
 # Ensure report directory exists (Nextflow won't create it)
 mkdir -p "$OUTDIR/reports"
@@ -135,6 +167,12 @@ fi
 # Add expected entry count if specified (verified during STREAM_JSONL)
 if [[ -n "$EXPECTED_COUNT" ]]; then
     NF_CMD+=(--expected_count "$EXPECTED_COUNT")
+fi
+
+# Previous release's manifest: the validation report lists schema differences.
+# Passed as given: Nextflow resolves a relative path against this directory.
+if [[ -n "$PREVIOUS_MANIFEST" ]]; then
+    NF_CMD+=(--previous_manifest "$PREVIOUS_MANIFEST")
 fi
 
 echo "Running: ${NF_CMD[*]}"

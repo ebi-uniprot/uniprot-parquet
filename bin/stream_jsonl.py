@@ -6,13 +6,22 @@ Reads a UniProtKB JSON dump from stdin (typically piped from pigz -dc),
 extracts each entry from the "results" array via streaming (ijson), and
 writes one JSON line per entry to stdout (via orjson).
 
-Integrity checks:
-  - Malformed entries that fail JSON serialisation are logged to stderr
-    and skipped (not silently dropped).
-  - Entry count and error count are reported to stderr on completion.
-  - Exit code 0 if all entries were processed, 1 if any were skipped.
-  - If --expected-count is provided, the output count must match exactly
-    or the script exits 1.
+Each line holds its entry's data exactly: the same keys in the same order,
+strings unchanged, and every number with its exact value (a non-integer is
+parsed as a Decimal and written with its own digits, not rounded through a
+double).  Only the formatting changes: one compact line, raw UTF-8 rather
+than \\u escapes, and an exponent written in Decimal's notation (1e5 as
+1E+5, the same value).
+
+Integrity checks (each exits 1 at once, with no count file):
+  - Input the JSONL cannot carry exactly: a lone surrogate escape (the
+    parser would turn it into '?'), an integer orjson cannot write (below
+    -2**63 or above 2**64 - 1), malformed JSON.
+
+Not checked: a key repeated in one object, of which only the last value
+is kept.  UniProt's serialiser does not produce them, and refusing them
+costs a Python call per key (~40% of this step's time).
+  - If --expected-count is provided, the output count must match exactly.
   - If --count-file is provided, the final count is written to that file
     so the caller can verify end-to-end (e.g. against zstd output lines).
 
@@ -26,9 +35,11 @@ Usage (with sidecar count file for post-hoc verification):
     pigz -dc input.json.gz | python3 stream_jsonl.py --count-file entry_count.txt | ...
 """
 
+import re
 import sys
 import time
 import argparse
+from decimal import Decimal
 
 try:
     import ijson.backends.yajl2_c as ijson
@@ -43,6 +54,72 @@ DUMPS = orjson.dumps
 OPT = orjson.OPT_APPEND_NEWLINE
 WRITE = sys.stdout.buffer.write
 LOG_INTERVAL = 1_000_000  # log progress every N entries
+
+
+def _exact_number(value):
+    """orjson default: a Decimal (ijson, use_float=False) written with its
+    own digits."""
+    if isinstance(value, Decimal):
+        return orjson.Fragment(str(value))
+    raise TypeError(f"Type is not JSON serializable: {type(value).__name__}")
+
+
+# A surrogate escape, high (\uD800-\uDBFF) or low (\uDC00-\uDFFF).  Rare,
+# so each match is judged in Python (_SurrogateGuard._lone).
+_SURROGATE_ESCAPE = re.compile(rb"\\u[dD][89a-fA-F][0-9a-fA-F]{2}")
+_LOW_ESCAPE = re.compile(rb"\\u[dD][c-fC-F][0-9a-fA-F]{2}")
+
+
+class LoneSurrogate(ValueError):
+    pass
+
+
+class _SurrogateGuard:
+    """A binary stream that refuses lone surrogate escapes, which yajl
+    decodes to '?' (and orjson could not write).  Each chunk is scanned with
+    the tail of the one before, so an escape split between reads is seen;
+    an escape too close to the end to judge is judged on the next read."""
+
+    CONTEXT = 64        # bytes of the previous chunk kept for the next scan
+    LOOKAHEAD = 12      # a high surrogate is judged with the escape after it
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.tail = b""
+        self.tail_offset = 0      # stream offset of tail[0]
+        self.judged = 0           # escapes starting before this offset were judged
+        self.paired_low = -1      # stream offset of the low escape after a judged high
+
+    @staticmethod
+    def _is_escape(buf, i):
+        """True if the backslash at buf[i] starts an escape (is not itself
+        escaped by an odd run of backslashes before it)."""
+        run = 0
+        while i - run - 1 >= 0 and buf[i - run - 1] == 0x5C:
+            run += 1
+        return run % 2 == 0
+
+    def read(self, n=-1):
+        if n == 0:
+            return b""
+        chunk = self.raw.read(n)
+        buf = self.tail + chunk
+        limit = len(buf) if not chunk else len(buf) - self.LOOKAHEAD
+        for m in _SURROGATE_ESCAPE.finditer(buf):
+            i = m.start()
+            at = self.tail_offset + i
+            if (i >= limit or at < self.judged or at == self.paired_low
+                    or not self._is_escape(buf, i)):
+                continue
+            if buf[i + 3] in b"89abAB" and _LOW_ESCAPE.match(buf, i + 6):
+                self.paired_low = at + 6
+                continue
+            raise LoneSurrogate(f"lone surrogate escape {m.group().decode()!r} at byte {at:,}")
+        self.judged = max(self.judged, self.tail_offset + limit)
+        keep = min(len(buf), self.CONTEXT)
+        self.tail_offset += len(buf) - keep
+        self.tail = buf[len(buf) - keep:]
+        return chunk
 
 
 def main():
@@ -62,23 +139,17 @@ def main():
     args = parser.parse_args()
 
     count = 0
-    errors = 0
     t0 = time.time()
 
     try:
-        for item in ijson.items(sys.stdin.buffer, "results.item", use_float=True):
-            try:
-                WRITE(DUMPS(item, option=OPT))
-                count += 1
-                if count % LOG_INTERVAL == 0:
-                    elapsed = time.time() - t0
-                    rate = count / elapsed if elapsed > 0 else 0
-                    print(f"  stream_jsonl: {count:,} entries ({rate:,.0f}/s)",
-                          file=sys.stderr)
-            except (TypeError, orjson.JSONEncodeError) as e:
-                errors += 1
-                acc = item.get("primaryAccession", "unknown") if isinstance(item, dict) else "unknown"
-                print(f"  stream_jsonl: SKIPPED entry {acc}: {e}",
+        for item in ijson.items(_SurrogateGuard(sys.stdin.buffer), "results.item",
+                                use_float=False, buf_size=1 << 20):
+            WRITE(DUMPS(item, default=_exact_number, option=OPT))
+            count += 1
+            if count % LOG_INTERVAL == 0:
+                elapsed = time.time() - t0
+                rate = count / elapsed if elapsed > 0 else 0
+                print(f"  stream_jsonl: {count:,} entries ({rate:,.0f}/s)",
                       file=sys.stderr)
     except BrokenPipeError:
         print(f"  stream_jsonl: FATAL — BrokenPipeError after {count:,} entries "
@@ -91,18 +162,16 @@ def main():
               file=sys.stderr)
         sys.exit(130)
     except Exception as e:
-        print(f"  stream_jsonl: FATAL — {type(e).__name__} after {count:,} entries: {e}",
-              file=sys.stderr)
+        # An error raised inside ijson's C reader (a lone surrogate) arrives
+        # as the cause of a SystemError.
+        cause = e.__cause__ if isinstance(e, SystemError) and e.__cause__ else e
+        print(f"  stream_jsonl: FATAL — {type(cause).__name__} in entry {count + 1:,} "
+              f"(after {count:,} written): {cause}", file=sys.stderr)
         sys.exit(1)
 
     elapsed = time.time() - t0
     print(f"  stream_jsonl: DONE — {count:,} entries in {elapsed:.1f}s",
           file=sys.stderr)
-    if errors:
-        print(f"  stream_jsonl: WARNING — {errors:,} entries skipped due to errors",
-              file=sys.stderr)
-        sys.exit(1)
-
     if args.expected_count is not None and count != args.expected_count:
         print(f"  stream_jsonl: FATAL — count mismatch: "
               f"wrote {count:,}, expected {args.expected_count:,}",

@@ -19,64 +19,73 @@ Checks (in order):
      - sum(entries.reference_count) == publications row count
 
   2. UNIQUENESS
-     - entries.acc has zero duplicates
+     - entries.accession has zero duplicates
 
   3. NULL KEYS AND EMPTY STRINGS
-     - acc, reviewed, taxid never null in any table
-     - Identity columns (acc, id, sequence) never empty strings
+     - accession, reviewed, organism_id never null in any table
+     - Identity columns (accession, id) never empty strings
 
   4. REFERENTIAL INTEGRITY
-     - Every acc in features exists in entries
-     - Every acc in xrefs exists in entries
-     - Every acc in comments exists in entries
-     - Every acc in publications exists in entries
+     - Every accession in features exists in entries
+     - Every accession in xrefs exists in entries
+     - Every accession in comments exists in entries
+     - Every accession in publications exists in entries
 
-  5. SORT ORDER
-     - All tables sorted by (reviewed DESC, taxid ASC, acc ASC)
+  5. SORT ORDER AND ARRAY POSITIONS
+     - entries sorted by (reviewed DESC, organism_id ASC, accession ASC); child tables by
+       the same keys then their *_index; accession_map by
+       (reviewed DESC, accession ASC, primary_accession ASC)
+     - Each child table's *_index runs 0..n-1 per accession, with n equal to
+       the entry's *_count (per-accession completeness); one streaming pass
+       per child table, merged with entries in their shared sort order
 
   6. ROUND-TRIP SPOT CHECK
      - Sample N accessions from the JSONL
-     - For each, verify acc, taxid, seq_length, feature_count match lake
+     - For each, verify accession, organism_id, length, feature_count match lake
 
   7. PARQUET FILE INTEGRITY
      - Every data file in the lake is a readable Parquet file
 
   8. MANIFEST CONSISTENCY
      - manifest.json file lists match actual files on disk
-     - every file's size and SHA-256 match manifest file_details
+     - every file's size, SHA-256 and MD5 match manifest file_details
 
   9. DENORMALIZED COLUMN SYNC
-     - taxid and reviewed in child tables match entries
+     - organism_id and reviewed in child tables match entries
 
   10. SEQUENCE INTEGRITY
-      - len(sequence) == seq_length for every entry
-      - No entries with seq_length == 0
+      - len(sequence.value) == length for every entry
+      - No entries with length == 0
 
   11. FEATURE COORDINATE BOUNDARIES
       - start_pos <= end_pos where both are non-null
 
-  12. SCHEMA TYPE PROTECTION
-      - Critical columns have expected Arrow types (not silently cast)
+  12. SHORTCUT COLUMN TYPES
+      - Every shortcut column (parquet_transform.COLUMN_TYPES) has its
+        declared type
 
   13. FIELD COMPLETENESS
-      - Every top-level JSON field is captured in entries or a child table
-      - Catches silent data loss when UniProt adds new top-level fields
+      - Every top-level key of a sampled entry, and of its features,
+        cross-references, comments and references, is a source column of
+        its table; source columns without a description (fields UniProt
+        added) are listed as warnings
 
-  14. SCHEMA EVOLUTION GUARD
-      - Inferred Parquet schema matches committed baseline
-      - Detects renamed/dropped/new fields from upstream JSON changes
+  14. SCHEMA DIFF (informational, never fails)
+      - With --previous-manifest: tables and columns added, removed or
+        retyped since the previous release, as warnings; shortcut changes
+        without a schema_version bump are flagged
 
   15. COMMENT TEXT
       - Every text-bearing comment type has a populated text_value
 
   16. RECONSTRUCTION
       - Sampled entries rebuilt from the five tables (bin/reconstruct.py)
-        equal the source JSONL, order-independent inside arrays
+        equal the source JSONL, including array order
 
   18. ACCESSION MAP
-      - Primary rows == entries, secondary rows == sum(len(secondary_accs)),
-        no duplicate (acc, primary_acc), every primary_acc exists,
-        (reviewed, taxid) match entries  (17 is reserved for bloom filters,
+      - Primary rows == entries, secondary rows == sum(len(secondaryAccessions)),
+        no duplicate (accession, primary_accession), every primary_accession exists,
+        (reviewed, organism_id) match entries  (17 is reserved for bloom filters,
         deferred: PyArrow 23 cannot write them)
 
   19. PARTITIONS
@@ -84,16 +93,21 @@ Checks (in order):
         `reviewed` column (row-group statistics), per-partition row counts
         match the manifest and sum to row_count, swissprot files first
 
+  20. SHORTCUT COLUMN COVERAGE (warnings, never fails)
+      - A shortcut column with no value in any row (footer statistics) is
+        listed: its source field may be absent or renamed upstream
+
 Usage:
     validate_lake.py \
         --lake /path/to/lake \
         --jsonl /path/to/uniprot.jsonl.zst \
         [--spot-check-n 1000] \
-        [--schema-baseline /path/to/schema_baseline.json] \
+        [--previous-manifest /path/to/<previous release>/lake/manifest.json] \
+        [--memory-limit 16GB] [--threads N] [--temp-dir /scratch/duckdb_tmp] \
         [-o validation_report.txt]
 
 Exit codes:
-    0  All checks passed
+    0  All checks passed (warnings do not fail)
     1  One or more checks FAILED — do not publish this lake
 """
 
@@ -101,7 +115,6 @@ import os
 import sys
 import json
 import random
-import hashlib
 import argparse
 import time
 from datetime import datetime, timezone
@@ -110,16 +123,35 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pyarrow.dataset as ds
+from concurrent.futures import ThreadPoolExecutor
+
+from parquet_transform import CHILD_TABLES, TABLE_DEFS, hash_file, init_duckdb
 
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
+# ─── DuckDB ────────────────────────────────────────────────────────────
+# One connection serves every check.  main() sizes it from --memory-limit /
+# --threads / --temp-dir (VALIDATE passes its task's share): DuckDB's default
+# connection would take 80% of the node's memory and every core, and spill
+# wherever it likes.
+
+_DUCKDB = {"con": None, "settings": ("16GB", None, None)}
+
+
+def _duckdb():
+    """The validator's DuckDB connection (init_duckdb), opened on first use."""
+    if _DUCKDB["con"] is None:
+        _DUCKDB["con"] = init_duckdb(*_DUCKDB["settings"])
+    return _DUCKDB["con"]
+
+
 # ─── Parquet reading helpers ──────────────────────────────────────────
 
-# Every table in the lake (kept in sync with parquet_transform.TABLE_DEFS).
-ALL_TABLES = ["entries", "features", "xrefs", "comments", "publications", "accession_map"]
+# Every table in the lake.
+ALL_TABLES = [name for name, _, _ in TABLE_DEFS]
 
 
 def _table_files(lake_dir, table_name):
@@ -140,6 +172,11 @@ def _table_glob(lake_dir, table_name):
     """DuckDB glob for a table: `**` crosses the partition directories (the
     form the README recommends, so the validator reads what users read)."""
     return os.path.join(lake_dir, table_name, "**", "*.parquet")
+
+
+def _sql_in_list(values):
+    """The inside of a SQL ``IN (...)``: each value as a quoted string literal."""
+    return ",".join("'" + v.replace("'", "''") + "'" for v in values)
 
 
 def open_table(lake_dir, table_name):
@@ -185,16 +222,19 @@ def count_jsonl_lines(jsonl_path: str) -> int:
 
 
 def _open_jsonl_lines(jsonl_path: str):
-    """Yield text lines from a JSONL(.zst) file, handling decompression."""
+    """Yield the lines of a JSONL(.zst) file as bytes, handling
+    decompression.  Bytes, not text: nearly every line of a ~1 TB stream is
+    only counted, so decoding it to str would be wasted work (json.loads
+    takes the bytes of a sampled line directly)."""
     if jsonl_path.endswith(".zst"):
         import zstandard as zstd
         import io
         dctx = zstd.ZstdDecompressor()
         with open(jsonl_path, "rb") as f:
             with dctx.stream_reader(f) as reader:
-                yield from io.TextIOWrapper(reader, encoding="utf-8")
+                yield from io.BufferedReader(reader, buffer_size=16 << 20)
     else:
-        with open(jsonl_path) as f:
+        with open(jsonl_path, "rb") as f:
             yield from f
 
 
@@ -248,8 +288,21 @@ class ValidationReport:
     def __init__(self):
         self.checks = []          # formatted lines, including section headers
         self.records = []         # one dict per check, for validation_report.json
+        self.warnings = []        # informational findings; never fail the lake
         self.failures = 0
         self.elapsed_s = None
+
+    def warn(self, name: str, detail: str = ""):
+        entry = f"  [WARN] {name}"
+        if detail:
+            entry += f"  —  {detail}"
+        self.checks.append(entry)
+        self.warnings.append({"name": name, "detail": detail})
+        eprint(entry)
+
+    def note(self, text: str):
+        self.checks.append(f"  [INFO] {text}")
+        eprint(f"  [INFO] {text}")
 
     def check(self, name: str, passed: bool, detail: str = ""):
         status = "PASS" if passed else "FAIL"
@@ -270,17 +323,18 @@ class ValidationReport:
         passed = total - self.failures
         return (
             f"{passed}/{total} checks passed, "
-            f"{self.failures} failed"
+            f"{self.failures} failed, {len(self.warnings)} warnings"
         )
 
     def to_dict(self) -> dict:
-        """Machine-readable form of the report (validation_report.json, plan F.2.1)."""
+        """Machine-readable form of the report (validation_report.json)."""
         return {
             "passed": self.passed(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "summary": self.summary(),
             "elapsed_s": self.elapsed_s,
             "checks": list(self.records),
+            "warnings": list(self.warnings),
         }
 
     def full_report(self) -> str:
@@ -353,7 +407,7 @@ def check_completeness(report, lake_dir, jsonl_count, expected_count=None):
 
 
 def check_uniqueness(report, lake_dir):
-    """Verify entries.acc has no duplicates.  Returns (total, unique_count).
+    """Verify entries.accession has no duplicates.  Returns (total, unique_count).
 
     Uses DuckDB aggregation instead of materializing 250M accessions into a
     Python set (~2.5 GB heap), which would pressure the GC and starve
@@ -362,17 +416,16 @@ def check_uniqueness(report, lake_dir):
     report.checks.append("\n--- 2. UNIQUENESS ---")
     eprint("\n--- 2. UNIQUENESS ---")
 
-    import duckdb
     entries_path = _table_glob(lake_dir, "entries")
-    row = duckdb.sql(f"""
-        SELECT count(*) AS total, count(DISTINCT acc) AS unique_count
+    row = _duckdb().sql(f"""
+        SELECT count(*) AS total, count(DISTINCT accession) AS unique_count
         FROM read_parquet('{entries_path}')
     """).fetchone()
     total, unique_count = row
     dupes = total - unique_count
 
     report.check(
-        "entries.acc is unique (no duplicates)",
+        "entries.accession is unique (no duplicates)",
         dupes == 0,
         f"total={total:,}, unique={unique_count:,}, dupes={dupes:,}"
     )
@@ -385,21 +438,21 @@ def check_null_keys(report, lake_dir):
     eprint("\n--- 3. NULL KEYS AND EMPTY STRINGS ---")
 
     key_checks = [
-        ("entries",    ["acc", "reviewed", "taxid", "entry_type"]),
-        ("features",   ["acc", "reviewed", "taxid", "type"]),
-        ("xrefs",      ["acc", "reviewed", "taxid", "database", "id"]),
-        ("comments",   ["acc", "reviewed", "taxid", "comment_type"]),
-        ("publications", ["acc", "reviewed", "taxid", "citation_type", "reference_number"]),
-        ("accession_map", ["acc", "primary_acc", "is_primary", "reviewed", "taxid"]),
+        ("entries",    ["accession", "reviewed", "organism_id", "entryType"]),
+        ("features",   ["accession", "reviewed", "organism_id", "type"]),
+        ("xrefs",      ["accession", "reviewed", "organism_id", "database", "id"]),
+        ("comments",   ["accession", "reviewed", "organism_id", "commentType"]),
+        ("publications", ["accession", "reviewed", "organism_id", "citation", "referenceNumber"]),
+        ("accession_map", ["accession", "primary_accession", "is_primary", "reviewed", "organism_id"]),
     ]
 
     # Identity columns that must never be empty strings
     empty_string_checks = [
-        ("entries",    ["acc", "id", "sequence"]),
-        ("features",   ["acc"]),
-        ("xrefs",      ["acc", "id"]),
-        ("comments",   ["acc"]),
-        ("publications", ["acc"]),
+        ("entries",    ["accession", "id"]),
+        ("features",   ["accession"]),
+        ("xrefs",      ["accession", "id"]),
+        ("comments",   ["accession"]),
+        ("publications", ["accession"]),
     ]
 
     for table_name, columns in key_checks:
@@ -439,7 +492,7 @@ def check_null_keys(report, lake_dir):
 
 
 def check_referential_integrity(report, lake_dir, entry_count):
-    """Verify every acc in child tables exists in entries.
+    """Verify every accession in child tables exists in entries.
 
     Uses DuckDB anti-joins instead of Python iteration for scalability
     (the xrefs table can exceed 16B rows at production scale).
@@ -448,24 +501,23 @@ def check_referential_integrity(report, lake_dir, entry_count):
     eprint("\n--- 4. REFERENTIAL INTEGRITY ---")
     eprint(f"  Entries: {entry_count:,} unique accessions")
 
-    import duckdb
     entries_path = _table_glob(lake_dir, "entries")
 
-    for child_name in ["features", "xrefs", "comments", "publications"]:
+    for child_name in CHILD_TABLES:
         child_path = _table_glob(lake_dir, child_name)
         t0 = time.time()
         try:
-            result = duckdb.sql(f"""
-                SELECT DISTINCT c.acc
+            result = _duckdb().sql(f"""
+                SELECT DISTINCT c.accession
                 FROM read_parquet('{child_path}') c
-                LEFT JOIN read_parquet('{entries_path}') e ON c.acc = e.acc
-                WHERE e.acc IS NULL
+                LEFT JOIN read_parquet('{entries_path}') e ON c.accession = e.accession
+                WHERE e.accession IS NULL
                 LIMIT 100
             """).fetchall()
             orphans = [row[0] for row in result]
             elapsed = time.time() - t0
             report.check(
-                f"all {child_name}.acc exist in entries",
+                f"all {child_name}.accession exist in entries",
                 len(orphans) == 0,
                 f"{len(orphans):,}+ orphan accessions ({elapsed:.1f}s)" if orphans else f"({elapsed:.1f}s)"
             )
@@ -473,99 +525,225 @@ def check_referential_integrity(report, lake_dir, entry_count):
                 report.checks.append(f"    orphan examples: {orphans[:5]}")
         except Exception as e:
             report.check(
-                f"all {child_name}.acc exist in entries",
+                f"all {child_name}.accession exist in entries",
                 False,
                 f"DuckDB error: {e}"
             )
 
 
-def _check_sorted(dataset, columns, key_fn):
-    """Streaming sort check for (bool DESC, k2 ASC, k3 ASC) keys.
+class _SortChecker:
+    """Streaming sort check for (bool DESC, k2 ASC, ..., kn ASC) keys, fed
+    one record batch at a time.
 
-    ``columns`` names the three key columns (the first a boolean sorted DESC);
+    ``columns`` names the key columns (the first a boolean sorted DESC);
     ``key_fn(*values) -> tuple`` builds the comparable key used at batch
-    boundaries.  Returns (is_sorted, detail)."""
-    is_sorted = True
-    disorder_detail = ""
-    row_offset = 0
-    prev_last = None
+    boundaries.  ``detail`` is empty until the first row out of order."""
 
-    for batch in dataset.to_batches(columns=list(columns)):
+    def __init__(self, columns, key_fn):
+        self.columns, self.key_fn = list(columns), key_fn
+        self.detail = ""
+        self._row_offset = 0
+        self._prev_last = None
+
+    def feed(self, batch):
         n = batch.num_rows
-        if n == 0:
-            continue
+        if self.detail or n == 0:
+            return
+        cols = [batch.column(c) for c in self.columns]
 
-        flags = batch.column(columns[0])
-        k2 = batch.column(columns[1])
-        k3 = batch.column(columns[2])
-
-        # Check boundary between previous batch and this batch
-        if prev_last is not None:
-            first = (flags[0].as_py(), k2[0].as_py(), k3[0].as_py())
-            if key_fn(*prev_last) > key_fn(*first):
-                is_sorted = False
-                disorder_detail = (
-                    f"disorder at row {row_offset}: "
-                    + ", ".join(f"{c}={a}→{b}" for c, a, b in zip(columns, prev_last, first))
+        # Boundary between the previous batch and this one
+        if self._prev_last is not None:
+            first = tuple(c[0].as_py() for c in cols)
+            if self.key_fn(*self._prev_last) > self.key_fn(*first):
+                self.detail = (
+                    f"disorder at row {self._row_offset}: "
+                    + ", ".join(f"{c}={a}→{b}" for c, a, b in zip(self.columns, self._prev_last, first))
                 )
-                break
+                return
 
-        # Vectorised within-batch check
+        # Vectorised within-batch check: row i+1 is out of order when every
+        # earlier key is equal and this key goes the wrong way.
         if n > 1:
-            f_prev, f_next = flags.slice(0, n - 1), flags.slice(1, n - 1)
-            k2_prev, k2_next = k2.slice(0, n - 1), k2.slice(1, n - 1)
-            k3_prev, k3_next = k3.slice(0, n - 1), k3.slice(1, n - 1)
-
-            f_equal = pc.equal(f_prev, f_next)
-            k2_equal = pc.equal(k2_prev, k2_next)
-
-            f_disorder = pc.and_(pc.invert(f_prev), f_next)          # false → true
-            k2_disorder = pc.and_(f_equal, pc.greater(k2_prev, k2_next))
-            k3_disorder = pc.and_(pc.and_(f_equal, k2_equal), pc.greater(k3_prev, k3_next))
-            any_disorder = pc.or_(pc.or_(f_disorder, k2_disorder), k3_disorder)
+            prev = [c.slice(0, n - 1) for c in cols]
+            nxt = [c.slice(1, n - 1) for c in cols]
+            any_disorder = pc.and_(pc.invert(prev[0]), nxt[0])             # false → true
+            prefix_equal = pc.equal(prev[0], nxt[0])
+            for p, q in zip(prev[1:], nxt[1:]):
+                any_disorder = pc.or_(any_disorder, pc.and_(prefix_equal, pc.greater(p, q)))
+                prefix_equal = pc.and_(prefix_equal, pc.equal(p, q))
 
             if pc.any(any_disorder).as_py():
                 idx = pc.index(any_disorder, True).as_py()
-                is_sorted = False
-                disorder_detail = (
-                    f"disorder at row {row_offset + idx + 1}: "
+                self.detail = (
+                    f"disorder at row {self._row_offset + idx + 1}: "
                     + ", ".join(f"{c}={col[idx].as_py()}→{col[idx + 1].as_py()}"
-                                for c, col in zip(columns, (flags, k2, k3)))
+                                for c, col in zip(self.columns, cols))
                 )
-                break
+                return
 
-        prev_last = (flags[n - 1].as_py(), k2[n - 1].as_py(), k3[n - 1].as_py())
-        row_offset += n
+        self._prev_last = tuple(c[n - 1].as_py() for c in cols)
+        self._row_offset += n
 
-    return is_sorted, disorder_detail
+
+def _check_sorted(dataset, columns, key_fn):
+    """Stream ``dataset`` through a _SortChecker; (is_sorted, detail)."""
+    checker = _SortChecker(columns, key_fn)
+    for batch in dataset.to_batches(columns=list(columns)):
+        checker.feed(batch)
+        if checker.detail:
+            break
+    return not checker.detail, checker.detail
+
+
+# Child table → (array position column, entries count column)
+CHILD_INDEX = {table: (index, count) for table, (_, index, count) in CHILD_TABLES.items()}
 
 
 def check_sort_order(report, lake_dir):
-    """Verify every table is sorted by its declared order: (reviewed DESC,
-    taxid ASC, acc ASC) for the five data tables, (reviewed DESC, acc ASC,
-    primary_acc ASC) for accession_map."""
-    report.checks.append("\n--- 5. SORT ORDER ---")
-    eprint("\n--- 5. SORT ORDER ---")
+    """Verify every table is sorted by its declared order, and that each child
+    table's array positions are exactly 0..n-1 per accession.  Each child
+    table is read once: the same batches feed both checks."""
+    report.checks.append("\n--- 5. SORT ORDER AND ARRAY POSITIONS ---")
+    eprint("\n--- 5. SORT ORDER AND ARRAY POSITIONS ---")
 
-    three_key = lambda r, t, a: (not r, t, a)  # noqa: E731
-    sort_check_tables = [
-        ("entries",       ["reviewed", "taxid", "acc"], three_key),
-        ("features",      ["reviewed", "taxid", "acc"], three_key),
-        ("xrefs",         ["reviewed", "taxid", "acc"], three_key),
-        ("comments",      ["reviewed", "taxid", "acc"], three_key),
-        ("publications",  ["reviewed", "taxid", "acc"], three_key),
-        ("accession_map", ["reviewed", "acc", "primary_acc"], lambda r, a, p: (not r, a, p)),
-    ]
+    orders = {name: order for name, order, _ in TABLE_DEFS}
+    # Every table sorts by reviewed DESC, then ascending columns.
+    assert all(o[0] == "reviewed DESC" and all(c.endswith(" ASC") for c in o[1:])
+               for o in orders.values()), orders
 
-    for table_name, columns, key_fn in sort_check_tables:
-        dataset = open_table(lake_dir, table_name)
-        is_sorted, disorder_detail = _check_sorted(dataset, columns, key_fn)
-        report.check(
-            f"{table_name} sorted by ({columns[0]} DESC, {columns[1]} ASC, {columns[2]} ASC)",
-            is_sorted,
-            disorder_detail
-        )
+    def columns_of(table_name):
+        return [c.split()[0] for c in orders[table_name]]
 
+    def key(reviewed, *rest):
+        return (not reviewed, *rest)
+
+    def label(table_name):
+        return f"{table_name} sorted by ({', '.join(orders[table_name])})"
+
+    is_sorted, detail = _check_sorted(open_table(lake_dir, "entries"), columns_of("entries"), key)
+    report.check(label("entries"), is_sorted, detail)
+
+    entries = open_table(lake_dir, "entries")
+    positions = []
+    for table_name, (idx, count_col) in CHILD_INDEX.items():
+        columns = columns_of(table_name)
+        checker = _SortChecker(columns, key)
+
+        def fed(dataset, checker=checker, columns=columns):
+            for batch in dataset.to_batches(columns=columns):
+                checker.feed(batch)
+                yield batch
+
+        batches = fed(open_table(lake_dir, table_name))
+        ok, detail = _check_array_positions(batches, idx, entries, count_col)
+        for _ in batches:           # positions failed early: finish the sort check
+            if checker.detail:
+                break
+        report.check(label(table_name), not checker.detail, checker.detail)
+        positions.append((f"{table_name}.{idx} is 0..{count_col}-1 for every accession", ok, detail))
+
+    is_sorted, detail = _check_sorted(open_table(lake_dir, "accession_map"),
+                                      columns_of("accession_map"), key)
+    report.check(label("accession_map"), is_sorted, detail)
+    for name, ok, detail in positions:
+        report.check(name, ok, detail)
+
+
+def _index_runs(batches, idx, problem):
+    """Stream a child table's record ``batches`` (holding ``accession`` and ``idx``)
+    in stored order; yield (accession, n) array pairs, one per accession in order
+    (n = its row count).  Stops at the first row whose ``idx`` is not 0 on a
+    new accession or the previous row's + 1, recording it in ``problem``.
+    With indices contiguous from 0, n = last index + 1."""
+    carry = None                                    # (accession, idx) of the last row so far
+    for batch in batches:
+        if batch.num_rows == 0:
+            continue
+        accession, pos = batch.column("accession"), batch.column(idx)
+        n = len(accession)
+        # Row 0 is compared with the carried row; rows 1.. with the row before
+        # (zero-copy slices).
+        continues = carry is not None and accession[0].as_py() == carry[0]
+        first_expected = carry[1] + 1 if continues else 0
+        if pos[0].as_py() != first_expected:
+            problem.append(f"{accession[0].as_py()}: {idx} {pos[0].as_py()} where "
+                           f"{first_expected} was expected")
+            return
+        same = pc.fill_null(pc.equal(accession.slice(1), accession.slice(0, n - 1)), False)
+        expected = pc.if_else(same, pc.add(pos.slice(0, n - 1), 1), 0)
+        bad = pc.fill_null(pc.not_equal(pos.slice(1), expected), True)
+        if pc.any(bad).as_py():
+            i = pc.index(bad, True).as_py()
+            problem.append(f"{accession[i + 1].as_py()}: {idx} {pos[i + 1].as_py()} where "
+                           f"{expected[i].as_py()} was expected")
+            return
+        # Rows followed by a new accession end a run; the batch's last row
+        # may continue into the next batch, so it is carried.
+        ends = pc.indices_nonzero(pc.invert(same))
+        run_acc, run_n = accession.take(ends), pc.add(pos.take(ends), 1)
+        if carry and not continues:
+            run_acc = pa.concat_arrays([pa.array([carry[0]], accession.type), run_acc])
+            run_n = pa.concat_arrays([pa.array([carry[1] + 1], run_n.type), run_n])
+        yield run_acc, run_n
+        carry = (accession[-1].as_py(), pos[-1].as_py())
+    if carry:
+        yield pa.array([carry[0]]), pa.array([carry[1] + 1])
+
+
+def _expected_runs(entries, count_col):
+    """(accession, count) array pairs of every entry with count > 0, in stored order."""
+    for batch in entries.to_batches(columns=["accession", count_col]):
+        keep = pc.greater(batch.column(1), 0)
+        yield batch.column(0).filter(keep), batch.column(1).filter(keep)
+
+
+def _aligned(left, right):
+    """Pair two streams of (accession, n) arrays as equal-length slices; the last
+    pair has None on the side that ran out first (both None when both did)."""
+    left, right = iter(left), iter(right)
+    x = y = None
+    while True:
+        while x is None or len(x[0]) == 0:
+            x = next(left, None)
+            if x is None:
+                break
+        while y is None or len(y[0]) == 0:
+            y = next(right, None)
+            if y is None:
+                break
+        if x is None or y is None:
+            yield x, y
+            return
+        k = min(len(x[0]), len(y[0]))
+        yield (x[0].slice(0, k), x[1].slice(0, k)), (y[0].slice(0, k), y[1].slice(0, k))
+        x, y = (x[0].slice(k), x[1].slice(k)), (y[0].slice(k), y[1].slice(k))
+
+
+def _check_array_positions(child_batches, idx, entries, count_col):
+    """Single streaming pass over a child table's record batches: every
+    accession's ``idx`` runs 0..n-1 in stored order, and the accessions with
+    rows, and their n, are exactly the entries with ``count_col`` > 0, in the
+    same (reviewed, organism_id, accession) order.  Returns (ok, detail)."""
+    problem = []
+    for got, want in _aligned(_index_runs(child_batches, idx, problem),
+                              _expected_runs(entries, count_col)):
+        if problem:
+            return False, problem[0]
+        if got is None and want is None:
+            break
+        if want is None:
+            return False, f"{got[0][0].as_py()}: {got[1][0].as_py()} rows, no entry with {count_col} > 0"
+        if got is None:
+            return False, f"{want[0][0].as_py()}: no rows, {count_col} = {want[1][0].as_py()}"
+        same = pc.and_(pc.equal(got[0], want[0]), pc.equal(pc.cast(got[1], pa.int64()),
+                                                            pc.cast(want[1], pa.int64())))
+        if not pc.all(same).as_py():
+            i = pc.index(same, False).as_py()
+            return False, (f"expected {want[1][i].as_py()} rows for {want[0][i].as_py()} "
+                           f"({count_col}), found {got[1][i].as_py()} rows for {got[0][i].as_py()}")
+    if problem:
+        return False, problem[0]
+    return True, ""
 
 
 def check_round_trip(report, lake_dir, sampled_entries, n):
@@ -582,10 +760,10 @@ def check_round_trip(report, lake_dir, sampled_entries, n):
     # Build lookup from JSONL
     jsonl_lookup = {}
     for entry in sampled:
-        acc = entry.get("primaryAccession")
-        if not acc:
+        accession = entry.get("primaryAccession")
+        if not accession:
             continue
-        taxid = entry.get("organism", {}).get("taxonId")
+        organism_id = entry.get("organism", {}).get("taxonId")
         seq_len = entry.get("sequence", {}).get("length")
         if seq_len is not None:
             seq_len = int(seq_len)
@@ -598,9 +776,9 @@ def check_round_trip(report, lake_dir, sampled_entries, n):
         references = entry.get("references", [])
         reference_count = len(references) if references else 0
 
-        jsonl_lookup[acc] = {
-            "taxid": taxid,
-            "seq_length": seq_len,
+        jsonl_lookup[accession] = {
+            "organism_id": organism_id,
+            "length": seq_len,
             "feature_count": feature_count,
             "xref_count": xref_count,
             "comment_count": comment_count,
@@ -608,21 +786,20 @@ def check_round_trip(report, lake_dir, sampled_entries, n):
         }
 
     # Read matching entries from lake via DuckDB (avoids scanning all 250M rows in Python)
-    import duckdb
     entries_path = _table_glob(lake_dir, "entries")
     acc_list = list(jsonl_lookup.keys())
     lake_lookup = {}
     try:
-        rows = duckdb.sql(f"""
-            SELECT acc, taxid, seq_length, feature_count,
+        rows = _duckdb().sql(f"""
+            SELECT accession, organism_id, length, feature_count,
                    xref_count, comment_count, reference_count
             FROM read_parquet('{entries_path}')
-            WHERE acc IN ({','.join("'" + a.replace("'", "''") + "'" for a in acc_list)})
+            WHERE accession IN ({_sql_in_list(acc_list)})
         """).fetchall()
         for row in rows:
             lake_lookup[row[0]] = {
-                "taxid": row[1],
-                "seq_length": row[2],
+                "organism_id": row[1],
+                "length": row[2],
                 "feature_count": row[3],
                 "xref_count": row[4],
                 "comment_count": row[5],
@@ -641,27 +818,27 @@ def check_round_trip(report, lake_dir, sampled_entries, n):
     if missing:
         report.checks.append(f"    missing examples: {sorted(missing)[:5]}")
 
-    mismatches = {"taxid": 0, "seq_length": 0, "feature_count": 0,
+    mismatches = {"organism_id": 0, "length": 0, "feature_count": 0,
                   "xref_count": 0, "comment_count": 0, "reference_count": 0}
     mismatch_examples = {}
 
-    for acc, expected in jsonl_lookup.items():
-        if acc not in lake_lookup:
+    for accession, expected in jsonl_lookup.items():
+        if accession not in lake_lookup:
             continue
-        actual = lake_lookup[acc]
+        actual = lake_lookup[accession]
         for field in mismatches:
             if expected[field] != actual[field]:
                 mismatches[field] += 1
                 if field not in mismatch_examples:
                     mismatch_examples[field] = (
-                        acc, expected[field], actual[field]
+                        accession, expected[field], actual[field]
                     )
 
     for field, count in mismatches.items():
         detail = ""
         if count > 0 and field in mismatch_examples:
-            acc, exp, act = mismatch_examples[field]
-            detail = f"{count} mismatches, e.g. {acc}: expected={exp}, got={act}"
+            accession, exp, act = mismatch_examples[field]
+            detail = f"{count} mismatches, e.g. {accession}: expected={exp}, got={act}"
         report.check(
             f"round-trip {field} matches JSONL",
             count == 0,
@@ -698,8 +875,9 @@ def check_parquet_integrity(report, lake_dir):
         report.checks.append(f"    CORRUPT: {fpath} — {err}")
 
 
-def check_manifest(report, lake_dir):
-    """Verify manifest.json exists and is consistent with actual files."""
+def check_manifest(report, lake_dir, workers=None):
+    """Verify manifest.json exists and is consistent with actual files.
+    ``workers`` files are hashed at a time (hashlib releases the GIL)."""
     report.checks.append("\n--- 8. MANIFEST CONSISTENCY ---")
     eprint("\n--- 8. MANIFEST CONSISTENCY ---")
 
@@ -731,24 +909,22 @@ def check_manifest(report, lake_dir):
             if manifest_files != actual_files else ""
         )
 
-        # Per-file SHA-256 and size (plan F.2.1): "what we published is what we built".
+        # Per-file size, SHA-256 and MD5: "what we published is what we built".
         details = table_info.get("file_details") or {}
-        bad = []
-        for rel in sorted(manifest_files & actual_files):
+
+        def problem(rel):
             d = details.get(rel)
             path = os.path.join(table_dir, rel)
             if not d:
-                bad.append(f"{rel}: no file_details")
-                continue
+                return f"{rel}: no file_details"
             if os.path.getsize(path) != d.get("size_bytes"):
-                bad.append(f"{rel}: size")
-                continue
-            h = hashlib.sha256()
-            with open(path, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1 << 20), b""):
-                    h.update(chunk)
-            if h.hexdigest() != d.get("sha256"):
-                bad.append(f"{rel}: sha256")
+                return f"{rel}: size"
+            sha, md5 = hash_file(path)
+            wrong = [name for name, got in (("sha256", sha), ("md5", md5)) if got != d.get(name)]
+            return f"{rel}: {', '.join(wrong)}" if wrong else None
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            bad = [p for p in pool.map(problem, sorted(manifest_files & actual_files)) if p]
         n = len(manifest_files & actual_files)
         report.check(f"{table_name}: {n - len(bad)}/{n} file hashes match", not bad, "; ".join(bad[:3]))
 
@@ -762,26 +938,25 @@ def check_denormalized_sync(report, lake_dir):
     report.checks.append("\n--- 9. DENORMALIZED COLUMN SYNC ---")
     eprint("\n--- 9. DENORMALIZED COLUMN SYNC ---")
 
-    import duckdb
     entries_path = _table_glob(lake_dir, "entries")
 
-    for child_name in ["features", "xrefs", "comments", "publications"]:
+    for child_name in CHILD_TABLES:
         child_path = _table_glob(lake_dir, child_name)
         t0 = time.time()
         try:
-            result = duckdb.sql(f"""
+            result = _duckdb().sql(f"""
                 SELECT
-                    count(*) FILTER (WHERE c.taxid != e.taxid) AS taxid_mismatches,
+                    count(*) FILTER (WHERE c.organism_id != e.organism_id) AS taxid_mismatches,
                     count(*) FILTER (WHERE c.reviewed != e.reviewed) AS reviewed_mismatches
                 FROM read_parquet('{child_path}') c
-                JOIN read_parquet('{entries_path}') e ON c.acc = e.acc
+                JOIN read_parquet('{entries_path}') e ON c.accession = e.accession
             """).fetchone()
             taxid_mismatches = result[0]
             reviewed_mismatches = result[1]
             elapsed = time.time() - t0
 
             report.check(
-                f"{child_name}.taxid matches entries.taxid",
+                f"{child_name}.organism_id matches entries.organism_id",
                 taxid_mismatches == 0,
                 f"{taxid_mismatches:,} mismatches ({elapsed:.1f}s)" if taxid_mismatches else f"({elapsed:.1f}s)"
             )
@@ -799,7 +974,7 @@ def check_denormalized_sync(report, lake_dir):
 
 
 def check_sequence_integrity(report, lake_dir):
-    """Verify sequence string length equals seq_length integer."""
+    """Verify the length of sequence.value equals length."""
     report.checks.append("\n--- 10. SEQUENCE INTEGRITY ---")
     eprint("\n--- 10. SEQUENCE INTEGRITY ---")
 
@@ -808,28 +983,28 @@ def check_sequence_integrity(report, lake_dir):
     zero_length = 0
     mismatch_examples = []
 
-    for batch in entries_ds.to_batches(columns=["acc", "sequence", "seq_length"]):
-        seq_lens = batch.column("seq_length")
-        str_lens = pc.utf8_length(batch.column("sequence"))
+    for batch in entries_ds.to_batches(columns=["accession", "sequence", "length"]):
+        seq_lens = batch.column("length")
+        str_lens = pc.utf8_length(pc.struct_field(batch.column("sequence"), "value"))
         is_equal = pc.equal(seq_lens, str_lens)
         n_bad = pc.sum(pc.invert(is_equal)).as_py() or 0
         if n_bad > 0:
             mismatches += n_bad
             if len(mismatch_examples) < 3:
-                accs = batch.column("acc").to_pylist()
+                accs = batch.column("accession").to_pylist()
                 sls = seq_lens.to_pylist()
                 stls = str_lens.to_pylist()
                 for i, eq in enumerate(is_equal.to_pylist()):
                     if not eq and len(mismatch_examples) < 3:
                         mismatch_examples.append(
-                            f"{accs[i]}: seq_length={sls[i]}, "
-                            f"len(sequence)={stls[i]}"
+                            f"{accs[i]}: length={sls[i]}, "
+                            f"len(sequence.value)={stls[i]}"
                         )
 
         zero_length += pc.sum(pc.equal(seq_lens, 0)).as_py() or 0
 
     report.check(
-        "len(sequence) == seq_length for all entries",
+        "len(sequence.value) == length for all entries",
         mismatches == 0,
         f"{mismatches:,} mismatches" if mismatches else ""
     )
@@ -837,9 +1012,9 @@ def check_sequence_integrity(report, lake_dir):
         report.checks.append(f"    {ex}")
 
     report.check(
-        "no entries with seq_length == 0",
+        "no entries with length == 0",
         zero_length == 0,
-        f"{zero_length:,} entries with seq_length=0" if zero_length else ""
+        f"{zero_length:,} entries with length=0" if zero_length else ""
     )
 
 
@@ -853,7 +1028,7 @@ def check_feature_coordinates(report, lake_dir):
     inversion_examples = []
 
     for batch in features_ds.to_batches(
-        columns=["acc", "type", "start_pos", "end_pos"]
+        columns=["accession", "type", "start_pos", "end_pos"]
     ):
         starts = batch.column("start_pos")
         ends = batch.column("end_pos")
@@ -870,7 +1045,7 @@ def check_feature_coordinates(report, lake_dir):
         if n_bad > 0:
             inverted += n_bad
             if len(inversion_examples) < 3:
-                accs = batch.column("acc").to_pylist()
+                accs = batch.column("accession").to_pylist()
                 types = batch.column("type").to_pylist()
                 ss = starts.to_pylist()
                 es = ends.to_pylist()
@@ -891,177 +1066,117 @@ def check_feature_coordinates(report, lake_dir):
 
 
 def check_schema_types(report, lake_dir):
-    """Verify critical columns have expected Arrow types after schema inference."""
-    report.checks.append("\n--- 12. SCHEMA TYPE PROTECTION ---")
-    eprint("\n--- 12. SCHEMA TYPE PROTECTION ---")
+    """Verify every shortcut column has its declared type (COLUMN_TYPES).
+    Source columns are not checked: their type follows the input by design."""
+    report.checks.append("\n--- 12. SHORTCUT COLUMN TYPES ---")
+    eprint("\n--- 12. SHORTCUT COLUMN TYPES ---")
 
-    # Expected types for critical columns (Arrow type string prefixes)
-    # Using startswith() to allow int32/int64 flexibility
-    expected_types = {
-        "entries": {
-            "acc":              "string",
-            "reviewed":         "bool",
-            "taxid":            "int",
-            "seq_length":       "int",
-            "sequence":         "string",
-            "annotation_score": ("double", "float"),
-        },
-        "features": {
-            "acc":              "string",
-            "reviewed":    "bool",
-            "taxid":            "int",
-            "type":             "string",
-            "start_pos":        "int",
-            "end_pos":          "int",
-        },
-        "xrefs": {
-            "acc":              "string",
-            "reviewed":    "bool",
-            "taxid":            "int",
-            "database":         "string",
-            "id":               "string",
-        },
-    }
-
-    for table_name, columns in expected_types.items():
-        dataset = open_table(lake_dir, table_name)
-        schema = dataset.schema
-        for col_name, expected in columns.items():
-            idx = schema.get_field_index(col_name)
-            if idx == -1:
-                report.check(
-                    f"{table_name}.{col_name} exists in schema",
-                    False, "column missing"
-                )
-                continue
-            actual_type = str(schema.field(idx).type)
-            if isinstance(expected, tuple):
-                matches = any(actual_type.startswith(e) for e in expected)
-            else:
-                matches = actual_type.startswith(expected)
-            report.check(
-                f"{table_name}.{col_name} type is {expected}",
-                matches,
-                f"actual={actual_type}" if not matches else ""
-            )
-
-    # ── Every declared column type (plan G.2) ──
-    # COLUMN_TYPES holds the DuckDB type of every column whose source path is
-    # optional; a build that lacked the field must still emit the declared
-    # type, never an int32 from an untyped NULL.
-    import duckdb
+    # COLUMN_TYPES holds the DuckDB type of every shortcut column: whatever
+    # DuckDB inferred, and whether or not a build's input had the source.
     from parquet_transform import COLUMN_TYPES
     by_table = {}
     for (table_name, col_name), expected in COLUMN_TYPES.items():
         by_table.setdefault(table_name, {})[col_name] = expected
     for table_name, columns in sorted(by_table.items()):
         path = _table_glob(lake_dir, table_name)
-        actual = {r[0]: r[1] for r in
-                  duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()}
+        rel = _duckdb().sql(f"SELECT * FROM read_parquet('{path}') LIMIT 0")
+        actual = {c: str(t) for c, t in zip(rel.columns, rel.types)}
         mismatches = [f"{c}: expected {e}, actual {actual.get(c)}"
                       for c, e in columns.items() if actual.get(c) != e]
         report.check(
-            f"{table_name}: {len(columns)} declared column types match",
+            f"{table_name}: {len(columns)} shortcut column types match",
             not mismatches,
             "; ".join(mismatches)
         )
 
 
+def check_curated_coverage(report, lake_dir):
+    """Warn about a shortcut column that holds no value in any row: a
+    source field UniProt renamed or dropped leaves it a typed NULL (or empty
+    list) throughout while its data moves to a new source column, so
+    reconstruction still passes.  Footer statistics only: a column chunk whose null count
+    equals its value count holds nothing (an empty list counts as a null
+    leaf).  A warning, not a failure: a subset may lack a source."""
+    from parquet_transform import TABLE_META
+    report.checks.append("\n--- 20. SHORTCUT COLUMN COVERAGE ---")
+    eprint("\n--- 20. SHORTCUT COLUMN COVERAGE ---")
+
+    for table_name in ALL_TABLES:
+        curated = TABLE_META[table_name]["columns"]["shortcut"]
+        has_value = dict.fromkeys(curated, False)
+        rows = 0
+        for path in _table_files(lake_dir, table_name):
+            meta = pq.read_metadata(path)
+            rows += meta.num_rows
+            for i in range(meta.num_row_groups):
+                group = meta.row_group(i)
+                for j in range(group.num_columns):
+                    chunk = group.column(j)
+                    top = chunk.path_in_schema.split(".")[0]
+                    if has_value.get(top) is False:
+                        stats = chunk.statistics
+                        # No null count recorded: assume the column has values.
+                        if (stats is None or not stats.has_null_count
+                                or stats.null_count < chunk.num_values):
+                            has_value[top] = True
+        if not rows:
+            report.note(f"{table_name}: no rows, coverage not checked")
+            continue
+        empty = [column for column, seen in has_value.items() if not seen]
+        for column in empty:
+            report.warn(f"{table_name}.{column} has no values",
+                        "NULL or empty in every row: is its source field absent or renamed "
+                        "upstream? (the transform log lists absent shortcut sources)")
+        if not empty:
+            report.note(f"{table_name}: every shortcut column has values")
+
+
 def check_field_completeness(report, lake_dir, sampled_entries):
-    """Verify the lake captures every top-level field from the source JSON.
+    """Every source field is a source column.
 
-    Samples one entry from the JSONL and checks that every top-level key is
-    either (a) a column or nested struct field in the entries table, or
-    (b) the source array for a child table (features, xrefs, comments,
-    publications).  Catches silent data loss when UniProt adds a new
-    top-level field that the pipeline's explicit SELECT list doesn't cover.
-
-    Uses a union of keys across a sample (not just one entry) because some
-    fields are rare (e.g. organismHosts only appears on virus entries,
-    geneLocations is uncommon).
+    The transform makes one column per top-level key of each table's JSON
+    element, so every key of a sampled entry, and of its features,
+    cross-references, comments and references, must be a column of its
+    table: one that is not was dropped.  Source columns without a
+    description are listed as warnings: fields UniProt added since this code
+    was written.  Reconstruction (check 16) proves the full round trip.
     """
     report.checks.append("\n--- 13. FIELD COMPLETENESS ---")
     eprint("\n--- 13. FIELD COMPLETENESS ---")
+    from parquet_transform import undescribed_source_columns
 
-    # ── Collect all top-level keys from a sample of source entries ──
-    source_keys = set()
-    # The shared sample (>= 1000 entries) covers rare fields.
-    sampled = sampled_entries
+    sampled = [e for e in sampled_entries if e.get("primaryAccession")]
     if not sampled:
         report.check("field completeness sample non-empty", False, "no entries sampled")
         return
+    columns = {t: _duckdb().sql(f"SELECT * FROM read_parquet('{_table_glob(lake_dir, t)}') "
+                                f"LIMIT 0").columns
+               for t in ("entries", *CHILD_TABLES)}
+    arrays = {array: table for table, (array, _, _) in CHILD_TABLES.items()}
+    missing = set()
     for entry in sampled:
-        source_keys.update(entry.keys())
-    eprint(f"  Source has {len(source_keys)} unique top-level fields: {sorted(source_keys)}")
-
-    # ── Map source fields to where they land in the lake ──
-    # Entries table: columns and nested structs cover most fields.
-    # Child tables: the four array fields are unnested into their own tables.
-    child_array_fields = {
-        "features":                    "features",
-        "uniProtKBCrossReferences":    "xrefs",
-        "comments":                    "comments",
-        "references":                  "publications",
-    }
-
-    # Get entries column names from the Parquet schema
-    entries_ds = open_table(lake_dir, "entries")
-    entries_columns = {field.name for field in entries_ds.schema}
-
-    # Known mappings: source field name → entries column name.
-    # Only needed when the column name differs from the source field name.
-    source_to_entries = {
-        "primaryAccession":   "acc",
-        "uniProtkbId":        "id",
-        "entryType":          "entry_type",
-        "secondaryAccessions": "secondary_accs",
-        "organism":           "organism_residual",
-        "proteinDescription": "protein_desc_residual",
-        "genes":              "genes_full",
-        "keywords":           "keywords_full",
-        "sequence":           "sequence",
-        "proteinExistence":   "protein_existence",
-        "annotationScore":    "annotation_score",
-        "entryAudit":         "first_public",       # split across multiple columns
-        "extraAttributes":    "extra_attributes",
-        "organismHosts":      "organism_hosts",
-        "geneLocations":      "gene_locations",
-    }
-
-    uncaptured = []
-    for key in sorted(source_keys):
-        # Is it a child table array?
-        if key in child_array_fields:
-            continue
-        # Does it map to a known entries column?
-        mapped_col = source_to_entries.get(key)
-        if mapped_col and mapped_col in entries_columns:
-            continue
-        # Is the source field name itself a column? (fallback for future fields
-        # that might be added with matching names)
-        if key in entries_columns:
-            continue
-        uncaptured.append(key)
-
-    if uncaptured:
-        report.check(
-            "all source JSON fields captured in lake",
-            False,
-            f"{len(uncaptured)} uncaptured field(s): {', '.join(uncaptured)}"
-        )
-        for f in uncaptured:
-            report.checks.append(f"    ✗ '{f}' — not in entries columns or child tables")
-    else:
-        report.check(
-            "all source JSON fields captured in lake",
-            True,
-            f"all {len(source_keys)} source fields accounted for"
-        )
+        for key, value in entry.items():
+            if key in arrays:
+                for element in value or []:
+                    missing.update(f"{arrays[key]}.{k}" for k in element
+                                   if k not in columns[arrays[key]])
+            elif key not in columns["entries"]:
+                missing.add(f"entries.{key}")
+    report.check(
+        f"every key of {len(sampled)} sampled entries and their elements is a source column",
+        not missing,
+        f"{len(missing)} missing: {', '.join(sorted(missing)[:10])}" if missing else "",
+    )
+    for table, names in columns.items():
+        new = undescribed_source_columns(table, names)
+        if new:
+            report.warn(f"{table}: new UniProt fields (source columns without a description)",
+                        ", ".join(new))
 
 
-# Comment types whose prose lives in a top-level ``texts`` key (plan G.1).
-# DISEASE and SUBCELLULAR LOCATION keep theirs under ``note.texts`` and are
-# deliberately absent: ``text_value`` is NULL for them by design.
+# Comment types whose prose lives in a top-level ``texts`` key.  DISEASE and
+# SUBCELLULAR LOCATION keep theirs under ``note.texts`` and are deliberately
+# absent: ``text_value`` is NULL for them by design.
 TEXT_COMMENT_TYPES = {
     "FUNCTION", "SUBUNIT", "TISSUE SPECIFICITY", "DOMAIN", "PTM",
     "SIMILARITY", "CAUTION", "MISCELLANEOUS", "ACTIVITY REGULATION",
@@ -1075,63 +1190,71 @@ def check_text_value(report, lake_dir):
     """Text-bearing comment types must have a populated text_value."""
     report.checks.append("\n--- 15. COMMENT TEXT ---")
     eprint("\n--- 15. COMMENT TEXT ---")
-    import duckdb
     path = _table_glob(lake_dir, "comments")
-    rows = duckdb.sql(f"""
-        SELECT comment_type, count(*) AS n, count(text_value) AS with_text
+    rows = _duckdb().sql(f"""
+        SELECT commentType, count(*) AS n, count(text_value) AS with_text,
+               list(DISTINCT accession ORDER BY accession) FILTER (WHERE text_value IS NULL)[:5] AS without
         FROM read_parquet('{path}') GROUP BY 1
     """).fetchall()
-    present = {r[0]: (r[1], r[2]) for r in rows}
+    present = {r[0]: r[1:] for r in rows}
     for ctype in sorted(TEXT_COMMENT_TYPES & set(present)):
-        n, with_text = present[ctype]
-        report.check(f"comments.text_value populated for {ctype}", with_text > 0,
-                     f"{with_text:,}/{n:,} rows have text")
+        n, with_text, without = present[ctype]
+        detail = f"{with_text:,}/{n:,} rows have text"
+        if without:
+            detail += f"; without: {', '.join(without)}"
+        report.check(f"comments.text_value populated for {ctype}", with_text == n, detail)
 
 
 def check_reconstruction(report, lake_dir, sampled_entries, n):
     """g(f(x)) == x on a sample: rebuild sampled entries from the five tables
-    with bin/reconstruct.py and compare with the JSONL (plan A11, the release
-    gate for the residual trim A13)."""
+    with bin/reconstruct.py and compare with the JSONL, array order included."""
     report.checks.append(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
     eprint(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
-    import duckdb
-    from reconstruct import reconstruct_entry, entries_match
+    from reconstruct import reconstruct_entry, entries_match, rows_from_arrow
 
     sampled = _spot_subsample(sampled_entries, n)
     originals = {e["primaryAccession"]: e for e in sampled if e.get("primaryAccession")}
     if not originals:
         report.check("reconstruction sample non-empty", False, "no entries sampled")
         return
-    in_list = ",".join("'" + a.replace("'", "''") + "'" for a in originals)
+    in_list = _sql_in_list(originals)
 
     def fetch(table):
         path = _table_glob(lake_dir, table)
-        tbl = duckdb.sql(f"SELECT * FROM read_parquet('{path}') WHERE acc IN ({in_list})").arrow().read_all()
+        tbl = _duckdb().sql(f"SELECT * FROM read_parquet('{path}') WHERE accession IN ({in_list})").arrow().read_all()
+        # DuckDB hands a JSON column over as plain strings: which columns are
+        # JSON comes from the files' own schema.
+        files = _table_files(lake_dir, table)
+        json_columns = ({f.name for f in pq.read_schema(files[0]) if isinstance(f.type, pa.JsonType)}
+                        if files else set())
         grouped = {}
         # MAP columns come back as dicts (an empty MAP as {}, not []), so
         # reconstruct.py never has to guess a column's type from its values.
-        for row in tbl.to_pylist(maps_as_pydicts="strict"):
-            grouped.setdefault(row["acc"], []).append(row)
+        for row in rows_from_arrow(tbl, json_columns):
+            grouped.setdefault(row["accession"], []).append(row)
         return grouped
 
     t0 = time.time()
-    rows = {t: fetch(t) for t in ("entries", "features", "xrefs", "comments", "publications")}
+    rows = {t: fetch(t) for t in ("entries", *CHILD_TABLES)}
     eprint(f"  Fetched rows for {len(originals)} accessions in {time.time()-t0:.1f}s")
 
     matched, failures = 0, []
-    for acc, orig in originals.items():
-        entry_rows = rows["entries"].get(acc)
+    for accession, orig in originals.items():
+        entry_rows = rows["entries"].get(accession)
         if not entry_rows:
-            failures.append(f"{acc}: not in entries")
+            failures.append(f"{accession}: not in entries")
             continue
-        rebuilt = reconstruct_entry(entry_rows[0], rows["features"].get(acc, []),
-                                    rows["xrefs"].get(acc, []), rows["comments"].get(acc, []),
-                                    rows["publications"].get(acc, []))
-        ok, diff = entries_match(rebuilt, orig)
+        try:
+            rebuilt = reconstruct_entry(entry_rows[0], rows["features"].get(accession, []),
+                                        rows["xrefs"].get(accession, []), rows["comments"].get(accession, []),
+                                        rows["publications"].get(accession, []))
+            ok, diff = entries_match(rebuilt, orig)
+        except Exception as e:      # a rebuild error is a failed entry, not a lost report
+            ok, diff = False, f"rebuild raised {type(e).__name__}: {e}"
         if ok:
             matched += 1
         else:
-            failures.append(f"{acc}: {diff}")
+            failures.append(f"{accession}: {diff}")
     report.check(
         f"reconstruction matches JSONL for {matched}/{len(originals)} sampled entries",
         not failures,
@@ -1140,45 +1263,49 @@ def check_reconstruction(report, lake_dir, sampled_entries, n):
 
 
 def check_accession_map(report, lake_dir):
-    """The six assertions of plan §5.5 on accession_map (sort order is
-    covered by check_sort_order)."""
+    """accession_map: primary rows == entries, secondary rows == sum of
+    secondaryAccessions lengths, no duplicate (accession, primary_accession), every primary_accession exists,
+    (reviewed, organism_id) match entries (sort order is covered by check_sort_order)."""
     report.checks.append("\n--- 18. ACCESSION MAP ---")
     eprint("\n--- 18. ACCESSION MAP ---")
-    import duckdb
     amap = _table_glob(lake_dir, "accession_map")
     entries = _table_glob(lake_dir, "entries")
 
-    n_primary, n_secondary, n_dup = duckdb.sql(f"""
+    n_primary, n_secondary, n_dup = _duckdb().sql(f"""
         SELECT count(*) FILTER (WHERE is_primary), count(*) FILTER (WHERE NOT is_primary),
-               count(*) - count(DISTINCT (acc, primary_acc))
+               count(*) - count(DISTINCT (accession, primary_accession))
         FROM read_parquet('{amap}')
     """).fetchone()
-    n_entries, n_secs = duckdb.sql(f"""
-        SELECT count(*), coalesce(sum(len(secondary_accs)), 0) FROM read_parquet('{entries}')
+    # secondaryAccessions is a source column: absent when no entry has one.
+    has_secondaries = "secondaryAccessions" in _duckdb().sql(
+        f"SELECT * FROM read_parquet('{entries}') LIMIT 0").columns
+    secondaries = "coalesce(sum(len(secondaryAccessions)), 0)" if has_secondaries else "0"
+    n_entries, n_secs = _duckdb().sql(f"""
+        SELECT count(*), {secondaries} FROM read_parquet('{entries}')
     """).fetchone()
     report.check("accession_map primary rows == entries rows", n_primary == n_entries,
                  f"{n_primary:,} vs {n_entries:,}")
-    report.check("accession_map secondary rows == sum(len(entries.secondary_accs))",
+    report.check("accession_map secondary rows == sum(len(entries.secondaryAccessions))",
                  n_secondary == n_secs, f"{n_secondary:,} vs {n_secs:,}")
-    report.check("accession_map has no duplicate (acc, primary_acc)", n_dup == 0, f"{n_dup:,} duplicates")
+    report.check("accession_map has no duplicate (accession, primary_accession)", n_dup == 0, f"{n_dup:,} duplicates")
 
-    orphans = duckdb.sql(f"""
+    orphans = _duckdb().sql(f"""
         SELECT count(*) FROM read_parquet('{amap}') m
-        ANTI JOIN read_parquet('{entries}') e ON m.primary_acc = e.acc
+        ANTI JOIN read_parquet('{entries}') e ON m.primary_accession = e.accession
     """).fetchone()[0]
-    report.check("every accession_map.primary_acc exists in entries", orphans == 0, f"{orphans:,} orphans")
+    report.check("every accession_map.primary_accession exists in entries", orphans == 0, f"{orphans:,} orphans")
 
-    mism = duckdb.sql(f"""
-        SELECT count(*) FILTER (WHERE m.reviewed != e.reviewed OR m.taxid != e.taxid)
-        FROM read_parquet('{amap}') m JOIN read_parquet('{entries}') e ON m.acc = e.acc
+    mism = _duckdb().sql(f"""
+        SELECT count(*) FILTER (WHERE m.reviewed != e.reviewed OR m.organism_id != e.organism_id)
+        FROM read_parquet('{amap}') m JOIN read_parquet('{entries}') e ON m.accession = e.accession
         WHERE m.is_primary
     """).fetchone()[0]
-    report.check("accession_map (reviewed, taxid) match entries for primary rows", mism == 0,
+    report.check("accession_map (reviewed, organism_id) match entries for primary rows", mism == 0,
                  f"{mism:,} mismatches")
 
 
 def check_partitions(report, lake_dir):
-    """Hive partitions agree with the stored column they mirror (plan D.3).
+    """Hive partitions agree with the stored column they mirror.
     Uses stats_min_value / stats_max_value: DuckDB's stats_min / stats_max are
     the legacy Parquet fields, which PyArrow omits for string columns.
     every row group under review_status=swissprot has reviewed min = max =
@@ -1187,7 +1314,6 @@ def check_partitions(report, lake_dir):
     files in the manifest's file list."""
     report.checks.append("\n--- 19. PARTITIONS ---")
     eprint("\n--- 19. PARTITIONS ---")
-    import duckdb
     with open(os.path.join(lake_dir, "manifest.json")) as f:
         manifest = json.load(f)
     expected_flag = {"swissprot": "true", "trembl": "false"}
@@ -1202,7 +1328,7 @@ def check_partitions(report, lake_dir):
         side_total = 0
         for side in key["values"]:
             path = os.path.join(lake_dir, table_name, f"{key['name']}={side}", "*.parquet")
-            bad, rows = duckdb.sql(f"""
+            bad, rows = _duckdb().sql(f"""
                 SELECT count(*) FILTER (WHERE lower(stats_min_value) != '{expected_flag[side]}'
                                            OR lower(stats_max_value) != '{expected_flag[side]}'),
                        coalesce(sum(row_group_num_rows), 0)
@@ -1219,74 +1345,106 @@ def check_partitions(report, lake_dir):
         report.check(f"{table_name}: swissprot files precede trembl files", sides == sorted(sides), str(sides[:4]))
 
 
-def check_schema_evolution(report, lake_dir, baseline_path):
-    """
-    Detect upstream UniProtKB JSON schema changes by comparing inferred Parquet
-    schema against a committed baseline.  Reports missing columns (ERROR) and
-    new columns (WARNING) to alert on schema drift.
-    """
-    report.checks.append("\n--- 14. SCHEMA EVOLUTION GUARD ---")
-    eprint("\n--- 14. SCHEMA EVOLUTION GUARD ---")
+def _arrow_type_paths(t: str, prefix: str = "") -> set[str]:
+    """Dotted field paths inside an Arrow type string (manifest "type"), list
+    items adding no segment and MAP values sitting under ``*``.
 
-    if not os.path.exists(baseline_path):
-        report.check(
-            "schema baseline file exists",
-            False,
-            f"baseline not found at {baseline_path}"
-        )
+    Arrow does not quote field names in a type string, so a key containing
+    ", " or an unbalanced bracket is misread.  The previous release's
+    manifest holds only these strings; the diff is informational."""
+    from parquet_transform import _split_top
+    t = t.strip()
+    if t.startswith("struct<") and t.endswith(">"):
+        paths = set()
+        for part in _split_top(t[len("struct<"):-1]):
+            name, _, sub = part.partition(": ")
+            path = f"{prefix}.{name}" if prefix else name
+            paths |= {path} | _arrow_type_paths(sub, path)
+        return paths
+    if t.split("<", 1)[0] in ("list", "large_list") and t.endswith(">"):
+        return _arrow_type_paths(t[t.index("<") + 1:-1].partition(": ")[2], prefix)
+    if t.startswith("map<") and t.endswith(">"):
+        return _arrow_type_paths(_split_top(t[len("map<"):-1])[-1], f"{prefix}.*" if prefix else "*")
+    return set()
+
+
+def _type_change(before: str, after: str) -> str:
+    """Readable summary of a column type change: the nested fields added and
+    removed, or the two types when only a leaf type changed."""
+    old, new = _arrow_type_paths(before), _arrow_type_paths(after)
+    # Only the topmost changed path: a removed struct implies its fields.
+    top = lambda ps: sorted(p for p in ps if not any(p.startswith(q + ".") for q in ps))  # noqa: E731
+    added, removed = top(new - old), top(old - new)
+    if added or removed:
+        return "; ".join(p for p in (f"fields added: {', '.join(added)}" if added else "",
+                                     f"fields removed: {', '.join(removed)}" if removed else "") if p)
+    short = lambda t: t if len(t) <= 80 else t[:77] + "..."  # noqa: E731
+    return f"{short(before)} → {short(after)}"
+
+
+def check_schema_diff(report, lake_dir, previous_manifest_path):
+    """Informational: how this build's schema differs from the previous release.
+
+    Source columns follow the input, so one added, removed or retyped is
+    expected whenever UniProt changes its JSON; it is reported, never
+    failed.  A change to a shortcut column (TABLE_META "shortcut") is a
+    contract change and is tagged SHORTCUT; if schema_version did not change
+    with it, or with a table added or removed, that is flagged too.  Without
+    a previous manifest there is nothing to compare.
+    """
+    report.checks.append("\n--- 14. SCHEMA DIFF VS PREVIOUS RELEASE (informational) ---")
+    eprint("\n--- 14. SCHEMA DIFF VS PREVIOUS RELEASE (informational) ---")
+    if not previous_manifest_path:
+        report.note("no --previous-manifest given; schema diff skipped")
         return
+    from parquet_transform import TABLE_META
 
-    # Load baseline schema
     try:
-        with open(baseline_path) as f:
-            baseline = json.load(f)
-    except Exception as e:
-        report.check(
-            "schema baseline file is valid JSON",
-            False,
-            f"error reading {baseline_path}: {e}"
-        )
+        with open(previous_manifest_path) as f:
+            previous = json.load(f)
+        with open(os.path.join(lake_dir, "manifest.json")) as f:
+            current = json.load(f)
+    except (OSError, ValueError) as e:
+        report.warn("schema diff skipped: cannot read a manifest", str(e))
         return
+    report.note(f"previous: release {previous.get('release')}, schema_version "
+                f"{previous.get('schema_version')}; this build: release {current.get('release')}, "
+                f"schema_version {current.get('schema_version')}")
 
-    report.check("schema baseline file exists", True)
+    prev_tables, cur_tables = previous.get("tables", {}), current.get("tables", {})
 
-    # Compare each table's columns
-    for table_name in ALL_TABLES:
-        if table_name not in baseline:
-            eprint(f"  warning: {table_name} not in baseline, skipping")
-            continue
-
-        baseline_cols = set(baseline[table_name])
-        dataset = open_table(lake_dir, table_name)
-        schema = dataset.schema
-        actual_cols = {field.name for field in schema}
-
-        missing_cols = baseline_cols - actual_cols
-        new_cols = actual_cols - baseline_cols
-
-        # Missing columns are ERRORS (upstream field dropped or renamed)
-        if missing_cols:
-            missing_detail = ", ".join(sorted(missing_cols)[:5])
-            report.check(
-                f"{table_name}: no missing columns",
-                False,
-                f"{len(missing_cols)} expected but not found: {missing_detail}"
-            )
-        else:
-            report.check(
-                f"{table_name}: no missing columns",
-                True
-            )
-
-        # New columns are WARNINGS (upstream added new field)
-        if new_cols:
-            report.checks.append(
-                f"  [WARN] NEW in {table_name}: {sorted(new_cols)}"
-            )
-            new_detail = ", ".join(sorted(new_cols)[:5])
-            report.checks.append(
-                f"  [{len(new_cols)} new column(s): {new_detail}]"
-            )
+    def curated(table):
+        # A shortcut now or in the previous release: a removed shortcut is no
+        # longer in TABLE_META, only in the previous manifest.
+        return (set(TABLE_META.get(table, {}).get("columns", {}).get("shortcut", []))
+                | set(prev_tables.get(table, {}).get("column_categories", {}).get("shortcut", [])))
+    curated_changed, any_diff = False, False
+    for table in sorted(set(prev_tables) - set(cur_tables)):
+        report.warn(f"table removed: {table}")
+        curated_changed = any_diff = True
+    for table in sorted(set(cur_tables) - set(prev_tables)):
+        report.warn(f"table added: {table}")
+        curated_changed = any_diff = True
+    for table in sorted(set(prev_tables) & set(cur_tables)):
+        curated_columns = curated(table)
+        before = {c["name"]: c["type"] for c in prev_tables[table].get("columns", [])}
+        after = {c["name"]: c["type"] for c in cur_tables[table].get("columns", [])}
+        changes = ([(c, "removed", f"was {before[c]}") for c in sorted(set(before) - set(after))]
+                   + [(c, "added", after[c]) for c in sorted(set(after) - set(before))]
+                   + [(c, "retyped", _type_change(before[c], after[c]))
+                      for c in sorted(set(before) & set(after)) if before[c] != after[c]])
+        for column, what, detail in changes:
+            is_curated = column in curated_columns
+            tag = "SHORTCUT column" if is_curated else "column"
+            curated_changed |= is_curated
+            any_diff = True
+            report.warn(f"{table}: {tag} {what}: {column}", detail)
+    if not any_diff:
+        report.note("no table or column differences")
+    if previous.get("schema_version") == current.get("schema_version"):
+        if curated_changed:
+            report.warn("shortcut schema changed but schema_version did not",
+                        f"both {current.get('schema_version')}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────
@@ -1308,16 +1466,26 @@ def main():
         help="Number of entries to spot-check against JSONL (default: 1000)",
     )
     parser.add_argument(
-        "--schema-baseline", default=None,
-        help="Path to schema baseline JSON (enables schema evolution check)",
+        "--previous-manifest", default=None,
+        help="manifest.json of the previous release: report schema differences "
+             "(informational, never fails)",
     )
     parser.add_argument(
         "--expected-count", type=int, default=None,
         help="Entry count recorded upstream of the sort (STREAM_JSONL's "
              "entry_count.txt); both the JSONL and the entries table must match it",
     )
+    parser.add_argument("--memory-limit", default="16GB", help="DuckDB memory limit")
+    parser.add_argument("--threads", type=int, default=None,
+                        help="DuckDB threads, and files hashed at a time (default: all cores)")
+    parser.add_argument(
+        "--temp-dir", default=None,
+        help="DuckDB spill directory. Defaults to $TMPDIR or /tmp/duckdb_temp.",
+    )
     parser.add_argument("-o", "--output", default="validation_report.txt")
     args = parser.parse_args()
+    _DUCKDB["settings"] = (args.memory_limit, args.threads, args.temp_dir)
+    _DUCKDB["con"] = init_duckdb(*_DUCKDB["settings"])
 
     t_start = time.time()
     eprint("=" * 70)
@@ -1325,6 +1493,7 @@ def main():
     eprint("=" * 70)
 
     report = ValidationReport()
+    report.note(f"DuckDB: memory_limit {args.memory_limit}, threads {args.threads or 'all'}")
 
     # ── 1. Count JSONL lines + sample entries (ground truth, one pass) ──
     # A single decompression pass serves both the line count and every check
@@ -1346,18 +1515,18 @@ def main():
     check_sort_order(report, args.lake)
     check_round_trip(report, args.lake, sampled_entries, args.spot_check_n)
     check_parquet_integrity(report, args.lake)
-    check_manifest(report, args.lake)
+    check_manifest(report, args.lake, args.threads)
     check_denormalized_sync(report, args.lake)
     check_sequence_integrity(report, args.lake)
     check_feature_coordinates(report, args.lake)
     check_schema_types(report, args.lake)
+    check_curated_coverage(report, args.lake)
     check_field_completeness(report, args.lake, sampled_entries)
+    check_schema_diff(report, args.lake, args.previous_manifest)
     check_text_value(report, args.lake)
     check_reconstruction(report, args.lake, sampled_entries, args.spot_check_n)
     check_accession_map(report, args.lake)
     check_partitions(report, args.lake)
-    if args.schema_baseline:
-        check_schema_evolution(report, args.lake, args.schema_baseline)
 
     # ── Write report ──
     elapsed = time.time() - t_start

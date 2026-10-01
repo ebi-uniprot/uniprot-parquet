@@ -2,7 +2,7 @@
 
 The client is deliberately a self-contained single file, so it embeds copies
 of the view and macro SQL instead of loading setup_views.sql at runtime
-(AUDIT.md Q-L10).  These tests assert the two definitions stay semantically
+(so a copied uniprot_parquet.py works alone).  These tests assert the two definitions stay semantically
 identical: same view statements, same macro names, same macro bodies —
 compared token-wise, so formatting and comments may differ freely.
 """
