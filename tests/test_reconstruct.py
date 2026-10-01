@@ -42,6 +42,18 @@ def test_array_order_is_compared():
     assert not ok and diff.startswith("$.a[0]")
 
 
+def test_numbers_compare_by_value_but_bools_are_not_numbers():
+    """A field mixing integers and decimals is stored as DOUBLE, so 5 and 5.0
+    are equal (README: the normalisations); True is never 1, at any depth."""
+    assert entries_match({"x": 5.0}, {"x": 5})[0]
+    assert entries_match({"x": [{"y": 2.0}]}, {"x": [{"y": 2}]})[0]
+    for a, b in (({"x": True}, {"x": 1}), ({"x": 0}, {"x": False}),
+                 ({"x": [{"y": 1.0}]}, {"x": [{"y": True}]})):
+        ok, diff = entries_match(a, b)
+        assert not ok and diff.startswith("$.x"), (a, b, diff)
+    assert entries_match({"x": True}, {"x": True})[0]
+
+
 def test_empty_child_array_matches_absent():
     """An empty child-table array and an absent one are both zero child rows,
     so they compare equal; other empty arrays, and non-empty ones, do not."""

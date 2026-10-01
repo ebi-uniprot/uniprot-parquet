@@ -24,6 +24,10 @@ costs a Python call per key (~40% of this step's time).
   - If --expected-count is provided, the output count must match exactly.
   - If --count-file is provided, the final count is written to that file
     so the caller can verify end-to-end (e.g. against zstd output lines).
+  - If --source and --input-manifest are provided, the source file's name,
+    size and SHA-256 (hashed in a thread while the stream is read), the
+    entry count and --expected-count go to that JSON sidecar, which
+    provenance.json records: the release names the dump it was built from.
 
 Usage (standalone):
     pigz -dc input.json.gz | python3 stream_jsonl.py | zstd -3 -T0 -o output.jsonl.zst
@@ -35,8 +39,12 @@ Usage (with sidecar count file for post-hoc verification):
     pigz -dc input.json.gz | python3 stream_jsonl.py --count-file entry_count.txt | ...
 """
 
+import hashlib
+import json
+import os
 import re
 import sys
+import threading
 import time
 import argparse
 from decimal import Decimal
@@ -122,6 +130,30 @@ class _SurrogateGuard:
         return chunk
 
 
+def _sha256_in_thread(path: str):
+    """Start hashing ``path`` in a thread (hashlib releases the GIL on large
+    buffers, so it runs beside the parse); the returned function joins it
+    and gives the hex digest."""
+    result = {}
+
+    def run():
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8 << 20), b""):
+                h.update(chunk)
+        result["sha256"] = h.hexdigest()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+    def finish() -> str:
+        thread.join()
+        if "sha256" not in result:
+            raise RuntimeError(f"hashing {path} failed")
+        return result["sha256"]
+    return finish
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Streaming UniProtKB JSON → JSONL converter"
@@ -136,7 +168,20 @@ def main():
         help="Write the final entry count to this file (one integer). "
              "Enables post-hoc verification by the caller.",
     )
+    parser.add_argument(
+        "--source", default=None,
+        help="The file the stream on stdin was decompressed from (the UniProtKB dump): "
+             "named, sized and hashed into --input-manifest.",
+    )
+    parser.add_argument(
+        "--input-manifest", default=None,
+        help="Write a JSON sidecar identifying --source (filename, size_bytes, sha256) "
+             "with entry_count and expected_count.",
+    )
     args = parser.parse_args()
+    if bool(args.source) != bool(args.input_manifest):
+        parser.error("--source and --input-manifest go together")
+    source_sha256 = _sha256_in_thread(args.source) if args.source else None
 
     count = 0
     t0 = time.time()
@@ -183,6 +228,17 @@ def main():
             f.write(str(count))
         print(f"  stream_jsonl: wrote count ({count:,}) to {args.count_file}",
               file=sys.stderr)
+
+    if args.input_manifest:
+        source = {"filename": os.path.basename(args.source),
+                  "size_bytes": os.path.getsize(args.source),
+                  "sha256": source_sha256(),
+                  "entry_count": count,
+                  "expected_count": args.expected_count}
+        with open(args.input_manifest, "w") as f:
+            json.dump(source, f, indent=2)
+        print(f"  stream_jsonl: source {source['filename']} sha256 {source['sha256']} "
+              f"→ {args.input_manifest}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -769,3 +769,72 @@ def test_duckdb_out_of_memory_exits_75(small_lake, tmp_path):
                             "--memory-limit", "50MB", "--threads", "2")
     assert result.returncode == 75, result.stderr[-2000:]
     assert "DuckDB ran out of memory" in result.stderr
+
+
+def test_key_value_directory_above_the_lake(small_lake, tmp_path):
+    """A `k=v` directory above the lake is not a column: DuckDB's Hive
+    auto-detection must not add one to the validator's reads."""
+    lake = tmp_path / "rel=2026_01" / "lake"
+    shutil.copytree(small_lake["lake_dir"], lake)
+    report_path = str(tmp_path / "report.txt")
+    result = _run_validator(str(lake), small_lake["jsonl"], report_path)
+    assert result.returncode == 0, [n for n, c in _checks(report_path).items() if not c["passed"]]
+
+
+def test_check_15_on_many_non_text_comments(tmp_path):
+    """Check 15 only aggregates text-bearing comment types and fetches
+    examples for failing types only, so 2M structured comments (text_value
+    NULL by design) fit in 256 MB."""
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    import validate_lake
+    from duckdb_util import init_duckdb
+    comments = tmp_path / "lake" / "comments"
+    comments.mkdir(parents=True)
+    con = init_duckdb("1GB", 2, str(tmp_path))
+    con.sql(f"""COPY (SELECT printf('A%08d', i) AS accession,
+                            CASE WHEN i % 1000 = 0 THEN 'FUNCTION' ELSE 'INTERACTION' END AS commentType,
+                            CASE WHEN i % 1000 = 0 AND i > 0 THEN 'text' END AS text_value
+                     FROM range(2000000) t(i))
+                TO '{comments}/comments_00001.parquet' (FORMAT PARQUET)""")
+    saved = dict(validate_lake._DUCKDB)
+    validate_lake._DUCKDB.update(con=init_duckdb("256MB", 2, str(tmp_path)))
+    try:
+        report = validate_lake.ValidationReport()
+        validate_lake.check_text_value(report, str(tmp_path / "lake"))
+    finally:
+        validate_lake._DUCKDB.update(saved)
+    [record] = report.records
+    assert record["name"] == "comments.text_value populated for FUNCTION"
+    assert record["passed"] is False and "A00000000" in record["detail"]
+
+
+def test_git_info_clean_with_pipeline_outputs(tmp_path):
+    """The default outputs of run_lake.sh and nextflow inside the checkout
+    are git-ignored, so a clean checkout's provenance records dirty: false;
+    an untracked new script still counts as dirty."""
+    import shutil as sh
+    from conftest import PROJECT_ROOT
+    repo = tmp_path / "repo"
+    (repo / "bin").mkdir(parents=True)
+    sh.copy(os.path.join(PROJECT_ROOT, ".gitignore"), repo)
+    sh.copy(os.path.join(BIN_DIR, "release_manifest.py"), repo / "bin")
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "x"], cwd=repo, env=env, check=True)
+    for output in ("datalake/small/provenance.json", "datalake/reports/trace.txt",
+                   "results/uniprot_parquet/2026_03/SCHEMA.md", "work/ab/cdef/.command.sh",
+                   ".nextflow/history", ".nextflow.log", ".nextflow.log.1",
+                   "demo/lake/2026_03/provenance.json", "demo/work/x"):
+        (repo / output).parent.mkdir(parents=True, exist_ok=True)
+        (repo / output).write_text("x")
+
+    def dirty():
+        code = ("import sys; sys.path[:0] = [sys.argv[1], sys.argv[2]]; "
+                "from release_manifest import git_info; print(git_info()['dirty'])")
+        return subprocess.check_output([sys.executable, "-c", code, str(repo / "bin"),
+                                        os.path.abspath(BIN_DIR)], text=True).strip()
+    assert dirty() == "False", subprocess.check_output(["git", "status", "--short"], cwd=repo, text=True)
+    (repo / "bin" / "new_script.py").write_text("x")
+    assert dirty() == "True"

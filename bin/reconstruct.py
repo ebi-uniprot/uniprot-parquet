@@ -147,10 +147,37 @@ def reconstruct_entry(entry_row, feature_rows=(), xref_rows=(), comment_rows=(),
     return normalize_value(out)
 
 
+class _Bool:
+    """A JSON boolean for comparison: Python's True == 1, a JSON true is not a 1."""
+    __slots__ = ("value",)
+
+    def __init__(self, value: bool):
+        self.value = value
+
+    def __eq__(self, other):
+        return isinstance(other, _Bool) and other.value == self.value
+
+    def __repr__(self):
+        return repr(self.value)
+
+
+def _strict_bools(val):
+    """``val`` with every bool wrapped in _Bool, so it never equals a number."""
+    if isinstance(val, bool):
+        return _Bool(val)
+    if isinstance(val, dict):
+        return {k: _strict_bools(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_strict_bools(v) for v in val]
+    return val
+
+
 def entries_match(reconstructed, original):
-    """(bool, first differing path) for a reconstructed vs original entry."""
-    a = drop_empty_child_arrays(normalize_value(reconstructed))
-    b = drop_empty_child_arrays(normalize_value(original))
+    """(bool, first differing path) for a reconstructed vs original entry.
+    Numbers compare by value (5 == 5.0: a field mixing integers and decimals
+    is stored as DOUBLE); a boolean equals only the same boolean."""
+    a = _strict_bools(drop_empty_child_arrays(normalize_value(reconstructed)))
+    b = _strict_bools(drop_empty_child_arrays(normalize_value(original)))
     if a == b:
         return True, None
     return False, first_diff(a, b)

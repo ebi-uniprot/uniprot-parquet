@@ -275,3 +275,18 @@ def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir, tmp_path):
                   for _, d in attempts]
         assert [(e, m) for (e, _), m in zip(attempts, limits)] == [("75", "1920MB"), ("0", "3840MB")]
     assert (launch_dir / "out" / "oom" / "RELEASE_COMPLETE").exists()
+
+
+def test_provenance_identifies_the_source_dump(launch_dir):
+    """provenance.json names the dump the release was built from (its
+    SHA-256), the tool versions and the run parameters."""
+    import hashlib
+    with open(launch_dir / "out" / "prev" / "provenance.json") as f:
+        provenance = json.load(f)
+    with open(SMALL_JSON_GZ, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    assert provenance["inputs"]["source"]["sha256"] == digest
+    assert provenance["inputs"]["source"]["entry_count"] == 52
+    assert provenance["tools"]["nextflow"] and provenance["tools"]["duckdb"]
+    assert provenance["params"]["release"] == "prev"
+    assert provenance["params"]["process_memory"] == "4 GB"

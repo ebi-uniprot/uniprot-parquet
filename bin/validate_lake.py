@@ -188,7 +188,13 @@ def _table_files(lake_dir, table_name):
 
 def _table_glob(lake_dir, table_name):
     """DuckDB glob for a table: `**` crosses the partition directories (the
-    form the README recommends, so the validator reads what users read)."""
+    form the README recommends, so the validator reads what users read).
+
+    Every read_parquet over it passes ``hive_partitioning = false``: the
+    stored `reviewed` column is authoritative (check 19 reads the partition
+    directories itself), and DuckDB's auto-detection would otherwise add a
+    column for any `key=value` directory above the lake, such as a
+    release directory named `rel=2026_01`."""
     return os.path.join(lake_dir, table_name, "**", "*.parquet")
 
 
@@ -477,7 +483,7 @@ def check_uniqueness(report, lake_dir):
     entries_path = _table_glob(lake_dir, "entries")
     row = _duckdb().sql(f"""
         SELECT count(*) AS total, count(DISTINCT accession) AS unique_count
-        FROM read_parquet('{entries_path}')
+        FROM read_parquet('{entries_path}', hive_partitioning = false)
     """).fetchone()
     total, unique_count = row
     dupes = total - unique_count
@@ -533,7 +539,7 @@ def check_null_keys(report, lake_dir, jsonl_unclassified=None):
 
     from parquet_transform import ENTRY_TYPES
     entry_types = [v for (v,) in _duckdb().sql(
-        f"SELECT DISTINCT entryType FROM read_parquet('{_table_glob(lake_dir, 'entries')}')").fetchall()]
+        f"SELECT DISTINCT entryType FROM read_parquet('{_table_glob(lake_dir, 'entries')}', hive_partitioning = false)").fetchall()]
     unknown = sorted((v for v in entry_types if v not in ENTRY_TYPES), key=str)
     report.check("entries.entryType values are known", not unknown,
                  f"unknown: {unknown}" if unknown else "")
@@ -579,8 +585,8 @@ def check_referential_integrity(report, lake_dir, entry_count):
         try:
             result = _duckdb().sql(f"""
                 SELECT DISTINCT c.accession
-                FROM read_parquet('{child_path}') c
-                LEFT JOIN read_parquet('{entries_path}') e ON c.accession = e.accession
+                FROM read_parquet('{child_path}', hive_partitioning = false) c
+                LEFT JOIN read_parquet('{entries_path}', hive_partitioning = false) e ON c.accession = e.accession
                 WHERE e.accession IS NULL
                 LIMIT 100
             """).fetchall()
@@ -866,7 +872,7 @@ def check_round_trip(report, lake_dir, sampled_entries, n, n_reviewed=None):
         rows = _duckdb().sql(f"""
             SELECT accession, organism_id, length, feature_count,
                    xref_count, comment_count, reference_count
-            FROM read_parquet('{entries_path}')
+            FROM read_parquet('{entries_path}', hive_partitioning = false)
             WHERE accession IN ({_sql_in_list(acc_list)})
         """).fetchall()
         for row in rows:
@@ -1023,8 +1029,8 @@ def check_denormalized_sync(report, lake_dir):
                 SELECT
                     count(*) FILTER (WHERE c.organism_id != e.organism_id) AS taxid_mismatches,
                     count(*) FILTER (WHERE c.reviewed != e.reviewed) AS reviewed_mismatches
-                FROM read_parquet('{child_path}') c
-                JOIN read_parquet('{entries_path}') e ON c.accession = e.accession
+                FROM read_parquet('{child_path}', hive_partitioning = false) c
+                JOIN read_parquet('{entries_path}', hive_partitioning = false) e ON c.accession = e.accession
             """).fetchone()
             taxid_mismatches = result[0]
             reviewed_mismatches = result[1]
@@ -1156,7 +1162,7 @@ def check_schema_types(report, lake_dir):
         by_table.setdefault(table_name, {})[col_name] = expected
     for table_name, columns in sorted(by_table.items()):
         path = _table_glob(lake_dir, table_name)
-        rel = _duckdb().sql(f"SELECT * FROM read_parquet('{path}') LIMIT 0")
+        rel = _duckdb().sql(f"SELECT * FROM read_parquet('{path}', hive_partitioning = false) LIMIT 0")
         actual = {c: str(t) for c, t in zip(rel.columns, rel.types)}
         mismatches = [f"{c}: expected {e}, actual {actual.get(c)}"
                       for c, e in columns.items() if actual.get(c) != e]
@@ -1239,7 +1245,7 @@ def check_field_completeness(report, lake_dir, sampled_entries):
     if not sampled:
         report.check("field completeness sample non-empty", False, "no entries sampled")
         return
-    columns = {t: _duckdb().sql(f"SELECT * FROM read_parquet('{_table_glob(lake_dir, t)}') "
+    columns = {t: _duckdb().sql(f"SELECT * FROM read_parquet('{_table_glob(lake_dir, t)}', hive_partitioning = false) "
                                 f"LIMIT 0").columns
                for t in ("entries", *CHILD_TABLES)}
     arrays = {array: table for table, (array, _, _) in CHILD_TABLES.items()}
@@ -1278,20 +1284,28 @@ TEXT_COMMENT_TYPES = {
 
 
 def check_text_value(report, lake_dir):
-    """Text-bearing comment types must have a populated text_value."""
+    """Text-bearing comment types must have a populated text_value.
+
+    Only TEXT_COMMENT_TYPES are aggregated: in every other type text_value
+    is NULL by design, so all of their (billions of) rows would match.  The
+    example accessions come from a second, LIMITed query run only for a
+    failing type: a per-type list(DISTINCT ...) does not spill."""
     report.checks.append("\n--- 15. COMMENT TEXT ---")
     eprint("\n--- 15. COMMENT TEXT ---")
     path = _table_glob(lake_dir, "comments")
+    source = f"read_parquet('{path}', hive_partitioning = false)"
     rows = _duckdb().sql(f"""
-        SELECT commentType, count(*) AS n, count(text_value) AS with_text,
-               list(DISTINCT accession ORDER BY accession) FILTER (WHERE text_value IS NULL)[:5] AS without
-        FROM read_parquet('{path}') GROUP BY 1
+        SELECT commentType, count(*) AS n, count(text_value) AS with_text
+        FROM {source} WHERE commentType IN ({_sql_in_list(sorted(TEXT_COMMENT_TYPES))})
+        GROUP BY 1
     """).fetchall()
-    present = {r[0]: r[1:] for r in rows}
-    for ctype in sorted(TEXT_COMMENT_TYPES & set(present)):
-        n, with_text, without = present[ctype]
+    for ctype, n, with_text in sorted(rows):
         detail = f"{with_text:,}/{n:,} rows have text"
-        if without:
+        if with_text != n:
+            without = [a for (a,) in _duckdb().execute(f"""
+                SELECT DISTINCT accession FROM {source}
+                WHERE commentType = ? AND text_value IS NULL ORDER BY accession LIMIT 5
+            """, [ctype]).fetchall()]
             detail += f"; without: {', '.join(without)}"
         report.check(f"comments.text_value populated for {ctype}", with_text == n, detail)
 
@@ -1312,7 +1326,7 @@ def fetch_sample_rows(lake_dir, accessions):
 
     def fetch(table, key):
         path = _table_glob(lake_dir, table)
-        tbl = _duckdb().sql(f"SELECT * FROM read_parquet('{path}') WHERE {key} IN ({in_list})").arrow().read_all()
+        tbl = _duckdb().sql(f"SELECT * FROM read_parquet('{path}', hive_partitioning = false) WHERE {key} IN ({in_list})").arrow().read_all()
         # DuckDB hands a JSON column over as plain strings: which columns are
         # JSON comes from the files' own schema.
         files = _table_files(lake_dir, table)
@@ -1421,14 +1435,14 @@ def check_accession_map(report, lake_dir):
     n_primary, n_secondary, n_dup = _duckdb().sql(f"""
         SELECT count(*) FILTER (WHERE is_primary), count(*) FILTER (WHERE NOT is_primary),
                count(*) - count(DISTINCT (accession, primary_accession))
-        FROM read_parquet('{amap}')
+        FROM read_parquet('{amap}', hive_partitioning = false)
     """).fetchone()
     # secondaryAccessions is a source column: absent when no entry has one.
     has_secondaries = "secondaryAccessions" in _duckdb().sql(
-        f"SELECT * FROM read_parquet('{entries}') LIMIT 0").columns
+        f"SELECT * FROM read_parquet('{entries}', hive_partitioning = false) LIMIT 0").columns
     secondaries = "coalesce(sum(len(secondaryAccessions)), 0)" if has_secondaries else "0"
     n_entries, n_secs = _duckdb().sql(f"""
-        SELECT count(*), {secondaries} FROM read_parquet('{entries}')
+        SELECT count(*), {secondaries} FROM read_parquet('{entries}', hive_partitioning = false)
     """).fetchone()
     report.check("accession_map primary rows == entries rows", n_primary == n_entries,
                  f"{n_primary:,} vs {n_entries:,}")
@@ -1437,8 +1451,8 @@ def check_accession_map(report, lake_dir):
     report.check("accession_map has no duplicate (accession, primary_accession)", n_dup == 0, f"{n_dup:,} duplicates")
 
     orphans = _duckdb().sql(f"""
-        SELECT count(*) FROM read_parquet('{amap}') m
-        ANTI JOIN read_parquet('{entries}') e ON m.primary_accession = e.accession
+        SELECT count(*) FROM read_parquet('{amap}', hive_partitioning = false) m
+        ANTI JOIN read_parquet('{entries}', hive_partitioning = false) e ON m.primary_accession = e.accession
     """).fetchone()[0]
     report.check("every accession_map.primary_accession exists in entries", orphans == 0, f"{orphans:,} orphans")
 
@@ -1447,9 +1461,9 @@ def check_accession_map(report, lake_dir):
     # secondaryAccessions, in both directions.
     if has_secondaries:
         extra, lost = _duckdb().sql(f"""
-            WITH m AS (SELECT accession, primary_accession FROM read_parquet('{amap}') WHERE NOT is_primary),
+            WITH m AS (SELECT accession, primary_accession FROM read_parquet('{amap}', hive_partitioning = false) WHERE NOT is_primary),
                  e AS (SELECT unnest(secondaryAccessions) AS accession, accession AS primary_accession
-                       FROM read_parquet('{entries}'))
+                       FROM read_parquet('{entries}', hive_partitioning = false))
             SELECT (SELECT count(*) FROM (SELECT * FROM m EXCEPT ALL SELECT * FROM e)),
                    (SELECT count(*) FROM (SELECT * FROM e EXCEPT ALL SELECT * FROM m))
         """).fetchone()
@@ -1462,7 +1476,7 @@ def check_accession_map(report, lake_dir):
 
     n_self = _duckdb().sql(f"""
         SELECT count(*) FILTER (WHERE is_primary AND accession IS DISTINCT FROM primary_accession)
-        FROM read_parquet('{amap}')
+        FROM read_parquet('{amap}', hive_partitioning = false)
     """).fetchone()[0]
     report.check("accession_map primary rows have accession == primary_accession", n_self == 0,
                  f"{n_self:,} rows" if n_self else "")
@@ -1470,7 +1484,7 @@ def check_accession_map(report, lake_dir):
     mism = _duckdb().sql(f"""
         SELECT count(*) FILTER (WHERE m.reviewed IS DISTINCT FROM e.reviewed
                                    OR m.organism_id IS DISTINCT FROM e.organism_id)
-        FROM read_parquet('{amap}') m JOIN read_parquet('{entries}') e ON m.primary_accession = e.accession
+        FROM read_parquet('{amap}', hive_partitioning = false) m JOIN read_parquet('{entries}', hive_partitioning = false) e ON m.primary_accession = e.accession
     """).fetchone()[0]
     report.check("accession_map (reviewed, organism_id) match the entry of primary_accession", mism == 0,
                  f"{mism:,} mismatches")

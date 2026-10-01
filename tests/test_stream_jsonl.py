@@ -29,6 +29,27 @@ def test_streams_every_entry_and_writes_count_file(tmp_path):
     assert count_file.read_text() == "52"
 
 
+def test_input_manifest_identifies_the_source_file(tmp_path):
+    """--source names the file the stream was decompressed from: its name,
+    size and SHA-256 (hashed while the stream is read) go to the
+    --input-manifest sidecar, with the counts."""
+    import hashlib
+    manifest = tmp_path / "input_manifest.json"
+    with gzip.open(SMALL_JSON_GZ, "rb") as f:
+        raw = f.read()
+    result = subprocess.run(
+        [sys.executable, os.path.join(BIN_DIR, "stream_jsonl.py"), "--expected-count", "52",
+         "--source", SMALL_JSON_GZ, "--input-manifest", str(manifest)],
+        input=raw, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    with open(SMALL_JSON_GZ, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    assert json.loads(manifest.read_text()) == {
+        "filename": "small.json.gz", "size_bytes": os.path.getsize(SMALL_JSON_GZ),
+        "sha256": digest, "entry_count": 52, "expected_count": 52}
+
+
 def test_interrupt_is_fatal_and_leaves_no_count_file(tmp_path, monkeypatch, capsys):
     """SIGINT mid-stream must not fall through to the success path: no DONE,
     no count file, non-zero exit — otherwise the caller's post-hoc line-count

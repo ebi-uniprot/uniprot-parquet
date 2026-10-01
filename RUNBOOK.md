@@ -410,7 +410,8 @@ repeat stage 4 here with `./run_lake.sh subset --outdir /scratch/$USER/uplake_su
 
 ```bash
 # 1. The commit Part A passed on, with a clean tree: provenance.json records the commit and a dirty flag.
-git status --short                      # empty
+git status --short                      # empty (datalake/, results/, work/, .nextflow* are git-ignored;
+                                        # any other untracked file, such as a new bin/ script, counts as dirty)
 git rev-parse HEAD                      # write this down
 
 # 2. Expected entry count for the release you are building
@@ -543,6 +544,9 @@ grep -E "VERDICT|expected count" $OUT/validation_report.txt
 # 2. Provenance: the commit you wrote down, and NOT dirty
 python -c "import json; p=json.load(open('$OUT/provenance.json')); print(p['pipeline'], p['release'])"
 #   {'commit': '<the hash you wrote down>', 'dirty': False}
+#   and the dump it was built from, which should match the file you downloaded:
+python -c "import json; p=json.load(open('$OUT/provenance.json')); print(p['inputs']['source'], p['tools'])"
+sha256sum /path/to/uniprot.json.gz      # == inputs.source.sha256
 
 # 3. Whole-lake checksums (slow on the full lake — run it as a job, ~30–60 min)
 (cd $OUT/lake && sha256sum -c --quiet SHA256SUMS.txt && echo CHECKSUMS_OK)

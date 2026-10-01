@@ -1021,12 +1021,12 @@ class TestOptionalPathGuards:
 
     def _build_all(self, entries, tmp_path):
         from parquet_transform import (check_curated_sources, check_required_paths,
-                                       discover_json_paths, inferred_types)
+                                       discover_json_paths, empty_child_arrays, inferred_types)
         con, read_clause, paths = self._stage(entries, tmp_path)
         check_required_paths(paths)
         types = inferred_types(con, read_clause)
         json_paths = discover_json_paths(types)
-        check_curated_sources(types)
+        check_curated_sources(types, empty_child_arrays(con, read_clause, types))
         from parquet_transform import _as_json_columns, json_source_columns
         return {name: _as_json_columns(
                     con.sql(build(paths, json_paths).format(read_clause=read_clause)).arrow().read_all(),
@@ -1121,6 +1121,25 @@ class TestUpstreamShapeChanges:
     @staticmethod
     def _build(entries, tmp_path):
         return TestOptionalPathGuards()._build_all(entries, tmp_path)
+
+    @pytest.mark.parametrize("table", ["features", "xrefs", "comments", "publications"])
+    def test_child_array_empty_in_every_entry(self, table, tmp_path):
+        """An array present but empty in every entry is inferred with no
+        element fields: it is treated like an absent one (a zero-row table
+        with the keys every element carries), not refused as "not a
+        UniProtKB dump"."""
+        from parquet_transform import CHILD_TABLES, _EMPTY_CHILD_KEYS, TABLE_META
+        array, _, count = CHILD_TABLES[table]
+        entries = _small_entries()
+        for e in entries:
+            e[array] = []
+        tables = self._build(entries, tmp_path)
+        assert tables[table].num_rows == 0
+        shortcuts = set(TABLE_META[table]["columns"]["shortcut"])
+        assert [c for c in tables[table].column_names if c not in shortcuts] == list(_EMPTY_CHILD_KEYS[array])
+        assert set(tables["entries"].column(count).to_pylist()) == {0}
+        failures = _reconstruction_failures(entries, _rows_from_tables(tables))
+        assert not failures, failures[:3]
 
     def test_entry_without_extra_attributes_stays_null(self, tmp_path):
         """Not an all-NULL struct (which reconstructs as extraAttributes: {})."""
@@ -1724,3 +1743,34 @@ class TestAbsentCuratedSources:
         returncode, text = _validation_report(renamed["lake"], renamed["jsonl"], renamed["out"])
         assert returncode == 0, text
         assert "[WARN] features.ligand_id has no values" in text
+
+
+def test_files_roll_over_inside_a_batch(small_jsonl, tmp_path):
+    """A batch is written in row-group slices and the file size checked
+    after each, so a file is at most one row group over target however large
+    the batch, and the target decides the file count."""
+    import pyarrow.parquet as pq
+    from conftest import table_files
+
+    def build(target):
+        lake = str(tmp_path / f"lake_{target}")
+        result = run_bin("parquet_transform.py", small_jsonl, "--outdir", lake, "--memory-limit", "3GB",
+                         "--batch-size", "4000", "--row-group-size", "250",
+                         "--target-file-bytes", str(target), "--only", "entries")
+        assert result.returncode == 0, result.stderr[-2000:]
+        return table_files(lake, "entries")
+
+    counts = {}
+    for target in (256_000, 512_000):
+        files = build(target)
+        counts[target] = len(files)
+        assert len(files) > 2, files            # more than one file per partition
+        for path in files:
+            # The writer rolls over after the row group that reaches the
+            # target, so every row group but the last starts below it.
+            meta = pq.ParquetFile(path).metadata
+            last = meta.row_group(meta.num_row_groups - 1)
+            start = min(c.dictionary_page_offset or c.data_page_offset
+                        for c in (last.column(j) for j in range(meta.num_columns)))
+            assert start < target, (path, start)
+    assert counts[256_000] > counts[512_000], counts

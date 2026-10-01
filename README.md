@@ -48,7 +48,7 @@ A field is read where UniProt puts it: a ligand's ChEBI id is `features.ligand.i
 
 ### 3. Lossless, including order
 
-`bin/reconstruct.py` rebuilds the original JSON entry from the six tables: an entries row's source columns are the entry, each child row's source columns an element of its array, placed by its position (`feature_index`, `xref_index`, `comment_index`, `reference_index`). Shortcut columns are never read. The comparison is exact, with three normalisations: JSON object key order is ignored, a key whose value is `null` is treated the same as an absent key, and an empty `features`, `uniProtKBCrossReferences`, `comments` or `references` array is treated the same as an absent one (both are stored as zero child rows; UniProt omits empty arrays).
+`bin/reconstruct.py` rebuilds the original JSON entry from the six tables: an entries row's source columns are the entry, each child row's source columns an element of its array, placed by its position (`feature_index`, `xref_index`, `comment_index`, `reference_index`). Shortcut columns are never read. The comparison is exact, with four normalisations: JSON object key order is ignored; a key whose value is `null` is treated the same as an absent key; an empty `features`, `uniProtKBCrossReferences`, `comments` or `references` array is treated the same as an absent one (both are stored as zero child rows; UniProt omits empty arrays); and numbers compare by value, so `5` equals `5.0` (a field holding integers in some entries and decimals in others is stored as DOUBLE). A boolean equals only the same boolean, never `1` or `0`.
 
 - The test suite rebuilds every fixture entry, including a fixture with new keys injected at every nesting level and a key whose type conflicts between entries.
 - The validator rebuilds a sample of 1,000 Swiss-Prot and 1,000 TrEMBL entries of every release (check 16) and fails the release on any difference, and checks that every key of the sample is a column (check 13).
@@ -347,8 +347,9 @@ A release is complete when `RELEASE_COMPLETE` exists next to `lake/`; mirrors sh
   sorted.jsonl.zst          the source data as sorted JSON lines
   SCHEMA.md                 this release's schema: every column, type, source path, description
   validation_report.txt     the validator's report (also as validation_report.json)
-  provenance.json           input checksums, git commit, row counts, size and SHA-256 of
-                            every file above (published beside lake/)
+  provenance.json           the source dump (name, size, SHA-256, counts), git commit, tool
+                            versions, run parameters, row counts, and the size and SHA-256
+                            of every file above (published beside lake/)
   RELEASE_COMPLETE          written last, only if validation passed and the published
                             copy matches its checksums (bin/verify_release.py)
 ```
@@ -559,7 +560,6 @@ Both suites check row counts, schemas and schema tiers, partitions, sort order a
 - `lineage_taxids`, for filtering by clade.
 - Function and subcellular-location text columns on `entries`.
 - Sequence-hash verification (`sequence.md5`, `sequence.crc64`) in the validator.
-- Tool versions in `provenance.json`.
 - A CI version matrix.
 
 ## Contributor notes

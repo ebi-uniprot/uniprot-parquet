@@ -22,8 +22,13 @@ def release(small_lake, tmp_path):
     (rel / "validation_report.txt").write_text("VERDICT: ALL CHECKS PASSED\n")
     (rel / "validation_report.json").write_text('{"passed": true}\n')
     (rel / "SCHEMA.md").write_text("# schema\n")
+    source = tmp_path / "input_manifest.json"
+    source.write_text(json.dumps({"filename": "uniprot.json.gz", "size_bytes": 10, "sha256": "ab" * 32,
+                                  "entry_count": 52, "expected_count": None}))
     result = run_bin("release_manifest.py", "--lake", rel / "lake",
                      "--input-jsonl", rel / "sorted.jsonl.zst", "--release", "2026_01",
+                     "--input-manifest", source, "--nextflow-version", "26.04.0",
+                     "--param", "process_memory=96 GB", "--param", "duckdb_pct=75",
                      "-o", rel / "provenance.json", "--complete-marker", rel / ".RELEASE_COMPLETE.pending",
                      "--published", rel / "sorted.jsonl.zst", rel / "SCHEMA.md",
                      rel / "validation_report.txt", rel / "validation_report.json")
@@ -101,3 +106,17 @@ def test_marker_of_another_lake_fails(release):
     marker.write_text(marker.read_text().replace("sha256sums_sha256: ", "sha256sums_sha256: 0"))
     result = _verify(release)
     assert result.returncode == 1 and "marker" in result.stdout
+
+
+def test_provenance_identifies_source_tools_and_params(release):
+    with open(release / "provenance.json") as f:
+        provenance = json.load(f)
+    assert provenance["inputs"]["source"]["sha256"] == "ab" * 32
+    assert provenance["inputs"]["source"]["filename"] == "uniprot.json.gz"
+    import duckdb
+    import pyarrow
+    tools = provenance["tools"]
+    assert tools["duckdb"] == duckdb.__version__ and tools["pyarrow"] == pyarrow.__version__
+    assert tools["nextflow"] == "26.04.0" and tools["python"].count(".") == 2
+    assert provenance["params"] == {"release": "2026_01", "process_memory": "96 GB", "duckdb_pct": "75"}
+    assert provenance["writer"]["row_group_size"] > 0

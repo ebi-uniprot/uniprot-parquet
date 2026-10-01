@@ -3,7 +3,10 @@
 Generate a release manifest for provenance tracking.
 
 Records everything needed to reproduce and audit a pipeline run:
+  - The source dump: file name, size and SHA-256, entry count and expected
+    count (STREAM_JSONL's input_manifest.json, --input-manifest)
   - Input file checksums (MD5, SHA-256)
+  - Tool versions (Python, DuckDB, PyArrow, Nextflow) and run parameters
   - Size and SHA-256 of every file published beside the lake (--published),
     which bin/verify_release.py checks the published copy against
   - Pipeline version (git commit)
@@ -18,12 +21,15 @@ Usage:
         --input-jsonl uniprot.jsonl.zst \
         --release 2026_01 \
         [--published sorted.jsonl.zst SCHEMA.md validation_report.txt ...] \
+        [--input-manifest input_manifest.json] [--nextflow-version 26.04.0] \
+        [--param process_memory='96 GB' --param duckdb_pct=75 ...] \
         [-o provenance.json]
 """
 
 import os
 import sys
 import json
+import platform
 import argparse
 import subprocess
 from datetime import datetime, timezone
@@ -74,6 +80,16 @@ def main():
         help="Files published beside lake/ in the release directory: their size and "
              "SHA-256 are recorded under \"published\" (by file name)",
     )
+    parser.add_argument(
+        "--input-manifest", default=None,
+        help="STREAM_JSONL's input_manifest.json: the source dump's name, size, SHA-256 "
+             "and counts, recorded under inputs.source",
+    )
+    parser.add_argument("--nextflow-version", default=None, help="Recorded under tools.nextflow")
+    parser.add_argument(
+        "--param", action="append", default=[], metavar="KEY=VALUE",
+        help="A run parameter, recorded under params (repeatable); --release is always recorded",
+    )
     parser.add_argument("-o", "--output", default="provenance.json")
     parser.add_argument(
         "--complete-marker", default=None,
@@ -102,12 +118,28 @@ def main():
             "size_bytes": os.path.getsize(abspath),
         }
 
+    if args.input_manifest:
+        with open(args.input_manifest) as f:
+            manifest["inputs"]["source"] = json.load(f)
+
+    # ── Tools and run parameters ──
+    import duckdb
+    import pyarrow
+    manifest["tools"] = {"python": platform.python_version(), "duckdb": duckdb.__version__,
+                         "pyarrow": pyarrow.__version__, "nextflow": args.nextflow_version}
+    manifest["params"] = {"release": args.release}
+    for item in args.param:
+        key, sep, value = item.partition("=")
+        if not sep:
+            parser.error(f"--param {item!r}: expected KEY=VALUE")
+        manifest["params"][key] = value
+
     # ── Files published beside the lake (verify_release.py checks them) ──
     manifest["published"] = {}
     for path in args.published:
         abspath = os.path.abspath(path)
         name = os.path.basename(abspath)
-        known = next((i for i in manifest["inputs"].values() if i["path"] == name), None)
+        known = next((i for i in manifest["inputs"].values() if i.get("path") == name), None)
         sha256 = known["sha256"] if known else hash_file(abspath)[0]
         manifest["published"][name] = {"size_bytes": os.path.getsize(abspath), "sha256": sha256}
 
@@ -151,6 +183,9 @@ def main():
             tables_info[table_name] = info
 
         manifest["tables"] = tables_info
+        # The writer settings the transform used (also in lake/manifest.json).
+        manifest["writer"] = {k: lake_manifest.get(k) for k in
+                              ("compression", "target_file_bytes", "row_group_size")}
         manifest["total_rows"] = sum(
             t.get("row_count", 0) for t in tables_info.values()
         )

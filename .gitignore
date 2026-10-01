@@ -3,7 +3,11 @@
 .nextflow.log*
 work/
 
-# Pipeline outputs
+# Pipeline outputs: run_lake.sh writes datalake/, a bare nextflow run
+# results/.  Ignored so a clean checkout's provenance.json records
+# dirty: false (an untracked new script still counts as dirty).
+datalake/
+results/
 *.parquet
 *.jsonl
 *.jsonl.zst

@@ -551,6 +551,14 @@ def _children(prefix: str, schema_paths) -> list[str]:
     return sorted(ordered) if isinstance(schema_paths, (set, frozenset)) else ordered
 
 
+def _has_elements(array: str, schema_paths) -> bool:
+    """True if the input has element fields under child array ``array``.  An
+    array that is empty in every entry is inferred with none (JSON[]): it is
+    treated like an absent array, a zero-row child table."""
+    head = array + "."
+    return any(p.startswith(head) for p in schema_paths)
+
+
 def _source_path(table: str, key: str) -> str:
     """Dotted input path of source column ``key`` of ``table``."""
     return _join("" if table == "entries" else CHILD_TABLES[table][0], key)
@@ -561,8 +569,8 @@ def _source_keys(table: str, schema_paths) -> list[str]:
     input's order: the source column names (an entry's four child arrays
     excepted)."""
     prefix = "" if table == "entries" else CHILD_TABLES[table][0]
-    if prefix and prefix not in schema_paths:
-        # No such array in the input: the zero-row table still has the keys
+    if prefix and not _has_elements(prefix, schema_paths):
+        # No such array in the input (or empty in every entry): the zero-row table still has the keys
         # every element carries (the _EMPTY_CHILD_SOURCE shape), so queries
         # and macros naming them bind on any lake.
         return list(_EMPTY_CHILD_KEYS[prefix])
@@ -663,7 +671,7 @@ def check_required_paths(schema_paths: set[str]) -> None:
     """Abort the build if the input lacks a field every UniProtKB entry has."""
     missing = sorted(p for p in REQUIRED_PATHS if p not in schema_paths)
     for parent, paths in REQUIRED_CHILD_PATHS.items():
-        if parent in schema_paths:
+        if _has_elements(parent, schema_paths):
             missing += sorted(p for p in paths if p not in schema_paths)
     if missing:
         raise RuntimeError("Input lacks fields every UniProtKB entry carries "
@@ -709,9 +717,25 @@ def absent_curated_sources(schema_paths) -> list[str]:
                   if ps and not any(p in schema_paths for p in ps))
 
 
-def check_curated_sources(types: dict[str, object]) -> None:
+def empty_child_arrays(con, read_clause: str, types: dict[str, object]) -> set[str]:
+    """Child arrays (features, comments, ...) present in the input but empty
+    in every entry.  DuckDB infers such an array as JSON[], the type it also
+    infers for elements whose types conflict; only the data tells the two
+    apart.  An empty array is a zero-row child table (_has_elements)."""
+    candidates = [a for a in _CHILD_ARRAYS if a in types and not _has_elements(a, types)]
+    if not candidates:
+        return set()
+    counts = con.sql("SELECT " + ", ".join(f"count(*) FILTER (WHERE len({_ident(a)}) > 0)"
+                                           for a in candidates)
+                     + f" FROM {read_clause}").fetchone()
+    return {a for a, n in zip(candidates, counts) if n == 0}
+
+
+def check_curated_sources(types: dict[str, object], empty_arrays=frozenset()) -> None:
     """Abort the build if a field a shortcut column reads has an inferred
-    type (inferred_types) the column cannot hold.
+    type (inferred_types) the column cannot hold.  Sources in a child array
+    that is empty in every entry (``empty_arrays``, from empty_child_arrays)
+    are absent, not conflicting.
 
     * Its type differs between entries: DuckDB infers JSON for the field, for
       an object containing it or for a field inside it.  A shortcut has one
@@ -734,6 +758,8 @@ def check_curated_sources(types: dict[str, object]) -> None:
 
     differs, plain, shape, mapped = [], [], [], []
     for (table, column), path, kind in _curated_sources():
+        if path.split(".")[0] in empty_arrays:
+            continue
         label = f"{table}.{column} ← {path}"
         length_only = (table, column) in _LENGTH_ONLY
         above = next((a for a in ancestors(path) if a in types and _is_json(types[a])), None)
@@ -801,8 +827,9 @@ _EMPTY_CHILD_KEYS: dict[str, tuple[str, ...]] = {
 
 
 def _child_source(field: str, schema_paths: set[str]) -> str:
-    """SQL for a child table's source array: the column, or an empty typed list."""
-    if field in schema_paths:
+    """SQL for a child table's source array: the column, or an empty typed
+    list when the input has no elements in it (_has_elements)."""
+    if _has_elements(field, schema_paths):
         return f'e."{field}"'
     return _EMPTY_CHILD_SOURCE[field]
 
@@ -1455,7 +1482,8 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
     """Stream DuckDB result → Hive-partitioned Parquet files in bounded-memory batches.
 
     DuckDB executes the query lazily and yields Arrow record batches of
-    `batch_size` rows.  Batches are accumulated into files of ~TARGET_FILE_BYTES
+    `batch_size` rows.  Batches are written a row group at a time into files of ~TARGET_FILE_BYTES
+    (a file rolls over after the row group that reaches the target)
     under ``<table_dir>/review_status=<swissprot|trembl>/``:
     rows arrive sorted ``reviewed DESC`` so every ``true`` row precedes every
     ``false`` row, a batch contains at most one flip, and the writer switches
@@ -1543,11 +1571,14 @@ def stream_to_parquet(con, sql, table_dir, batch_size, label="table", sort_order
         pending.append((st["path"], final, os.path.relpath(final, table_dir)))
 
     def write_part(tbl):
-        if st["writer"] is None:
-            open_writer()
-        st["writer"].write_table(tbl, row_group_size=ROW_GROUP_SIZE)
-        if os.path.getsize(st["path"]) >= TARGET_FILE_BYTES:
-            close_writer()
+        # One row group at a time, the size checked after each: a file ends
+        # at most one row group past TARGET_FILE_BYTES, whatever the batch size.
+        for start in range(0, tbl.num_rows, ROW_GROUP_SIZE):
+            if st["writer"] is None:
+                open_writer()
+            st["writer"].write_table(tbl.slice(start, ROW_GROUP_SIZE), row_group_size=ROW_GROUP_SIZE)
+            if os.path.getsize(st["path"]) >= TARGET_FILE_BYTES:
+                close_writer()
 
     remove_tmp_dirs()                  # leftovers of a killed earlier run
     try:
@@ -2117,7 +2148,7 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
 # ─── Main ───────────────────────────────────────────────────────────────
 
 def main():
-    global TARGET_FILE_BYTES, ZSTD_LEVEL
+    global TARGET_FILE_BYTES, ZSTD_LEVEL, ROW_GROUP_SIZE
     parser = argparse.ArgumentParser(
         description="Transform UniProtKB JSONL → sorted Parquet tables "
                     "(entries, features, xrefs, comments, publications, accession_map)"
@@ -2156,6 +2187,10 @@ def main():
         help=f"Roll to a new Parquet file at this size (default {TARGET_FILE_BYTES}).",
     )
     parser.add_argument(
+        "--row-group-size", type=int, default=None,
+        help=f"Rows per Parquet row group (default {ROW_GROUP_SIZE:,}). For benchmarks and tests.",
+    )
+    parser.add_argument(
         "--zstd-level", type=int, default=None,
         help=f"zstd compression level for Parquet pages (default {ZSTD_LEVEL}).",
     )
@@ -2165,6 +2200,8 @@ def main():
         TARGET_FILE_BYTES = args.target_file_bytes
     if args.zstd_level is not None:
         ZSTD_LEVEL = args.zstd_level
+    if args.row_group_size:
+        ROW_GROUP_SIZE = args.row_group_size
     table_defs = TABLE_DEFS
     if args.only:
         wanted = {t.strip() for t in args.only.split(",")}
@@ -2243,7 +2280,7 @@ def main():
             if json_paths:
                 eprint(f"  Fields whose type varies between entries (their source column "
                        f"is stored as JSON): {sorted(json_paths)}")
-            check_curated_sources(types)
+            check_curated_sources(types, empty_child_arrays(con, read_clause, types))
             absent = absent_curated_sources(schema_paths)
             if absent:
                 eprint("  WARNING: shortcut sources absent from input (these columns are "

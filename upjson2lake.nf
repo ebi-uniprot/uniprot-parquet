@@ -186,6 +186,7 @@ process STREAM_JSONL {
     output:
     path "uniprot.jsonl.zst", emit: jsonl
     path "entry_count.txt",   emit: count_file
+    path "input_manifest.json", emit: input_manifest   // the dump's name, size, SHA-256: provenance.json
 
     script:
     def cpus = task.cpus
@@ -197,6 +198,7 @@ process STREAM_JSONL {
 
     ${decompress} \
         | stream_jsonl.py --count-file entry_count.txt ${expected_flag} \
+            --source ${inputfile} --input-manifest input_manifest.json \
         | zstd -3 -T${cpus} -o uniprot.jsonl.zst
 
     # Post-hoc verification: line count of compressed output must match
@@ -412,6 +414,7 @@ process PROVENANCE {
     path lake
     path sorted_jsonl
     path validation_reports   // validation_report.txt and .json; their arrival is the VALIDATE gate
+    path input_manifest       // STREAM_JSONL's record of the source dump
     val bin_code              // bin_digest: the imported bin/ modules
 
     output:
@@ -434,6 +437,10 @@ process PROVENANCE {
         --input-jsonl ${sorted_jsonl} \
         --release ${params.release} \
         --published ${sorted_jsonl} SCHEMA.md ${validation_reports} \
+        --input-manifest ${input_manifest} \
+        --nextflow-version '${workflow.nextflow.version}' \
+        --param 'process_memory=${params.process_memory}' --param 'duckdb_pct=${params.duckdb_pct}' \
+        --param 'max_time=${params.max_time}' --param 'expected_count=${params.expected_count ?: ''}' \
         -o provenance.json \
         --complete-marker RELEASE_COMPLETE
     """
@@ -515,6 +522,7 @@ workflow {
         PARQUET_TRANSFORM.out.lake,
         SORT_JSONL.out.sorted_jsonl,
         VALIDATE.out.report.concat(VALIDATE.out.report_json).collect(),
+        STREAM_JSONL.out.input_manifest,
         bin_digest('PROVENANCE'),
     )
 
