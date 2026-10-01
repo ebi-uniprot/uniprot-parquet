@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import duckdb
 
@@ -275,12 +276,24 @@ def _read_manifest(base: str) -> dict | None:
     return _read_json(base, "manifest.json")
 
 
+# A definite "this copy does not hold the file": HTTP 404, or 403 (what S3
+# answers for a missing object without list permission), or no match.
+_NOT_FOUND = re.compile(r"\b(?:403|404)\b|Not Found|No files found")
+
+
 def _remote_readable(con, url: str) -> bool:
+    """True if ``url`` can be read; False if the server says it is not there.
+    Any other failure (a 5xx, a rate limit, a timeout that outlasted httpfs's
+    retries) raises: taking it as "absent" would build views that silently
+    miss the file's rows."""
     try:
         con.sql(f"SELECT 1 FROM read_parquet('{_q(url)}') LIMIT 0")
         return True
-    except (duckdb.IOException, duckdb.HTTPException, duckdb.Error):
-        return False
+    except duckdb.Error as e:
+        if getattr(e, "status_code", None) in (403, 404) or _NOT_FOUND.search(str(e)):
+            return False
+        raise RuntimeError(f"Could not tell whether {url} is in this copy of the lake "
+                           f"(the request failed: {e}). Retry connect().") from e
 
 
 def _present_files(con, base: str, table: str, rels: list[str]) -> list[str]:
@@ -293,7 +306,9 @@ def _present_files(con, base: str, table: str, rels: list[str]) -> list[str]:
     partition-level mirror, one request per partition); if it is not, every
     other file of that partition is probed individually, so a hosted
     per-organism subset (entries_00017.parquet alone) is still found at the
-    cost of one request per listed file of that partition.
+    cost of one request per listed file of that partition.  Only a definite
+    not-found counts as absent: any other probe failure raises
+    (_remote_readable).
     """
     if not rels:
         return []

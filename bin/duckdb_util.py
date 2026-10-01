@@ -52,13 +52,27 @@ def init_duckdb(memory_limit: str, threads: int | None,
     return con
 
 
+def _is_out_of_memory(e: BaseException) -> bool:
+    """True for a DuckDB out-of-memory error in any of its guises: the typed
+    exception, or, once a query streams through PyArrow's RecordBatchReader
+    (every batch after the first), an OSError or ArrowException carrying
+    DuckDB's message."""
+    if isinstance(e, duckdb.OutOfMemoryException):
+        return True
+    import pyarrow
+    return (isinstance(e, (OSError, pyarrow.ArrowException))
+            and str(e).startswith("Out of Memory Error"))
+
+
 def run_main(main) -> None:
     """Run a script's main(); a DuckDB out-of-memory error, wherever it is
     raised, exits EX_TEMPFAIL with a clear message instead of a traceback
     and exit 1."""
     try:
         main()
-    except duckdb.OutOfMemoryException as e:
+    except Exception as e:
+        if not _is_out_of_memory(e):
+            raise
         print(f"FATAL — DuckDB ran out of memory: {e}\n"
               f"  Exit {EX_TEMPFAIL} (EX_TEMPFAIL): the workflow retries with twice the memory; "
               f"by hand, raise --memory-limit or point --temp-dir at more spill space.",

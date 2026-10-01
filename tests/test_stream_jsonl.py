@@ -77,9 +77,12 @@ def test_interrupt_is_fatal_and_leaves_no_count_file(tmp_path, monkeypatch, caps
 
 def _exact(text):
     """``text`` parsed with nothing lost: objects as (key, value) pair lists
-    (key order and duplicate keys kept), non-integers as exact Decimals."""
+    (key order and duplicate keys kept), numbers tagged with their JSON kind
+    so an integer never equals a decimal of the same value (2 vs 2.0), and
+    non-integers as exact Decimals (1.50 equals 1.5: formatting may change)."""
     from decimal import Decimal
-    return json.loads(text, parse_float=Decimal, object_pairs_hook=list)
+    return json.loads(text, parse_int=lambda s: ("int", int(s)),
+                      parse_float=lambda s: ("num", Decimal(s)), object_pairs_hook=list)
 
 
 def _stream(raw, *args):
@@ -130,6 +133,18 @@ PRESERVED = b"""{"meta": {"n": 2}, "results": [
     "nested": {"x": [1.0, 2.25, 1E-7]}
   }
 ], "tail": true}"""
+
+
+@pytest.mark.parametrize("original, rewritten", [
+    ('{"e": 2}', '{"e": 2.0}'),
+    ('{"c": 100000}', '{"c": 1E+5}'),
+    ('{"d": 0}', '{"d": -0.0}'),
+    ('{"g": [{"k": 1}]}', '{"g": [{"k": 1.0}]}'),
+])
+def test_exact_tells_an_integer_from_a_decimal(original, rewritten):
+    """2 and 2.0 are equal Python numbers but different JSON data: a stream
+    that rewrote integers as decimals must fail the preservation tests."""
+    assert _exact(original) != _exact(rewritten)
 
 
 def test_values_are_preserved_exactly():

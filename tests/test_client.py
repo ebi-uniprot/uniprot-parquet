@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 
+import duckdb
 import pytest
 
 import uniprot_parquet as up
@@ -237,6 +238,38 @@ def test_present_files_remote_probing(monkeypatch):
     # swissprot: first file present → one probe; trembl: first missing → the other three probed
     assert len(probes) == 1 + 4
     assert up._present_files(None, base, "entries", []) == []
+
+
+class _FailingConnection:
+    def __init__(self, error):
+        self.error = error
+
+    def sql(self, query):
+        raise self.error
+
+
+@pytest.mark.parametrize("error", [
+    duckdb.HTTPException('HTTP Error: Unable to connect to URL "https://h/x.parquet": 404 (Not Found).'),
+    duckdb.HTTPException('HTTP Error: Unable to connect to URL "s3://b/x.parquet": 403 (Forbidden).'),
+    duckdb.IOException('IO Error: No files found that match the pattern "https://h/x.parquet"'),
+])
+def test_remote_probe_not_found_means_absent(error):
+    """A definite not-found is a file this copy does not hold (a partial or
+    per-organism copy): left out of the views."""
+    assert up._remote_readable(_FailingConnection(error), "https://h/x.parquet") is False
+
+
+@pytest.mark.parametrize("error", [
+    duckdb.HTTPException('HTTP Error: Unable to connect to URL "https://h/x.parquet": 503 (Service Unavailable).'),
+    duckdb.IOException("IO Error: Could not establish connection error for HTTP HEAD to 'https://h/x.parquet'"),
+    duckdb.HTTPException('HTTP Error: Unable to connect to URL "https://h/x.parquet": 429 (Too Many Requests).'),
+])
+def test_remote_probe_failure_is_not_taken_as_absent(error):
+    """Any other failure (a 5xx, a rate limit, a timeout) says nothing about
+    whether the file exists: connect() stops rather than build views that
+    silently miss the file's rows."""
+    with pytest.raises(RuntimeError, match="https://h/x.parquet"):
+        up._remote_readable(_FailingConnection(error), "https://h/x.parquet")
 
 
 # Shortcuts named like a UniProt REST return field and holding its value,

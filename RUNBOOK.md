@@ -50,7 +50,9 @@ nextflow lint upjson2lake.nf nextflow.config
 
 The `local` executor refuses a task that asks for more memory than the machine
 has (`Process requirement exceeds available memory`). The small and demo stages
-ask for 8 GB; stage 4 asks for what you give it.
+ask for 8 GB; stage 4 asks for what you give it. CPUs need no check: the
+`local` profile caps each process's request (VALIDATE 8, the other heavy
+processes 4) at the machine's CPU count.
 
 ---
 

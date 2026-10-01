@@ -89,7 +89,15 @@ def render(manifest: dict) -> str:
             out.append(f"- Primary key: `{', '.join(info['primary_key'])}`")
         fks = info.get("foreign_keys") or {}
         if fks:
-            out.append("- Foreign keys: " + ", ".join(f"`{k}` → `{v}`" for k, v in fks.items()))
+            # One key per referenced table: (accession, organism_id) together
+            # identify the entry; organism_id alone is not a key.
+            by_target: dict[str, list[tuple[str, str]]] = {}
+            for column, ref in fks.items():
+                ref_table, _, ref_column = ref.partition(".")
+                by_target.setdefault(ref_table, []).append((column, ref_column))
+            out.append("- Foreign keys: " + "; ".join(
+                f"`({', '.join(c for c, _ in pairs)})` → `{t}({', '.join(r for _, r in pairs)})`"
+                for t, pairs in by_target.items()))
         out.append(f"- Sort order: `{', '.join(info.get('sort_order') or [])}`")
         part = info.get("partitioning")
         if part:

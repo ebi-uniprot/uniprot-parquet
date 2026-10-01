@@ -84,3 +84,14 @@ def test_column_sources_are_paths():
             continue
         for path in source.split(" | "):
             assert re.fullmatch(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*", path), (key, source)
+
+
+def test_foreign_keys_are_listed_per_referenced_table():
+    """features' accession and organism_id reference entries together:
+    SCHEMA.md lists them as one composite key, not organism_id on its own."""
+    from gen_schema_md import render
+    manifest = {"release": "r", "version": 1, "tables": {"features": {
+        "row_count": 1, "description": "", "columns": [],
+        "foreign_keys": {"accession": "entries.accession", "organism_id": "entries.organism_id"}}}}
+    assert ("- Foreign keys: `(accession, organism_id)` → `entries(accession, organism_id)`"
+            in render(manifest).splitlines())

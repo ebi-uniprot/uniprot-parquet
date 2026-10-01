@@ -536,6 +536,20 @@ def _typed(table: str, column: str, expr: str, schema_paths: set[str]) -> str:
     return _cast(table, column, expr)
 
 
+def _per_element(table: str, column: str, array: str, array_path: str, element_expr: str,
+                 schema_paths: set[str]) -> str:
+    """SQL for an optional shortcut holding one value per element of
+    ``array`` (``element_expr`` of ``x``): a typed NULL when the array is
+    absent from the input, and one NULL per element when the array is there
+    but none of its elements carries the source field (a subset whose genes
+    have only ORF names), so the list stays aligned with the array."""
+    if COLUMN_SOURCES[(table, column)] in schema_paths:
+        return _cast(table, column, f"list_transform(COALESCE({array}, []), x -> {element_expr})")
+    if array_path in schema_paths:
+        return _cast(table, column, f"list_transform(COALESCE({array}, []), x -> NULL)")
+    return _null(table, column)
+
+
 def _needs_json(prefix: str, json_paths: set[str]) -> bool:
     """True if the subtree at ``prefix`` holds a JSON-typed field."""
     return any(p == prefix or p.startswith(prefix + ".") for p in json_paths)
@@ -927,20 +941,21 @@ def _build_entries_sql(schema_paths, json_paths: set[str]) -> str:
         protein_name_expr = _null("entries", "protein_name_primary")
 
     # Genes and alternative names: absent from some subsets.
-    gene_names_expr = _typed("entries", "gene_primary",
-                             "list_transform(COALESCE(e.genes, []), g -> g.geneName.value)", schema_paths)
+    gene_names_expr = _per_element("entries", "gene_primary", "e.genes", "genes",
+                                   "x.geneName.value", schema_paths)
     gene_synonyms_expr = _typed(
         "entries", "gene_synonym",
         "flatten(list_transform(COALESCE(e.genes, []), g -> list_transform(COALESCE(g.synonyms, []), s -> s.value)))",
         schema_paths)
-    alt_protein_names_expr = _typed(
-        "entries", "alt_protein_names",
-        "list_transform(COALESCE(e.proteinDescription.alternativeNames, []), x -> x.fullName.value)",
-        schema_paths)
+    alt_protein_names_expr = _per_element(
+        "entries", "alt_protein_names", "e.proteinDescription.alternativeNames",
+        "proteinDescription.alternativeNames", "x.fullName.value", schema_paths)
 
     def _keyword_list(field):
-        if not has(f"keywords.{field}"):
+        if not has("keywords"):
             return "[]"
+        if not has(f"keywords.{field}"):        # one NULL per keyword, as in the JSON
+            return "list_transform(COALESCE(e.keywords, []), x -> NULL::VARCHAR)"
         return f"list_transform(COALESCE(e.keywords, []), x -> x.{field})"
 
     # Taxonomic division needs the lineage; without it only the human rule applies.
@@ -2025,6 +2040,22 @@ def _arrow_type_to_frictionless(arrow_type_str: str) -> dict:
     return {"type": "string", "format": "default"}
 
 
+def _frictionless_foreign_keys(foreign_keys: dict[str, str]) -> list[dict]:
+    """Frictionless foreignKeys from {column: "table.column"}: one composite
+    key per referenced table (features' accession and organism_id together
+    reference entries), as uniprot_parquet._join_hint joins them.  Separate
+    single-column keys would declare organism_id alone a key into entries,
+    where it is not unique."""
+    by_target: dict[str, tuple[list[str], list[str]]] = {}
+    for column, ref in foreign_keys.items():
+        ref_table, _, ref_column = ref.partition(".")
+        fields, ref_fields = by_target.setdefault(ref_table, ([], []))
+        fields.append(column)
+        ref_fields.append(ref_column or ref_table)
+    return [{"fields": fields, "reference": {"resource": ref_table, "fields": ref_fields}}
+            for ref_table, (fields, ref_fields) in by_target.items()]
+
+
 def _build_datapackage(manifest: dict, release: str) -> dict:
     """Build a Frictionless Data Package descriptor from a manifest.
 
@@ -2077,16 +2108,8 @@ def _build_datapackage(manifest: dict, release: str) -> dict:
             "schema": {
                 "fields": fields,
                 "primaryKey": meta.get("primary_key", table_info.get("primary_key", [])),
-                "foreignKeys": [
-                    {
-                        "fields": [fk_col],
-                        "reference": {
-                            "resource": ref.split(".")[0],
-                            "fields": [ref.split(".")[1]] if "." in ref else [ref],
-                        },
-                    }
-                    for fk_col, ref in meta.get("foreign_keys", table_info.get("foreign_keys", {})).items()
-                ],
+                "foreignKeys": _frictionless_foreign_keys(
+                    meta.get("foreign_keys", table_info.get("foreign_keys", {}))),
             },
             "rowCount": table_info.get("row_count", 0),
             "bytes": table_info.get("size_bytes"),

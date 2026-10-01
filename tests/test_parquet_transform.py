@@ -13,6 +13,7 @@ import json
 import os
 import re
 
+import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
@@ -387,12 +388,14 @@ class TestDataPackage:
         with open(os.path.join(lake_dir, "datapackage.json")) as f:
             dp = json.load(f)
         resource_map = {r["name"]: r for r in dp["resources"]}
-        # Child tables should have foreign keys to entries
+        # A child row belongs to its entry through (accession, organism_id)
+        # together: one composite key, since organism_id alone is not unique
+        # in entries and a join on it would multiply rows.
         for child in ["features", "xrefs", "comments", "publications"]:
             fks = resource_map[child]["schema"]["foreignKeys"]
-            fk_fields = {fk["fields"][0] for fk in fks}
-            assert "accession" in fk_fields, f"{child} missing accession foreign key"
-            assert "organism_id" in fk_fields, f"{child} missing organism_id foreign key"
+            assert fks == [{"fields": ["accession", "organism_id"],
+                            "reference": {"resource": "entries",
+                                          "fields": ["accession", "organism_id"]}}], (child, fks)
 
     def test_accession_map_fk(self, lake_dir):
         with open(os.path.join(lake_dir, "datapackage.json")) as f:
@@ -903,6 +906,32 @@ def test_duckdb_out_of_memory_exits_75(small_jsonl, tmp_path):
                      "--memory-limit", "50MB", "--threads", "2")
     assert result.returncode == 75, result.stderr[-2000:]
     assert "DuckDB ran out of memory" in result.stderr
+
+
+@pytest.mark.parametrize("error", [
+    OSError("Out of Memory Error: failed to pin block of size 256.0 KiB"),
+    pa.ArrowInvalid("Out of Memory Error: could not allocate block of size 1.0 MiB"),
+])
+def test_out_of_memory_while_streaming_batches_exits_75(error):
+    """Past the first batch, DuckDB's errors reach Python through PyArrow's
+    stream reader as an OSError or ArrowException carrying DuckDB's message,
+    not as duckdb.OutOfMemoryException: an out-of-memory one still exits 75."""
+    from duckdb_util import EX_TEMPFAIL, run_main
+
+    def main():
+        raise error
+    with pytest.raises(SystemExit) as exit_info:
+        run_main(main)
+    assert exit_info.value.code == EX_TEMPFAIL
+
+
+def test_other_stream_errors_are_not_retried():
+    from duckdb_util import run_main
+
+    def main():
+        raise OSError("No space left on device")
+    with pytest.raises(OSError, match="No space left"):
+        run_main(main)
 
 
 def test_unknown_entry_type_is_refused(tmp_path):
@@ -1713,6 +1742,35 @@ class TestDerivedColumnEdgeCases:
         rows = _rows_from_tables(TestUpstreamShapeChanges._build(entries, tmp_path))
         row = rows["entries"][e["primaryAccession"]][0]
         assert row["gene_primary"] == [None, "X"]
+
+    def test_gene_primary_keeps_its_slots_when_no_gene_has_a_name(self, tmp_path):
+        """A subset whose genes carry only ORF or locus names has no
+        genes.geneName path at all: gene_primary still holds one NULL per
+        gene (not a NULL list), and the lake validates."""
+        entries = _small_entries()
+        for e in entries:
+            for g in e.get("genes", []):
+                g.pop("geneName", None)
+                g.pop("synonyms", None)
+                g.setdefault("orfNames", [{"value": "ORF1"}])
+        lake, jsonl = _build_lake(entries, tmp_path, "nogene_2026")
+        rows = _lake_rows(lake)
+        for e in entries:
+            row = rows["entries"][e["primaryAccession"]][0]
+            assert row["gene_primary"] == [None] * len(e.get("genes", [])), e["primaryAccession"]
+        code, text = _validation_report(lake, jsonl, tmp_path)
+        assert code == 0, text
+
+    def test_alt_protein_names_keep_their_slots_when_no_name_has_a_full_name(self, tmp_path):
+        entries = _small_entries()
+        for e in entries:
+            for a in e.get("proteinDescription", {}).get("alternativeNames", []):
+                a.pop("fullName", None)
+                a.setdefault("shortNames", [{"value": "S"}])
+        rows = _rows_from_tables(TestUpstreamShapeChanges._build(entries, tmp_path))
+        for e in entries:
+            n = len(e.get("proteinDescription", {}).get("alternativeNames", []))
+            assert rows["entries"][e["primaryAccession"]][0]["alt_protein_names"] == [None] * n
 
 
 @pytest.fixture(scope="module")
