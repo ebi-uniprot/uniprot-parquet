@@ -51,7 +51,7 @@ A field is read where UniProt puts it: a ligand's ChEBI id is `features.ligand.i
 `bin/reconstruct.py` rebuilds the original JSON entry from the six tables: an entries row's source columns are the entry, each child row's source columns an element of its array, placed by its position (`feature_index`, `xref_index`, `comment_index`, `reference_index`). Shortcut columns are never read. The comparison is exact, with three normalisations: JSON object key order is ignored, a key whose value is `null` is treated the same as an absent key, and an empty `features`, `uniProtKBCrossReferences`, `comments` or `references` array is treated the same as an absent one (both are stored as zero child rows; UniProt omits empty arrays).
 
 - The test suite rebuilds every fixture entry, including a fixture with new keys injected at every nesting level and a key whose type conflicts between entries.
-- The validator rebuilds a 1,000-entry sample of every release (check 16) and fails the release on any difference, and checks that every key of the sample is a column (check 13).
+- The validator rebuilds a sample of 1,000 Swiss-Prot and 1,000 TrEMBL entries of every release (check 16) and fails the release on any difference, and checks that every key of the sample is a column (check 13).
 - `sorted.jsonl.zst`, published next to the lake, is the same data in its original JSON form: each line holds one element of the dump's `results` array with the same keys, in the same order, and exact values (numbers keep their digits). Only the layout changes: one compact line per entry, in UTF-8. `SORT_JSONL` moves these lines without rewriting them, so `VALIDATE` compares the lake with the dump's own data. Input a JSON line cannot carry exactly (a lone surrogate escape, an integer outside −2^63 … 2^64−1) stops `STREAM_JSONL`. One case is not checked: a key repeated within one object keeps only its last value. UniProt's serialiser does not produce repeated keys, and checking every key would add about 40% to the streaming time.
 
 ### 4. Layout
@@ -109,7 +109,7 @@ Shortcut columns (snake_case, declared types) are listed first, then the **sourc
 
 **entries**: one row per protein.
 
-- Shortcuts: `accession`, `id`, `reviewed`, `organism_id`, `organism_name`, `gene_primary` (one element per gene, NULL for a gene with only ORF or locus names), `protein_name_primary` (falls back to the submitted name for TrEMBL entries), `length`, `gene_synonym`, `alt_protein_names`, `ec`, `division` (the UniProt FTP taxonomic division: `archaea`, `bacteria`, `fungi`, `human`, `invertebrates`, `mammals`, `plants`, `rodents`, `vertebrates`, `viruses`, `unclassified`), `go_id`, `go_terms` (`{id, aspect (P/F/C), term, evidence_type}`), `xref_dbs`, `xref_proteomes`, `keywordid`, `keyword`, `keyword_categories`, `date_created`, `date_modified`, `date_sequence_modified` (DATEs), `feature_count`, `xref_count`, `comment_count`, `reference_count`, `lit_pubmed_id` (distinct, stored as strings: numeric ids in numeric order, then any non-numeric id)
+- Shortcuts: `accession`, `id`, `reviewed`, `organism_id`, `organism_name`, `gene_primary` (one element per gene, NULL for a gene with only ORF or locus names), `protein_name_primary` (falls back to the submitted name for TrEMBL entries), `length`, `gene_synonym`, `alt_protein_names`, `ec` (every EC number of the entry's naming blocks and of its domains' and chains' — `includes` and `contains` — as REST's `ec`), `division` (the UniProt FTP taxonomic division: `archaea`, `bacteria`, `fungi`, `human`, `invertebrates`, `mammals`, `plants`, `rodents`, `vertebrates`, `viruses`, `unclassified`), `go_id`, `go_terms` (`{id, aspect (P/F/C), term, evidence_type}`), `xref_dbs`, `xref_proteomes`, `keywordid`, `keyword`, `keyword_categories`, `date_created`, `date_modified`, `date_sequence_modified` (DATEs), `feature_count`, `xref_count`, `comment_count`, `reference_count`, `lit_pubmed_id` (distinct, stored as strings: numeric ids in numeric order, then any non-numeric id)
 - **Source:** `sequence` (`value`, `length`, `molWeight`, `crc64`, `md5`; stored after `length`), `entryType`, `primaryAccession`, `secondaryAccessions`, `uniProtkbId`, `entryAudit` (dates and versions as strings), `annotationScore`, `organism` (`scientificName`, `commonName`, `synonyms`, `taxonId`, `lineage`, `evidences`), `organismHosts`, `proteinExistence`, `proteinDescription` (`recommendedName`, `alternativeNames`, `submissionNames`, `flag`, `contains`, `includes`, ...), `genes`, `geneLocations`, `keywords`, `extraAttributes` (`countByCommentType`, `countByFeatureType`, `uniParcId`)
 
 **features**: one row per positional annotation.
@@ -494,10 +494,10 @@ Approximate time budgets for the full ~250M-entry dataset (not yet measured on a
 
 1. **Completeness:** JSONL line count == entries rows (== the pre-sort count); child row counts == `sum(entries.*_count)`
 2. **Uniqueness:** no duplicate `entries.accession`
-3. **Null keys and empty strings:** `accession`, `reviewed`, `organism_id` never null; identity columns never empty
+3. **Null keys and empty strings:** `accession`, `reviewed`, `organism_id` never null; identity columns never empty; `entryType` holds only the two values the transform knows (the transform also stops on any other)
 4. **Referential integrity:** every child `accession` exists in `entries`
 5. **Sort order and array positions:** every table in its declared order; each child table's `*_index` runs `0..n-1` per accession with `n` equal to the entry's count (one streaming pass per child table, merged with `entries` in their shared sort order)
-6. **Round-trip spot check:** sampled entries' keys and counts match the JSONL
+6. **Round-trip spot check:** sampled entries' keys and counts match the JSONL. The sample behind checks 6, 13, 16 and 21 is stratified: 1,000 Swiss-Prot and 1,000 TrEMBL entries (`--spot-check-n`, `--spot-check-n-reviewed`), drawn in the one pass that counts the JSONL, since a uniform sample would hold about 2 Swiss-Prot entries. Each report line gives the count per stratum
 7. **Parquet integrity:** every file is readable
 8. **Manifest:** file list, sizes and SHA-256 match disk
 9. **Denormalized sync:** child `organism_id` / `reviewed` match `entries`
@@ -507,11 +507,12 @@ Approximate time budgets for the full ~250M-entry dataset (not yet measured on a
 13. **Field completeness:** every key of a sampled entry, and of its features, cross-references, comments and references, is a column of its table; source columns without a description (keys UniProt added) are listed as warnings. Deeper fields are covered by check 16
 14. **Schema diff (informational):** tables and columns added, removed or retyped since `--previous_manifest`
 15. **Comment text:** every text-bearing comment type has a `text_value`
-16. **Reconstruction:** a 1,000-entry sample rebuilt by `bin/reconstruct.py` equals the JSONL, array order included; an entry whose rebuild raises an error counts as a mismatch
+16. **Reconstruction:** the 1,000 + 1,000 sample rebuilt by `bin/reconstruct.py` equals the JSONL, array order included; an entry whose rebuild raises an error counts as a mismatch
 17. *(reserved for bloom filters; see open decisions)*
-18. **Accession map:** primaries == entries, secondaries == `sum(len(secondaryAccessions))`, no duplicates, no orphans, `(reviewed, organism_id)` match
+18. **Accession map:** primaries == entries, secondaries == `sum(len(secondaryAccessions))`, no duplicates, no orphans; the secondary rows are exactly the `(secondary, entry)` pairs of `entries.secondaryAccessions`, primary rows map to themselves, and every row's `(reviewed, organism_id)` is its entry's
 19. **Partitions:** directories agree with the stored `reviewed`; per-partition counts match the manifest; Swiss-Prot files first
-20. **Shortcut coverage (warnings):** a shortcut with no value in any row (its source may be absent or renamed upstream)
+20. **Shortcut coverage:** a shortcut with no value in any row (its source may be absent or renamed upstream). A warning for a subset; with `--release`, which `VALIDATE` passes, a failure, as is a table with no rows
+21. **Shortcut values:** for the check 16 sample, every shortcut of every table equals an independent Python computation from the JSON entry (`bin/shortcut_reference.py`). Reconstruction reads only source columns, so this is the check that catches a wrong shortcut
 
 ### Testing
 

@@ -60,7 +60,7 @@ Ground rules for every work package:
 
 ## Decisions needed before starting
 
-**Status: the owner has not yet confirmed these recommendations.** Ask before starting WP2 (D3, D4), WP11 (D5) and WP14 (D1, D2, D6). The other work packages don't depend on them.
+**Status: confirmed by the owner on 2026-09-30, all as recommended.**
 
 | # | Question | Recommendation |
 | --- | --- | --- |
@@ -71,7 +71,6 @@ Ground rules for every work package:
 | D5 | Should reconstruction treat JSON `5` and a lake's `5.0` as equal? A field with mixed ints and floats is stored as DOUBLE. | Yes, but say so as a fourth normalisation in the README. Do not treat booleans and numbers as equal (WP11). |
 | D6 | Rename `files_for_taxid()` and the manifest's `taxid_min`/`taxid_max` to match the `organism_id` column? | Yes: `files_for_organism_id()` and `organism_id_min`/`organism_id_max`. Nothing is published yet (WP14). |
 
-The work packages below assume the recommended answers.
 
 ---
 

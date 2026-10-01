@@ -518,12 +518,15 @@ COLUMN_SOURCES: dict[tuple[str, str], str] = {
 # derived shortcut has none), for check_curated_sources.  Not written to the
 # Parquet metadata or SCHEMA.md, which show such a column as "derived".
 _NAMING_BLOCKS = ("recommendedName", "alternativeNames", "submissionNames", "submittedNames")
+# proteinDescription arrays whose elements (domains, chains) carry naming blocks of their own.
+_NESTED_NAMING = ("includes", "contains")
 DERIVED_SOURCES: dict[tuple[str, str], tuple[str, ...]] = {
     ("entries", "protein_name_primary"): tuple(f"proteinDescription.{b}.fullName.value"
                                        for b in _NAMING_BLOCKS[1:]),
     ("entries", "division"): ("organism.taxonId", "organism.lineage"),
-    ("entries", "ec"): tuple(f"proteinDescription.{b}.ecNumbers.value"
-                                     for b in _NAMING_BLOCKS),
+    ("entries", "ec"): tuple(f"proteinDescription.{n}{b}.ecNumbers.value"
+                             for n in ("", *(f"{x}." for x in _NESTED_NAMING))
+                             for b in _NAMING_BLOCKS),
     ("entries", "go_terms"): ("uniProtKBCrossReferences.id", "uniProtKBCrossReferences.database",
                               "uniProtKBCrossReferences.properties.key",
                               "uniProtKBCrossReferences.properties.value"),
@@ -639,6 +642,25 @@ def _source_columns(table: str, base: str, schema_paths,
 # The review flag, shared by every table builder: Swiss-Prot entries are
 # "UniProtKB reviewed (Swiss-Prot)", TrEMBL "UniProtKB unreviewed (TrEMBL)".
 REVIEWED_EXPR = "CASE WHEN e.entryType LIKE '%Swiss-Prot%' THEN true ELSE false END"
+
+# Every entryType UniProt ships, with the review flag REVIEWED_EXPR gives it.
+# Any other value (a rewording, a NULL) would land every entry carrying it
+# in the TrEMBL partition: check_entry_types refuses the input instead.
+ENTRY_TYPES: dict[str, bool] = {
+    "UniProtKB reviewed (Swiss-Prot)": True,
+    "UniProtKB unreviewed (TrEMBL)": False,
+}
+
+
+def check_entry_types(con, read_clause: str) -> None:
+    """Abort the build if an entry's entryType is not one of ENTRY_TYPES."""
+    values = [v for (v,) in con.sql(f"SELECT DISTINCT entryType FROM {read_clause}").fetchall()]
+    unknown = sorted((v for v in values if v not in ENTRY_TYPES), key=str)
+    if unknown:
+        raise RuntimeError(
+            f"Input has entryType value(s) {unknown}; known values are {sorted(ENTRY_TYPES)}. "
+            "The review flag and the swissprot/trembl partitions depend on entryType: "
+            "a reworded value needs a code decision (ENTRY_TYPES in parquet_transform.py).")
 
 # Paths every UniProtKB entry carries; the builders dereference them without
 # a guard.  A dump lacking one is refused up front with a clear message
@@ -853,29 +875,30 @@ def _build_entries_sql(schema_paths, json_paths: set[str]) -> str:
     def c(column: str, expr: str) -> str:
         return _cast("entries", column, expr)
 
-    # EC numbers: extract from recommended, alternative, and (if present) submitted names.
-    # Each naming block's struct schema may or may not include ecNumbers depending on the
-    # dataset.  Only include the extraction expression when the field actually exists.
-    ec_parts = []
-    if has("proteinDescription.recommendedName.ecNumbers"):
-        ec_parts.append(
-            "list_transform(COALESCE(e.proteinDescription.recommendedName.ecNumbers, []), x -> x.value)"
-        )
-    if has("proteinDescription.alternativeNames.ecNumbers"):
-        ec_parts.append("""flatten(list_transform(
-            COALESCE(e.proteinDescription.alternativeNames, []),
+    # EC numbers: every naming block's ecNumbers (recommended, alternative,
+    # submitted), of the entry and of each domain (includes[]) and chain
+    # (contains[]), as UniProt's REST `ec` field.  A naming block's struct
+    # may lack ecNumbers in a subset, so only existing paths are read.
+    def _ec_parts(path: str, expr: str) -> list[str]:
+        parts = []
+        if has(f"{path}.recommendedName.ecNumbers"):
+            parts.append(f"list_transform(COALESCE({expr}.recommendedName.ecNumbers, []), x -> x.value)")
+        # UniProtKB API renamed submittedNames → submissionNames; read either.
+        for block in _NAMING_BLOCKS[1:]:
+            if has(f"{path}.{block}.ecNumbers"):
+                parts.append(f"""flatten(list_transform(
+            COALESCE({expr}.{block}, []),
             n -> list_transform(COALESCE(n.ecNumbers, []), x -> x.value)
         ))""")
-    # UniProtKB API renamed submittedNames → submissionNames; handle both.
-    _submitted_field = (
-        "submissionNames" if has("proteinDescription.submissionNames.ecNumbers")
-        else "submittedNames" if has("proteinDescription.submittedNames.ecNumbers")
-        else None
-    )
-    if _submitted_field:
-        ec_parts.append(f"""flatten(list_transform(
-            COALESCE(e.proteinDescription.{_submitted_field}, []),
-            n -> list_transform(COALESCE(n.ecNumbers, []), x -> x.value)
+        return parts
+
+    ec_parts = _ec_parts("proteinDescription", "e.proteinDescription")
+    for nested in _NESTED_NAMING:
+        inner = _ec_parts(f"proteinDescription.{nested}", "d")
+        if inner:
+            ec_parts.append(f"""flatten(list_transform(
+            COALESCE(e.proteinDescription.{nested}, []),
+            d -> flatten([{", ".join(inner)}])
         ))""")
 
     if ec_parts:
@@ -1017,7 +1040,7 @@ SELECT
     -- Gene & protein
     {gene_synonyms_expr}                            AS gene_synonym,
     {alt_protein_names_expr}                        AS alt_protein_names,
-    -- EC numbers from all naming blocks (recommended, alternative, submitted)
+    -- EC numbers from all naming blocks, the entry's and its domains' and chains'
     {c('ec', ec_numbers_expr)}              AS ec,
     -- UniProt taxonomic division, most specific rule first.
     -- First approximation of the FTP taxonomic_divisions/ rules; the final CASE
@@ -1847,7 +1870,9 @@ COLUMN_DESCRIPTIONS = {
     ("entries", "length"):         "Sequence length in amino acids.",
     ("entries", "gene_synonym"):      "Flattened list of gene name synonyms across all genes.",
     ("entries", "alt_protein_names"):  "List of alternative full protein names from proteinDescription.alternativeNames.",
-    ("entries", "ec"):         "Distinct EC (Enzyme Commission) numbers extracted from all naming blocks.",
+    ("entries", "ec"):         "Distinct EC (Enzyme Commission) numbers from every naming block (recommended, "
+                                 "alternative, submission names) of the entry and of its domains (includes) "
+                                 "and chains (contains).",
     ("entries", "division"):           "UniProt taxonomic division (archaea, bacteria, fungi, human, invertebrates, mammals, plants, rodents, vertebrates, viruses, unclassified), derived from lineage and organism_id.",
     ("entries", "go_id"):             "Distinct Gene Ontology term IDs (e.g. GO:0005634) from cross-references.",
     ("entries", "go_terms"):           "GO annotations as {id, aspect (P/F/C), term, evidence_type}; go_id is the flat id list.",
@@ -2242,6 +2267,7 @@ def main():
             # shortcut's required source is missing).  Fields UniProt adds are
             # not an error: they become source columns.
             check_required_paths(schema_paths)
+            check_entry_types(con, read_clause)
             types = inferred_types(con, read_clause)
             json_paths = discover_json_paths(types)
             if json_paths:

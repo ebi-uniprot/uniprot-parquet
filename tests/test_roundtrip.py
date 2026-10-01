@@ -331,6 +331,32 @@ class TestConvenienceColumns:
             expected = sorted(ids, key=int)
             assert (lake_entries[accession].get("lit_pubmed_id") or []) == expected, f"{accession}: lit_pubmed_id"
 
+    @staticmethod
+    def _ec_numbers(node):
+        """Every ecNumbers[].value anywhere under ``node`` (every naming
+        block, including those of includes[] and contains[])."""
+        if isinstance(node, list):
+            return {v for x in node for v in TestConvenienceColumns._ec_numbers(x)}
+        if not isinstance(node, dict):
+            return set()
+        found = {x["value"] for x in node.get("ecNumbers") or []}
+        for key, value in node.items():
+            if key != "ecNumbers":
+                found |= TestConvenienceColumns._ec_numbers(value)
+        return found
+
+    def test_ec_matches_every_naming_block(self, originals, lake_entries):
+        wrong = [acc for acc, orig in originals.items()
+                 if set(lake_entries[acc].get("ec") or [])
+                 != self._ec_numbers(orig.get("proteinDescription"))]
+        assert not wrong, f"{len(wrong)} entries' ec differs, e.g. {wrong[:5]}"
+
+    def test_ec_includes_contained_chains(self, originals, lake_entries):
+        """P0DTD1 (SARS-CoV-2 pp1ab) has EC numbers only on its chains."""
+        if "P0DTD1" not in originals:
+            pytest.skip("P0DTD1 not in this fixture")
+        assert "3.4.22.69" in lake_entries["P0DTD1"]["ec"]
+
     def test_proteome_ids_match(self, originals, lake_entries):
         for accession, orig in originals.items():
             expected = sorted({
@@ -405,3 +431,42 @@ class TestConvenienceColumns:
             assert lake["reference_count"] == len(orig.get("references") or []), (
                 f"{accession}: reference_count mismatch"
             )
+
+
+class TestShortcutValues:
+    """Every shortcut column of every table equals an independent Python
+    computation from the JSON entry (bin/shortcut_reference.py, which the
+    validator's check 21 also uses)."""
+
+    def test_reference_covers_every_shortcut(self):
+        from parquet_transform import TABLE_META
+        from shortcut_reference import expected_shortcuts
+        entry = {"primaryAccession": "P1", "secondaryAccessions": ["Q1"],
+                 "entryType": "UniProtKB reviewed (Swiss-Prot)",
+                 "features": [{}], "uniProtKBCrossReferences": [{}],
+                 "comments": [{}], "references": [{}]}
+        rows = expected_shortcuts(entry)
+        missing = {table: sorted(set(meta["columns"]["shortcut"]) - set(rows[table][0]))
+                   for table, meta in TABLE_META.items()}
+        assert not any(missing.values()), f"shortcuts without a reference value: {missing}"
+        extra = {table: sorted(set(rows[table][0]) - set(meta["columns"]["shortcut"]))
+                 for table, meta in TABLE_META.items()}
+        assert not any(extra.values()), f"reference values that are not shortcuts: {extra}"
+
+    def test_every_shortcut_matches_reference(self, originals, lake, lake_entries, lake_features,
+                                              lake_xrefs, lake_comments, lake_publications):
+        from conftest import open_table
+        from shortcut_reference import compare_rows, expected_shortcuts, lake_order
+        amap = {}
+        for row in open_table(lake, "accession_map").to_table().to_pylist():
+            amap.setdefault(row["primary_accession"], []).append(row)
+        lake_rows = {"entries": {a: [r] for a, r in lake_entries.items()},
+                     "features": lake_features, "xrefs": lake_xrefs,
+                     "comments": lake_comments, "publications": lake_publications,
+                     "accession_map": amap}
+        problems = []
+        for accession, orig in originals.items():
+            for table, rows in expected_shortcuts(orig).items():
+                got = lake_order(table, lake_rows[table].get(accession, []))
+                problems += compare_rows(table, accession, rows, got)
+        assert not problems, f"{len(problems)} shortcut mismatches, e.g. {problems[:5]}"

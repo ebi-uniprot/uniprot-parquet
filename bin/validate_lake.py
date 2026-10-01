@@ -24,6 +24,9 @@ Checks (in order):
   3. NULL KEYS AND EMPTY STRINGS
      - accession, reviewed, organism_id never null in any table
      - Identity columns (accession, id) never empty strings
+     - entries.entryType holds only the values the transform knows
+       (parquet_transform.ENTRY_TYPES): a reworded value would be filed
+       as TrEMBL
 
   4. REFERENTIAL INTEGRITY
      - Every accession in features exists in entries
@@ -40,7 +43,8 @@ Checks (in order):
        per child table, merged with entries in their shared sort order
 
   6. ROUND-TRIP SPOT CHECK
-     - Sample N accessions from the JSONL
+     - Sample N TrEMBL and N Swiss-Prot accessions from the JSONL (two
+       reservoirs, one pass: a uniform sample would hold ~0.23% Swiss-Prot)
      - For each, verify accession, organism_id, length, feature_count match lake
 
   7. PARQUET FILE INTEGRITY
@@ -84,24 +88,34 @@ Checks (in order):
 
   18. ACCESSION MAP
       - Primary rows == entries, secondary rows == sum(len(secondaryAccessions)),
-        no duplicate (accession, primary_accession), every primary_accession exists,
-        (reviewed, organism_id) match entries  (17 is reserved for bloom filters,
-        deferred: PyArrow 23 cannot write them)
+        no duplicate (accession, primary_accession), every primary_accession exists
+      - Secondary rows == the (secondary, entry) pairs of entries.secondaryAccessions
+        (EXCEPT ALL both ways), primary rows map to themselves, every row's
+        (reviewed, organism_id) is its entry's  (17 is reserved for bloom
+        filters, deferred: PyArrow 23 cannot write them)
 
   19. PARTITIONS
       - review_status=swissprot|trembl directories agree with the stored
         `reviewed` column (row-group statistics), per-partition row counts
         match the manifest and sum to row_count, swissprot files first
 
-  20. SHORTCUT COLUMN COVERAGE (warnings, never fails)
+  20. SHORTCUT COLUMN COVERAGE (warnings; failures with --release)
       - A shortcut column with no value in any row (footer statistics) is
-        listed: its source field may be absent or renamed upstream
+        listed: its source field may be absent or renamed upstream.  A
+        warning for a subset; with --release (a full release, as VALIDATE
+        runs it) a failure, as is a table with no rows
+
+  21. SHORTCUT VALUES
+      - For the entries sampled for check 16, every shortcut column of every
+        table equals an independent Python computation from the JSON entry
+        (bin/shortcut_reference.py): reconstruction reads only source
+        columns, so this is what catches a wrong shortcut
 
 Usage:
     validate_lake.py \
         --lake /path/to/lake \
         --jsonl /path/to/uniprot.jsonl.zst \
-        [--spot-check-n 1000] \
+        [--spot-check-n 1000] [--release] \
         [--previous-manifest /path/to/<previous release>/lake/manifest.json] \
         [--memory-limit 16GB] [--threads N] [--temp-dir /scratch/duckdb_tmp] \
         [-o validation_report.txt]
@@ -115,6 +129,7 @@ import os
 import sys
 import json
 import random
+import re
 import argparse
 import time
 from datetime import datetime, timezone
@@ -238,46 +253,86 @@ def _open_jsonl_lines(jsonl_path: str):
             yield from f
 
 
-def sample_and_count_jsonl(jsonl_path: str, n: int,
-                           seed: int = 42) -> tuple[list[dict], int]:
-    """Reservoir-sample N parsed entries from a JSONL(.zst) file and count
-    its non-empty lines, in a single decompression pass.
+# entryType of a JSONL line, found without parsing the line: one C-speed
+# search per line of a ~250M-line stream.  UniProt writes the key once, at
+# the top level of the entry.
+_ENTRY_TYPE_RE = re.compile(rb'"entryType"\s*:\s*"([^"]*)"')
 
-    The full stream (~1 TB uncompressed at production scale) is expensive to
-    decompress, so main() does this once and shares the sample across every
-    check that needs source entries."""
+
+def _is_reviewed(entry: dict) -> bool:
+    """Swiss-Prot (True) or TrEMBL (False), as the sampler classifies a line."""
+    return "Swiss-Prot" in (entry.get("entryType") or "")
+
+
+def sample_and_count_jsonl(jsonl_path: str, n: int, seed: int = 42,
+                           n_reviewed: int | None = None) -> tuple[list[dict], int, int]:
+    """Reservoir-sample parsed entries from a JSONL(.zst) file, stratified,
+    and count its non-empty lines, in a single decompression pass.
+
+    Two reservoirs: ``n_reviewed`` (default ``n``) Swiss-Prot entries and
+    ``n`` TrEMBL entries.  A uniform sample of a full release would hold
+    about 2 Swiss-Prot entries in 1,000 (0.23%), so the structures only
+    Swiss-Prot has would almost never be checked.  Each line is classified
+    by a bytes regex on its entryType; only lines entering a reservoir are
+    parsed.  The sorted JSONL puts Swiss-Prot first, but nothing here relies
+    on that.
+
+    Returns (Swiss-Prot sample + TrEMBL sample, line count, lines without an
+    entryType).  The full stream (~1 TB uncompressed at production scale) is
+    expensive to decompress, so main() does this once and shares the sample
+    across every check that needs source entries."""
     rng = random.Random(seed)
-    reservoir = []
-    idx = 0
+    sizes = {True: n if n_reviewed is None else n_reviewed, False: n}
+    reservoirs: dict[bool, list[bytes]] = {True: [], False: []}
+    seen = {True: 0, False: 0}
+    idx = unclassified = 0
 
     for line in _open_jsonl_lines(jsonl_path):
         line = line.strip()
         if not line:
             continue
-        if idx < n:
-            reservoir.append(json.loads(line))
-        else:
-            j = rng.randint(0, idx)
-            if j < n:
-                reservoir[j] = json.loads(line)
         idx += 1
+        m = _ENTRY_TYPE_RE.search(line)
+        if m is None:
+            unclassified += 1
+            continue
+        stratum = b"Swiss-Prot" in m.group(1)
+        k, reservoir = sizes[stratum], reservoirs[stratum]
+        if seen[stratum] < k:
+            reservoir.append(line)
+        else:
+            j = rng.randint(0, seen[stratum])
+            if j < k:
+                reservoir[j] = line
+        seen[stratum] += 1
 
-    return reservoir, idx
+    return [json.loads(line) for line in reservoirs[True] + reservoirs[False]], idx, unclassified
 
 
 def sample_jsonl_entries(jsonl_path: str, n: int,
                          seed: int = 42) -> list[dict]:
-    """Reservoir-sample N parsed entries from a JSONL(.zst) file."""
+    """Reservoir-sample N Swiss-Prot and N TrEMBL parsed entries from a JSONL(.zst) file."""
     return sample_and_count_jsonl(jsonl_path, n, seed)[0]
 
 
-def _spot_subsample(sampled: list[dict], n: int, seed: int = 42) -> list[dict]:
-    """A deterministic size-n subsample of the shared JSONL sample, for the
-    checks that honour --spot-check-n (the shared sample holds
-    max(spot_check_n, 1000) entries)."""
-    if n >= len(sampled):
-        return sampled
-    return random.Random(seed).sample(sampled, n)
+def _spot_subsample(sampled: list[dict], n: int, seed: int = 42,
+                    n_reviewed: int | None = None) -> list[dict]:
+    """A deterministic subsample of the shared JSONL sample, for the checks
+    that honour --spot-check-n: up to ``n_reviewed`` (default ``n``)
+    Swiss-Prot and ``n`` TrEMBL entries (the shared sample holds
+    max(spot_check_n, 1000) of each)."""
+    out = []
+    for stratum, k in ((True, n if n_reviewed is None else n_reviewed), (False, n)):
+        part = [e for e in sampled if _is_reviewed(e) == stratum]
+        out += part if k >= len(part) else random.Random(seed).sample(part, k)
+    return out
+
+
+def _strata(entries) -> str:
+    """'x Swiss-Prot + y TrEMBL' for a list of entries."""
+    entries = list(entries)
+    reviewed = sum(map(_is_reviewed, entries))
+    return f"{reviewed:,} Swiss-Prot + {len(entries) - reviewed:,} TrEMBL"
 
 
 # ─── Validation framework ─────────────────────────────────────────────
@@ -432,8 +487,10 @@ def check_uniqueness(report, lake_dir):
     return total, unique_count
 
 
-def check_null_keys(report, lake_dir):
-    """Verify critical columns are never null and identity columns have no empty strings."""
+def check_null_keys(report, lake_dir, jsonl_unclassified=None):
+    """Verify critical columns are never null and identity columns have no
+    empty strings, that entryType holds only known values, and (given the
+    sampler's count) that every JSONL line has an entryType."""
     report.checks.append("\n--- 3. NULL KEYS AND EMPTY STRINGS ---")
     eprint("\n--- 3. NULL KEYS AND EMPTY STRINGS ---")
 
@@ -470,6 +527,16 @@ def check_null_keys(report, lake_dir):
                 nc == 0,
                 f"null_count={nc:,}" if nc > 0 else ""
             )
+
+    from parquet_transform import ENTRY_TYPES
+    entry_types = [v for (v,) in _duckdb().sql(
+        f"SELECT DISTINCT entryType FROM read_parquet('{_table_glob(lake_dir, 'entries')}')").fetchall()]
+    unknown = sorted((v for v in entry_types if v not in ENTRY_TYPES), key=str)
+    report.check("entries.entryType values are known", not unknown,
+                 f"unknown: {unknown}" if unknown else "")
+    if jsonl_unclassified is not None:
+        report.check("every JSONL line has an entryType", jsonl_unclassified == 0,
+                     f"{jsonl_unclassified:,} lines without one" if jsonl_unclassified else "")
 
     for table_name, columns in empty_string_checks:
         dataset = open_table(lake_dir, table_name)
@@ -746,12 +813,13 @@ def _check_array_positions(child_batches, idx, entries, count_col):
     return True, ""
 
 
-def check_round_trip(report, lake_dir, sampled_entries, n):
-    """Spot-check N entries from the shared JSONL sample against the lake."""
+def check_round_trip(report, lake_dir, sampled_entries, n, n_reviewed=None):
+    """Spot-check n TrEMBL and n_reviewed Swiss-Prot entries from the shared
+    JSONL sample against the lake."""
     report.checks.append(f"\n--- 6. ROUND-TRIP SPOT CHECK (n={n}) ---")
     eprint(f"\n--- 6. ROUND-TRIP SPOT CHECK (n={n}) ---")
 
-    sampled = _spot_subsample(sampled_entries, n)
+    sampled = _spot_subsample(sampled_entries, n, n_reviewed=n_reviewed)
 
     if not sampled:
         report.check("round-trip sample non-empty", False, "no entries sampled")
@@ -811,7 +879,7 @@ def check_round_trip(report, lake_dir, sampled_entries, n):
 
     missing = set(jsonl_lookup.keys()) - set(lake_lookup.keys())
     report.check(
-        f"all {len(jsonl_lookup)} sampled accessions found in lake",
+        f"all {len(jsonl_lookup)} sampled accessions found in lake ({_strata(sampled)})",
         len(missing) == 0,
         f"{len(missing)} missing" if missing else ""
     )
@@ -1090,13 +1158,17 @@ def check_schema_types(report, lake_dir):
         )
 
 
-def check_curated_coverage(report, lake_dir):
-    """Warn about a shortcut column that holds no value in any row: a
-    source field UniProt renamed or dropped leaves it a typed NULL (or empty
-    list) throughout while its data moves to a new source column, so
-    reconstruction still passes.  Footer statistics only: a column chunk whose null count
-    equals its value count holds nothing (an empty list counts as a null
-    leaf).  A warning, not a failure: a subset may lack a source."""
+def check_curated_coverage(report, lake_dir, release=False):
+    """Report a shortcut column that holds no value in any row: a source
+    field UniProt renamed or dropped leaves it a typed NULL (or empty list)
+    throughout while its data moves to a new source column, so
+    reconstruction still passes.  Footer statistics only: a column chunk
+    whose null count equals its value count holds nothing (an empty list
+    counts as a null leaf).
+
+    A warning for a subset, which may lack a source.  With ``release`` (a
+    full UniProtKB release) every shortcut column must have values and
+    every table rows: each is a failure."""
     from parquet_transform import TABLE_META
     report.checks.append("\n--- 20. SHORTCUT COLUMN COVERAGE ---")
     eprint("\n--- 20. SHORTCUT COLUMN COVERAGE ---")
@@ -1120,15 +1192,24 @@ def check_curated_coverage(report, lake_dir):
                                 or stats.null_count < chunk.num_values):
                             has_value[top] = True
         if not rows:
-            report.note(f"{table_name}: no rows, coverage not checked")
+            if release:
+                report.check(f"{table_name} has rows", False, "a full release has rows in every table")
+            else:
+                report.note(f"{table_name}: no rows, coverage not checked")
             continue
         empty = [column for column, seen in has_value.items() if not seen]
+        why = ("NULL or empty in every row: is its source field absent or renamed "
+               "upstream? (the transform log lists absent shortcut sources)")
         for column in empty:
-            report.warn(f"{table_name}.{column} has no values",
-                        "NULL or empty in every row: is its source field absent or renamed "
-                        "upstream? (the transform log lists absent shortcut sources)")
+            if release:
+                report.check(f"{table_name}.{column} has values", False, why)
+            else:
+                report.warn(f"{table_name}.{column} has no values", why)
         if not empty:
-            report.note(f"{table_name}: every shortcut column has values")
+            if release:
+                report.check(f"every {table_name} shortcut column has values", True)
+            else:
+                report.note(f"{table_name}: every shortcut column has values")
 
 
 def check_field_completeness(report, lake_dir, sampled_entries):
@@ -1163,7 +1244,8 @@ def check_field_completeness(report, lake_dir, sampled_entries):
             elif key not in columns["entries"]:
                 missing.add(f"entries.{key}")
     report.check(
-        f"every key of {len(sampled)} sampled entries and their elements is a source column",
+        f"every key of {len(sampled)} sampled entries ({_strata(sampled)}) and their "
+        f"elements is a source column",
         not missing,
         f"{len(missing)} missing: {', '.join(sorted(missing)[:10])}" if missing else "",
     )
@@ -1205,23 +1287,23 @@ def check_text_value(report, lake_dir):
         report.check(f"comments.text_value populated for {ctype}", with_text == n, detail)
 
 
-def check_reconstruction(report, lake_dir, sampled_entries, n):
-    """g(f(x)) == x on a sample: rebuild sampled entries from the five tables
-    with bin/reconstruct.py and compare with the JSONL, array order included."""
-    report.checks.append(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
-    eprint(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
-    from reconstruct import reconstruct_entry, entries_match, rows_from_arrow
+def _sampled_originals(sampled_entries, n, n_reviewed=None):
+    """{accession: entry} for the subsample checks 16 and 21 share."""
+    return {e["primaryAccession"]: e for e in _spot_subsample(sampled_entries, n, n_reviewed=n_reviewed)
+            if e.get("primaryAccession")}
 
-    sampled = _spot_subsample(sampled_entries, n)
-    originals = {e["primaryAccession"]: e for e in sampled if e.get("primaryAccession")}
-    if not originals:
-        report.check("reconstruction sample non-empty", False, "no entries sampled")
-        return
-    in_list = _sql_in_list(originals)
 
-    def fetch(table):
+def fetch_sample_rows(lake_dir, accessions):
+    """{table: {accession: [row, ...]}}: every table's rows for the sampled
+    entries, as rows_from_arrow dicts (JSON decoded, MAPs as dicts).
+    accession_map rows are grouped by primary_accession, the entry they
+    belong to.  One query per table, shared by checks 16 and 21."""
+    from reconstruct import rows_from_arrow
+    in_list = _sql_in_list(accessions)
+
+    def fetch(table, key):
         path = _table_glob(lake_dir, table)
-        tbl = _duckdb().sql(f"SELECT * FROM read_parquet('{path}') WHERE accession IN ({in_list})").arrow().read_all()
+        tbl = _duckdb().sql(f"SELECT * FROM read_parquet('{path}') WHERE {key} IN ({in_list})").arrow().read_all()
         # DuckDB hands a JSON column over as plain strings: which columns are
         # JSON comes from the files' own schema.
         files = _table_files(lake_dir, table)
@@ -1231,14 +1313,33 @@ def check_reconstruction(report, lake_dir, sampled_entries, n):
         # MAP columns come back as dicts (an empty MAP as {}, not []), so
         # reconstruct.py never has to guess a column's type from its values.
         for row in rows_from_arrow(tbl, json_columns):
-            grouped.setdefault(row["accession"], []).append(row)
+            grouped.setdefault(row[key], []).append(row)
         return grouped
 
     t0 = time.time()
-    rows = {t: fetch(t) for t in ("entries", *CHILD_TABLES)}
-    eprint(f"  Fetched rows for {len(originals)} accessions in {time.time()-t0:.1f}s")
+    rows = {t: fetch(t, "accession") for t in ("entries", *CHILD_TABLES)}
+    rows["accession_map"] = fetch("accession_map", "primary_accession")
+    eprint(f"  Fetched rows for {len(accessions)} accessions in {time.time()-t0:.1f}s")
+    return rows
 
-    matched, failures = 0, []
+
+def check_reconstruction(report, lake_dir, sampled_entries, n, rows=None, n_reviewed=None):
+    """g(f(x)) == x on a sample: rebuild sampled entries from the five tables
+    with bin/reconstruct.py and compare with the JSONL, array order included.
+    ``rows`` is fetch_sample_rows' result for the same sample, if main()
+    already fetched it."""
+    report.checks.append(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
+    eprint(f"\n--- 16. RECONSTRUCTION (n={n}) ---")
+    from reconstruct import reconstruct_entry, entries_match
+
+    originals = _sampled_originals(sampled_entries, n, n_reviewed)
+    if not originals:
+        report.check("reconstruction sample non-empty", False, "no entries sampled")
+        return
+    if rows is None:
+        rows = fetch_sample_rows(lake_dir, originals)
+
+    matched, failures = {True: 0, False: 0}, []
     for accession, orig in originals.items():
         entry_rows = rows["entries"].get(accession)
         if not entry_rows:
@@ -1252,20 +1353,57 @@ def check_reconstruction(report, lake_dir, sampled_entries, n):
         except Exception as e:      # a rebuild error is a failed entry, not a lost report
             ok, diff = False, f"rebuild raised {type(e).__name__}: {e}"
         if ok:
-            matched += 1
+            matched[_is_reviewed(orig)] += 1
         else:
             failures.append(f"{accession}: {diff}")
+    totals = {s: sum(_is_reviewed(e) == s for e in originals.values()) for s in (True, False)}
     report.check(
-        f"reconstruction matches JSONL for {matched}/{len(originals)} sampled entries",
+        f"reconstruction matches JSONL for {matched[True]}/{totals[True]} Swiss-Prot and "
+        f"{matched[False]}/{totals[False]} TrEMBL entries",
         not failures,
         "; ".join(failures[:3]) + (f" (+{len(failures)-3} more)" if len(failures) > 3 else ""),
     )
 
 
+def check_shortcut_values(report, lake_dir, sampled_entries, n, rows=None, n_reviewed=None):
+    """Every shortcut column of the sampled entries' rows, in every table,
+    equals bin/shortcut_reference.py's independent computation from the
+    JSON entry.  Lists compare in order (those built by list_distinct as
+    sets), dates as ISO strings."""
+    report.checks.append(f"\n--- 21. SHORTCUT VALUES (n={n}) ---")
+    eprint(f"\n--- 21. SHORTCUT VALUES (n={n}) ---")
+    from shortcut_reference import compare_rows, expected_shortcuts, lake_order
+
+    originals = _sampled_originals(sampled_entries, n, n_reviewed)
+    if not originals:
+        report.check("shortcut values sample non-empty", False, "no entries sampled")
+        return
+    if rows is None:
+        rows = fetch_sample_rows(lake_dir, originals)
+    problems = {table: [] for table in ALL_TABLES}
+    compared = dict.fromkeys(ALL_TABLES, 0)
+    for accession, orig in originals.items():
+        for table, expected in expected_shortcuts(orig).items():
+            actual = lake_order(table, rows[table].get(accession, []))
+            problems[table] += compare_rows(table, accession, expected, actual)
+            compared[table] += len(expected)
+    for table in ALL_TABLES:
+        found = problems[table]
+        report.check(
+            f"{table} shortcut values match the JSONL ({compared[table]:,} rows of "
+            f"{_strata(originals.values())} entries)",
+            not found,
+            "; ".join(found[:3]) + (f" (+{len(found)-3} more)" if len(found) > 3 else ""),
+        )
+
+
 def check_accession_map(report, lake_dir):
     """accession_map: primary rows == entries, secondary rows == sum of
-    secondaryAccessions lengths, no duplicate (accession, primary_accession), every primary_accession exists,
-    (reviewed, organism_id) match entries (sort order is covered by check_sort_order)."""
+    secondaryAccessions lengths, no duplicate (accession, primary_accession),
+    every primary_accession exists, the secondary rows are exactly the
+    (secondary, entry) pairs of entries.secondaryAccessions, primary rows map
+    to themselves, and every row's (reviewed, organism_id) is its entry's
+    (sort order is covered by check_sort_order)."""
     report.checks.append("\n--- 18. ACCESSION MAP ---")
     eprint("\n--- 18. ACCESSION MAP ---")
     amap = _table_glob(lake_dir, "accession_map")
@@ -1295,12 +1433,37 @@ def check_accession_map(report, lake_dir):
     """).fetchone()[0]
     report.check("every accession_map.primary_accession exists in entries", orphans == 0, f"{orphans:,} orphans")
 
-    mism = _duckdb().sql(f"""
-        SELECT count(*) FILTER (WHERE m.reviewed != e.reviewed OR m.organism_id != e.organism_id)
-        FROM read_parquet('{amap}') m JOIN read_parquet('{entries}') e ON m.accession = e.accession
-        WHERE m.is_primary
+    # The mappings themselves, as set comparisons DuckDB can spill: each
+    # secondary row is one (secondary accession, entry) pair of entries'
+    # secondaryAccessions, in both directions.
+    if has_secondaries:
+        extra, lost = _duckdb().sql(f"""
+            WITH m AS (SELECT accession, primary_accession FROM read_parquet('{amap}') WHERE NOT is_primary),
+                 e AS (SELECT unnest(secondaryAccessions) AS accession, accession AS primary_accession
+                       FROM read_parquet('{entries}'))
+            SELECT (SELECT count(*) FROM (SELECT * FROM m EXCEPT ALL SELECT * FROM e)),
+                   (SELECT count(*) FROM (SELECT * FROM e EXCEPT ALL SELECT * FROM m))
+        """).fetchone()
+    else:
+        extra, lost = n_secondary, 0
+    report.check("accession_map secondary rows map each secondary accession to its entry",
+                 extra == 0 and lost == 0,
+                 f"{extra:,} rows no entry lists, {lost:,} listed secondaries without their row"
+                 if extra or lost else "")
+
+    n_self = _duckdb().sql(f"""
+        SELECT count(*) FILTER (WHERE is_primary AND accession IS DISTINCT FROM primary_accession)
+        FROM read_parquet('{amap}')
     """).fetchone()[0]
-    report.check("accession_map (reviewed, organism_id) match entries for primary rows", mism == 0,
+    report.check("accession_map primary rows have accession == primary_accession", n_self == 0,
+                 f"{n_self:,} rows" if n_self else "")
+
+    mism = _duckdb().sql(f"""
+        SELECT count(*) FILTER (WHERE m.reviewed IS DISTINCT FROM e.reviewed
+                                   OR m.organism_id IS DISTINCT FROM e.organism_id)
+        FROM read_parquet('{amap}') m JOIN read_parquet('{entries}') e ON m.primary_accession = e.accession
+    """).fetchone()[0]
+    report.check("accession_map (reviewed, organism_id) match the entry of primary_accession", mism == 0,
                  f"{mism:,} mismatches")
 
 
@@ -1463,7 +1626,19 @@ def main():
     )
     parser.add_argument(
         "--spot-check-n", type=int, default=1000,
-        help="Number of entries to spot-check against JSONL (default: 1000)",
+        help="TrEMBL entries, and Swiss-Prot entries unless --spot-check-n-reviewed "
+             "says otherwise, to spot-check against the JSONL (default: 1000 each)",
+    )
+    parser.add_argument(
+        "--spot-check-n-reviewed", type=int, default=None,
+        help="Swiss-Prot entries to spot-check (default: --spot-check-n).  The "
+             "sample is stratified: --spot-check-n TrEMBL plus this many Swiss-Prot",
+    )
+    parser.add_argument(
+        "--release", action="store_true",
+        help="The lake is a full UniProtKB release (VALIDATE passes this): a "
+             "shortcut column with no values, or an empty table, fails check 20 "
+             "instead of warning",
     )
     parser.add_argument(
         "--previous-manifest", default=None,
@@ -1500,33 +1675,40 @@ def main():
     # that needs source entries (round-trip, field completeness,
     # reconstruction) — decompressing the stream per check is the dominant
     # cost at production scale.
-    sample_n = max(args.spot_check_n, 1000)
-    eprint(f"\nCounting JSONL lines and sampling {sample_n:,} entries (one pass)...")
+    # Swiss-Prot and TrEMBL are sampled separately (sample_and_count_jsonl).
+    n_reviewed = args.spot_check_n if args.spot_check_n_reviewed is None else args.spot_check_n_reviewed
+    sample_n, sample_n_reviewed = max(args.spot_check_n, 1000), max(n_reviewed, 1000)
+    eprint(f"\nCounting JSONL lines and sampling {sample_n_reviewed:,} Swiss-Prot + "
+           f"{sample_n:,} TrEMBL entries (one pass)...")
     t0 = time.time()
-    sampled_entries, jsonl_count = sample_and_count_jsonl(args.jsonl, sample_n)
-    eprint(f"  JSONL: {jsonl_count:,} lines, {len(sampled_entries):,} sampled "
+    sampled_entries, jsonl_count, unclassified = sample_and_count_jsonl(
+        args.jsonl, sample_n, n_reviewed=sample_n_reviewed)
+    eprint(f"  JSONL: {jsonl_count:,} lines, {_strata(sampled_entries)} sampled "
            f"({time.time()-t0:.1f}s)")
 
     # ── Run all checks ──
     check_completeness(report, args.lake, jsonl_count, args.expected_count)
     entry_total, entry_unique = check_uniqueness(report, args.lake)
-    check_null_keys(report, args.lake)
+    check_null_keys(report, args.lake, unclassified)
     check_referential_integrity(report, args.lake, entry_unique)
     check_sort_order(report, args.lake)
-    check_round_trip(report, args.lake, sampled_entries, args.spot_check_n)
+    check_round_trip(report, args.lake, sampled_entries, args.spot_check_n, n_reviewed)
     check_parquet_integrity(report, args.lake)
     check_manifest(report, args.lake, args.threads)
     check_denormalized_sync(report, args.lake)
     check_sequence_integrity(report, args.lake)
     check_feature_coordinates(report, args.lake)
     check_schema_types(report, args.lake)
-    check_curated_coverage(report, args.lake)
+    check_curated_coverage(report, args.lake, args.release)
     check_field_completeness(report, args.lake, sampled_entries)
     check_schema_diff(report, args.lake, args.previous_manifest)
     check_text_value(report, args.lake)
-    check_reconstruction(report, args.lake, sampled_entries, args.spot_check_n)
+    spot = _sampled_originals(sampled_entries, args.spot_check_n, n_reviewed)
+    sample_rows = fetch_sample_rows(args.lake, spot) if spot else None
+    check_reconstruction(report, args.lake, sampled_entries, args.spot_check_n, sample_rows, n_reviewed)
     check_accession_map(report, args.lake)
     check_partitions(report, args.lake)
+    check_shortcut_values(report, args.lake, sampled_entries, args.spot_check_n, sample_rows, n_reviewed)
 
     # ── Write report ──
     elapsed = time.time() - t_start

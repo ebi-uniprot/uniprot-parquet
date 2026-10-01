@@ -896,6 +896,21 @@ def case_dup_jsonl(tmp_path_factory):
     return path
 
 
+def test_unknown_entry_type_is_refused(tmp_path):
+    """A reworded entryType would put every Swiss-Prot entry in the trembl
+    partition with reviewed = false: the build stops, naming the value."""
+    entries = _small_entries()
+    for e in entries:
+        if e["entryType"] == "UniProtKB reviewed (Swiss-Prot)":
+            e["entryType"] = "UniProtKB reviewed (SwissProt)"
+    jsonl = write_jsonl_zst(entries, str(tmp_path / "in.jsonl.zst"))
+    result = run_bin("parquet_transform.py", jsonl, "--outdir", tmp_path / "lake",
+                     "--memory-limit", "4GB")
+    assert result.returncode != 0
+    assert "UniProtKB reviewed (SwissProt)" in result.stderr
+    assert not os.path.exists(tmp_path / "lake" / "entries")
+
+
 class TestCaseDuplicateKeys:
     """Sibling keys differing only in case cannot share a DuckDB struct: the
     build stops with a message naming the key, not DuckDB's internal error."""

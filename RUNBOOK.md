@@ -100,6 +100,10 @@ ls datalake/small/RELEASE_COMPLETE
 # 3. Validation: all checks passed, including the pre-sort entry-count anchor
 grep VERDICT datalake/small/validation_report.txt          # VERDICT: ALL CHECKS PASSED (172/172 ...)
 grep "expected count" datalake/small/validation_report.txt # [PASS] ... expected=52, jsonl=52, entries=52
+grep -E "reconstruction matches|shortcut values match" datalake/small/validation_report.txt
+#   [PASS] reconstruction matches JSONL for 31/31 Swiss-Prot and 21/21 TrEMBL entries
+#   [PASS] <table> shortcut values match the JSONL (... rows of 31 Swiss-Prot + 21 TrEMBL entries), one per table
+#   On a full release: 1000/1000 Swiss-Prot and 1000/1000 TrEMBL
 
 # 4. Provenance recorded THIS checkout, whatever directory the task ran in
 python -c "import json; p=json.load(open('datalake/small/provenance.json')); print(p['pipeline'])"
@@ -571,6 +575,9 @@ head -5 $OUT/SCHEMA.md
 | `VALIDATE` fails | Read `validation_report.txt`; the lake was not marked complete. Fix, then re-submit — VALIDATE alone re-runs. |
 | `PARQUET_TRANSFORM` stops with `Input lacks fields every UniProtKB entry carries` | UniProt removed or renamed a field a shortcut column is built from (or the input is not a UniProtKB dump). Update the SQL builder and `REQUIRED_PATHS` in `bin/parquet_transform.py`; this is a shortcut-schema change. New fields, and retyped fields that no shortcut reads, never stop the build: they are source columns. |
 | `PARQUET_TRANSFORM` stops with `Shortcut columns whose source field has a different type in different entries` | UniProt ships a field a shortcut is built from with more than one type (for example a string in some entries and an object in others), so DuckDB inferred JSON. The message names the column and the source path. Decide how the shortcut should read the field, update its SQL builder in `bin/parquet_transform.py`, and bump `schema_version` if the column's type or meaning changes. |
+| `PARQUET_TRANSFORM` stops with `Input has entryType value(s) [...]` | UniProt reworded or added an `entryType` value. The review flag and the swissprot/trembl partitions depend on it, so the build refuses rather than file every such entry as TrEMBL. Add the value to `ENTRY_TYPES` in `bin/parquet_transform.py` and to `ENTRY_TYPES` in `bin/shortcut_reference.py`, mapping it to reviewed or unreviewed. |
+| `VALIDATE` fails check 21 (`<table> shortcut values match the JSONL`) | A shortcut column disagrees with the independent computation in `bin/shortcut_reference.py`; the detail names the column, accession, expected and actual value. Either the SQL in `bin/parquet_transform.py` or the reference is wrong, often because UniProt changed a field a shortcut reads. Fix the wrong side and rebuild. |
+| `VALIDATE` fails check 20 (`<table>.<column> has values`) | A shortcut is empty in every row of a full release: its source field is absent or renamed upstream (the transform log lists absent sources). Update the shortcut's SQL, or the field it reads. |
 | `PARQUET_TRANSFORM` stops with `input key(s) [...] have the name of a shortcut column` | UniProt added a key named like one of the table's shortcuts (compared case-insensitively). Rename the shortcut in `bin/parquet_transform.py` (a major schema version change). |
 | Manual re-run of the transform on an existing `lake/` (outside Nextflow) | `parquet_transform.py ... --skip-existing` skips only tables whose `.complete/<table>.json` matches the files on disk and records the same input (size, mtime) and release; anything else is rebuilt, with a `REBUILD <table>: ..., <reason>` line on stderr. |
 | Reports in `<outdir>/reports/` look stale | They are overwritten on every run; check the mtime, then `.nextflow.log` for `Failed to render` (should not appear). |

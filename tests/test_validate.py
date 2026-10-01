@@ -561,3 +561,203 @@ def test_validate_fails_on_wrong_file_digest(small_lake, tmp_path, digest):
               if name.startswith("xrefs:") and "file hashes match" in name]
     assert failed and failed[0]["passed"] is False
     assert f"{rel}: {digest}" in failed[0]["detail"]
+
+
+# ─── Check 21: shortcut values; check 3: entryType; check 20: --release ───
+
+
+def _set_column(tbl, name, fn):
+    """``tbl`` with column ``name`` replaced by fn(old values), same type."""
+    import pyarrow as pa
+    i = tbl.schema.get_field_index(name)
+    field = tbl.schema.field(i)
+    return tbl.set_column(i, field, pa.array([fn(v) for v in tbl.column(name).to_pylist()], field.type))
+
+
+def _failed(report_path):
+    return [name for name, c in _checks(report_path).items() if not c["passed"]]
+
+
+@pytest.mark.parametrize("table, column, fn", [
+    ("entries", "protein_name_primary", lambda v: "WRONG"),
+    ("entries", "go_id", lambda v: []),
+    ("entries", "lit_pubmed_id", lambda v: []),
+    ("entries", "date_created", lambda v: None),
+    ("entries", "reviewed", lambda v: not v),
+    ("features", "organism_name", lambda v: "x"),
+    ("features", "start_pos", lambda v: None if v is None else v + 1),
+])
+def test_wrong_shortcut_values_fail_check_21(small_lake, tmp_path, table, column, fn):
+    """A shortcut that is wrong in every row of a file fails check 21, even
+    though every entry still reconstructs from its source columns."""
+    lake = str(tmp_path / "lake")
+    shutil.copytree(small_lake["lake_dir"], lake)
+    _rewrite_first_file(lake, table, lambda tbl: _set_column(tbl, column, fn))
+    report_path = str(tmp_path / "report.txt")
+    result = _run_validator(lake, small_lake["jsonl"], report_path, "--spot-check-n", "100")
+    assert result.returncode == 1
+    failed = _failed(report_path)
+    check = f"{table} shortcut values match the JSONL"
+    assert any(name.startswith(check) for name in failed), failed
+    detail = next(c["detail"] for name, c in _checks(report_path).items() if name.startswith(check))
+    assert f"{table}.{column} " in detail
+
+
+def test_unknown_entry_type_fails_check_3(small_lake, tmp_path):
+    lake = str(tmp_path / "lake")
+    shutil.copytree(small_lake["lake_dir"], lake)
+    _rewrite_first_file(lake, "entries", lambda tbl: _set_column(
+        tbl, "entryType", lambda v: v.replace("Swiss-Prot", "SwissProt")))
+    report_path = str(tmp_path / "report.txt")
+    assert _run_validator(lake, small_lake["jsonl"], report_path).returncode == 1
+    check = _checks(report_path)["entries.entryType values are known"]
+    assert check["passed"] is False and "SwissProt" in check["detail"]
+
+
+@pytest.mark.parametrize("release", [True, False])
+def test_empty_shortcut_fails_check_20_in_release_mode(small_lake, tmp_path, release):
+    """go_id empty in every row: a failure for a release (--release), a
+    warning for a subset."""
+    from conftest import table_files
+    import pyarrow.parquet as pq
+    lake = str(tmp_path / "lake")
+    shutil.copytree(small_lake["lake_dir"], lake)
+    for i in range(len(table_files(lake, "entries"))):
+        # _rewrite_first_file rewrites file 0: rotate through every file.
+        files = table_files(lake, "entries")
+        path = files[i]
+        tbl = pq.read_table(path)
+        pq.write_table(_set_column(tbl, "go_id", lambda v: []), path)
+    report_path = str(tmp_path / "report.txt")
+    extra = ("--release",) if release else ()
+    _run_validator(lake, small_lake["jsonl"], report_path, *extra)
+    failed = _failed(report_path)
+    with open(report_path) as f:
+        text = f.read()
+    if release:
+        assert "entries.go_id has values" in failed, failed
+    else:
+        assert "entries.go_id has values" not in failed
+        assert "[WARN] entries.go_id has no values" in text
+
+
+def test_good_lake_passes_in_release_mode(small_lake, tmp_path):
+    report_path = str(tmp_path / "report.txt")
+    result = _run_validator(small_lake["lake_dir"], small_lake["jsonl"], report_path,
+                            "--release", "--spot-check-n", "100")
+    assert result.returncode == 0, result.stderr[-2000:]
+    names = _checks(report_path)
+    for table in ("entries", "features", "xrefs", "comments", "publications", "accession_map"):
+        assert any(n.startswith(f"{table} shortcut values match the JSONL") for n in names), table
+
+
+# ─── Check 18: accession_map mappings ─────────────────────────────────
+
+
+def _rotate_secondary_primaries(tbl):
+    """Each secondary row points at the next secondary row's primary."""
+    import pyarrow as pa
+    primary = tbl.column("is_primary").to_pylist()
+    targets = tbl.column("primary_accession").to_pylist()
+    rows = [i for i, p in enumerate(primary) if not p]
+    rotated = list(targets)
+    distinct = sorted({targets[i] for i in rows})
+    for i in rows:
+        rotated[i] = distinct[(distinct.index(targets[i]) + 1) % len(distinct)]
+    i = tbl.schema.get_field_index("primary_accession")
+    return tbl.set_column(i, tbl.schema.field(i), pa.array(rotated, tbl.schema.field(i).type))
+
+
+def _repoint_first_primary(tbl):
+    import pyarrow as pa
+    primary = tbl.column("is_primary").to_pylist()
+    targets = tbl.column("primary_accession").to_pylist()
+    first, other = [i for i, p in enumerate(primary) if p][:2]
+    targets[first] = targets[other]
+    i = tbl.schema.get_field_index("primary_accession")
+    return tbl.set_column(i, tbl.schema.field(i), pa.array(targets, tbl.schema.field(i).type))
+
+
+def _flip_first_secondary_reviewed(tbl):
+    import pyarrow as pa
+    primary = tbl.column("is_primary").to_pylist()
+    reviewed = tbl.column("reviewed").to_pylist()
+    first = primary.index(False)
+    reviewed[first] = not reviewed[first]
+    i = tbl.schema.get_field_index("reviewed")
+    return tbl.set_column(i, tbl.schema.field(i), pa.array(reviewed, pa.bool_()))
+
+
+@pytest.mark.parametrize("mutate, check", [
+    (_rotate_secondary_primaries, "accession_map secondary rows map each secondary accession to its entry"),
+    (_repoint_first_primary, "accession_map primary rows have accession == primary_accession"),
+    (_flip_first_secondary_reviewed, "accession_map (reviewed, organism_id) match the entry of primary_accession"),
+])
+def test_wrong_accession_map_mapping_fails_check_18(small_lake, tmp_path, mutate, check):
+    """Counts, duplicates and orphans all still agree: only the mapping is wrong."""
+    lake = str(tmp_path / "lake")
+    shutil.copytree(small_lake["lake_dir"], lake)
+    _rewrite_first_file(lake, "accession_map", mutate)
+    report_path = str(tmp_path / "report.txt")
+    assert _run_validator(lake, small_lake["jsonl"], report_path).returncode == 1
+    checks = _checks(report_path)
+    assert check in checks, sorted(checks)
+    assert checks[check]["passed"] is False
+
+
+# ─── Stratified sample (Swiss-Prot and TrEMBL reservoirs) ──────────────
+
+
+def _synthetic_jsonl(path, n_reviewed, n_unreviewed):
+    """JSONL.zst lines with only the keys the sampler reads, TrEMBL and
+    Swiss-Prot interleaved (the sampler must not rely on the sort)."""
+    from conftest import write_jsonl_zst
+    entries = [{"primaryAccession": f"T{i}", "entryType": "UniProtKB unreviewed (TrEMBL)"}
+               for i in range(n_unreviewed)]
+    for i in range(n_reviewed):
+        entries.insert(i * 37 % (len(entries) + 1),
+                       {"primaryAccession": f"S{i}", "entryType": "UniProtKB reviewed (Swiss-Prot)"})
+    return write_jsonl_zst(entries, str(path))
+
+
+def test_sample_is_stratified(tmp_path):
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    from validate_lake import sample_and_count_jsonl
+    jsonl = _synthetic_jsonl(tmp_path / "in.jsonl.zst", 10, 5000)
+    sample, count, unclassified = sample_and_count_jsonl(jsonl, 5)
+    assert count == 5010 and unclassified == 0
+    accessions = [e["primaryAccession"] for e in sample]
+    assert len(accessions) == len(set(accessions)) == 10
+    assert sum(a.startswith("S") for a in accessions) == 5
+    sample, _, _ = sample_and_count_jsonl(jsonl, 5, n_reviewed=8)
+    assert sum(e["primaryAccession"].startswith("S") for e in sample) == 8
+
+
+def test_sample_single_stratum(tmp_path):
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    from validate_lake import sample_and_count_jsonl
+    jsonl = _synthetic_jsonl(tmp_path / "in.jsonl.zst", 0, 300)
+    sample, count, unclassified = sample_and_count_jsonl(jsonl, 5)
+    assert (len(sample), count, unclassified) == (5, 300, 0)
+
+
+def test_sample_counts_lines_without_entry_type(tmp_path):
+    sys.path.insert(0, os.path.abspath(BIN_DIR))
+    from conftest import write_jsonl_zst
+    from validate_lake import sample_and_count_jsonl
+    jsonl = write_jsonl_zst([{"primaryAccession": "A"}, {"primaryAccession": "B",
+                             "entryType": "UniProtKB unreviewed (TrEMBL)"}],
+                            str(tmp_path / "in.jsonl.zst"))
+    assert sample_and_count_jsonl(jsonl, 5)[1:] == (2, 1)
+
+
+def test_report_shows_both_strata(small_lake, tmp_path):
+    report_path = str(tmp_path / "report.txt")
+    result = _run_validator(small_lake["lake_dir"], small_lake["jsonl"], report_path,
+                            "--spot-check-n", "5")
+    assert result.returncode == 0, result.stderr[-2000:]
+    names = list(_checks(report_path))
+    assert "reconstruction matches JSONL for 5/5 Swiss-Prot and 5/5 TrEMBL entries" in names, names
+    assert any(n.startswith("entries shortcut values match the JSONL") and "5 Swiss-Prot + 5 TrEMBL" in n
+               for n in names), names
+    assert "all 10 sampled accessions found in lake (5 Swiss-Prot + 5 TrEMBL)" in names, names

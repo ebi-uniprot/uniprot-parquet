@@ -302,6 +302,7 @@ process VALIDATE {
         --jsonl ${sorted_jsonl} \
         --expected-count \$(cat ${count_file}) \
         --spot-check-n 1000 \
+        --release \
         --memory-limit \${DUCKDB_MEM} \
         --threads ${task.cpus} \
         ${spill_flag()} \
