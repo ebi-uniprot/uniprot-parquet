@@ -130,8 +130,10 @@ grep -E "VERDICT|expected count" demo/lake/2026_03/validation_report.txt
 jupyter nbconvert --to notebook --execute demo/demo.ipynb --output-dir /tmp --output demo_run
 
 # 3. A schema diff with real differences (demo vs 52-entry lake): warnings, but the lake passes
+#    (stderr repeats the whole report: only the grep's lines matter; a crash leaves no report to grep)
+rm -f /tmp/demo_vs_small.*
 python bin/validate_lake.py --lake demo/lake/2026_03/lake --jsonl demo/lake/2026_03/sorted.jsonl.zst \
-    --previous-manifest datalake/small/lake/manifest.json -o /tmp/demo_vs_small.txt
+    --previous-manifest datalake/small/lake/manifest.json -o /tmp/demo_vs_small.txt 2>/dev/null
 grep -E "WARN|VERDICT" /tmp/demo_vs_small.txt
 #   [WARN] entries: column retyped: organism  —  fields removed: synonyms
 #   ... (about a dozen more)
