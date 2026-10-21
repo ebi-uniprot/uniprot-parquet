@@ -106,17 +106,21 @@ fi
 [[ -n "$OUTDIR_OVERRIDE" ]]    && OUTDIR="$OUTDIR_OVERRIDE"
 [[ -n "$RELEASE_OVERRIDE" ]]   && RELEASE="$RELEASE_OVERRIDE"
 
+# The box widens to its longest row.  Rows are padded by hand: ${#row}
+# counts characters (the arrow is one), printf's %-Ns width counts bytes.
+TITLE="UniProtKB → Parquet Data Lake"
+ROWS=("Mode:      $MODE" "Release:   $RELEASE" "Input:     $INPUTFILE"
+      "Output:    $OUTDIR" "Memory:    $MEMORY" "Profile:   $PROFILE")
 W=55
+for row in "$TITLE" "${ROWS[@]}"; do
+    if (( ${#row} + 3 > W )); then W=$(( ${#row} + 3 )); fi
+done
+box_row() { printf "║  %s%*s║\n" "$1" $(( W - 2 - ${#1} )) ""; }
 BAR=$(printf '═%.0s' $(seq 1 $W))
 printf "╔%s╗\n" "$BAR"
-printf "║  %-$(( W - 2 ))s║\n" "UniProtKB → Parquet Data Lake"
+box_row "$TITLE"
 printf "╠%s╣\n" "$BAR"
-printf "║  %-$(( W - 2 ))s║\n" "Mode:      $MODE"
-printf "║  %-$(( W - 2 ))s║\n" "Release:   $RELEASE"
-printf "║  %-$(( W - 2 ))s║\n" "Input:     $INPUTFILE"
-printf "║  %-$(( W - 2 ))s║\n" "Output:    $OUTDIR"
-printf "║  %-$(( W - 2 ))s║\n" "Memory:    $MEMORY"
-printf "║  %-$(( W - 2 ))s║\n" "Profile:   $PROFILE"
+for row in "${ROWS[@]}"; do box_row "$row"; done
 printf "╚%s╝\n" "$BAR"
 echo ""
 
