@@ -116,7 +116,7 @@ def page_index_delta(jsonl: str, memory: str, tmp_root: str) -> dict[str, int]:
     build_lake(jsonl, outdir, only="entries", memory=memory)
     sizes = {True: 0, False: 0}
     for f in table_files(outdir, "entries"):
-        t = pq.read_table(f)
+        t = pq.read_table(f, partitioning=None)  # stored columns only, no Hive review_status
         for with_index in sizes:
             p = f + ".rewrite"
             pq.write_table(t, p, compression="zstd", row_group_size=ROW_GROUP_SIZE,

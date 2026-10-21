@@ -254,7 +254,9 @@ def _rewrite_first_file(lake: str, table: str, transform: Callable[[Any], Any]) 
     from conftest import table_files
     from parquet_transform import _file_details
     path = table_files(lake, table)[0]
-    tbl = pq.read_table(path)
+    # partitioning=None: read_table would add review_status from the Hive path,
+    # and a file with one more column than its siblings breaks DuckDB's glob read.
+    tbl = pq.read_table(path, partitioning=None)
     pq.write_table(transform(tbl), path)
     with open(os.path.join(lake, "manifest.json")) as f:
         manifest = json.load(f)
@@ -647,7 +649,7 @@ def test_empty_shortcut_fails_check_20_in_release_mode(small_lake: dict[str, str
         # _rewrite_first_file rewrites file 0: rotate through every file.
         files = table_files(lake, "entries")
         path = files[i]
-        tbl = pq.read_table(path)
+        tbl = pq.read_table(path, partitioning=None)
         pq.write_table(_set_column(tbl, "go_id", lambda v: []), path)
     report_path = str(tmp_path / "report.txt")
     extra = ("--release",) if release else ()

@@ -201,7 +201,7 @@ class TestReleaseMarker:
         assert victim.exists()
         assert (release / "RELEASE_COMPLETE").exists()
         result = run_bin("verify_release.py", release, "--full")
-        assert result.returncode == 0, result.stdout
+        assert result.returncode == 0, result.stdout + result.stderr
 
     def test_failed_verification_writes_no_marker(self, launch_dir: pathlib.Path, project_copy: pathlib.Path) -> None:
         stub = project_copy / "bin" / "verify_release.py"
@@ -212,7 +212,7 @@ class TestReleaseMarker:
                              workflow=project_copy / "upjson2lake.nf")
         finally:
             stub.write_text(original)
-        assert result.returncode == 0, result.stdout[-3000:]
+        assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
         release = launch_dir / "out" / "unverified"
         assert (release / "provenance.json").exists()
         assert not (release / "RELEASE_COMPLETE").exists()
@@ -233,10 +233,16 @@ def test_changed_bin_module_reruns_validate(launch_dir: pathlib.Path, project_co
         result = _launch(launch_dir, "digest", "--inputfile", SMALL_JSON_GZ, workflow=workflow)
     finally:
         module.write_text(original)
-    out = result.stdout
-    assert result.returncode == 0, out[-3000:]
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
     # STREAM_JSONL, SORT_JSONL and PARQUET_TRANSFORM cached; VALIDATE and PROVENANCE run.
-    assert "completed=2 failed=0 cached=3" in out, out[-1000:]
+    # From .nextflow.log, not the console: which lines the console shows depends
+    # on where Nextflow runs (under an AI agent it prints only a summary).
+    with open(launch_dir / ".nextflow.log") as f:
+        log = f.read()
+    for process in ("STREAM_JSONL", "SORT_JSONL", "PARQUET_TRANSFORM"):
+        assert f"Cached process > {process} (" in log, process
+    for process in ("VALIDATE", "PROVENANCE"):
+        assert f"Submitted process > {process} (" in log, process
 
 
 def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir: pathlib.Path, tmp_path: pathlib.Path) -> None:
@@ -247,7 +253,7 @@ def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir: pathlib.Pa
     inputfile = tmp_path / "input.json.gz"
     shutil.copy(SMALL_JSON_GZ, inputfile)
     result = _launch(launch_dir, "oom", "--process_memory", "2.5 GB", "--inputfile", str(inputfile))
-    assert result.returncode == 0, result.stdout[-3000:]
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
     # The trace file is off in these tests (its collector needs /proc/<pid>/io);
     # .nextflow.log records each attempt.
     with open(launch_dir / ".nextflow.log") as f:
@@ -302,7 +308,7 @@ def test_prod_profile_on_stand_in_slurm(tmp_path: pathlib.Path) -> None:
          "--inputfile", SMALL_JSON_GZ, "--outdir", "out", "--release", "slurm",
          "--process_memory", "2.5 GB", "--max_time", "50h", "--expected_count", "52"],
         cwd=launch, env=env, capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout[-3000:]
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
     assert (launch / "out" / "slurm" / "RELEASE_COMPLETE").exists()
 
     def requests(job: pathlib.Path) -> tuple[str, str | None, str, str, str]:

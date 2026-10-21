@@ -346,8 +346,7 @@ nextflow run upjson2lake.nf -profile short --inputfile tests/fixtures/small.json
 
 ```bash
 ls /scratch/$USER/uplake_oom/oom/RELEASE_COMPLETE
-#   the console ends "[FAILED] completed=7 failed=2": the two failed attempts are counted,
-#   but the run succeeded (exit 0, marker written)
+#   the run succeeded (exit 0, marker written) although two attempts failed
 nextflow log last -f name,status,exit,memory,time
 #   SORT_JSONL and PARQUET_TRANSFORM twice each: FAILED 75 2.5 GB, then COMPLETED 0 5 GB (prod: 96 -> 192 GB)
 grep -l "FATAL — DuckDB ran out of memory" $NXF_WORK/*/*/.command.err   # the two failed attempts
