@@ -59,8 +59,8 @@ import orjson
 # ijson's pure-Python backend gives the same output ~11x slower than its C one
 # (yajl2_c): a day or two for a full release, against STREAM_JSONL's 48h wall
 # time, instead of 2-4 h.  main() refuses it without --allow-pure-python, so an
-# environment missing the C extension (as conda-forge's ijson was in a
-# free-threaded env) fails at once instead of crawling.
+# environment missing the C extension (conda-forge's ijson package has none:
+# environment.yml takes ijson from PyPI) fails at once instead of crawling.
 C_BACKEND_ERROR: ImportError | None = None
 try:
     import ijson.backends.yajl2_c as ijson

@@ -6,14 +6,13 @@ dependencies:
   - openjdk=21                        # Required for Nextflow (LTS, supported through 2029)
   - nextflow>=26.04                   # Pipeline orchestration (strict-syntax pipeline)
   - python>=3.14
-  - python_abi=3.14=*_cp314           # the GIL build, not free-threaded 3.14t (whose ijson lacked
-                                      # its C backend; DuckDB and orjson re-enable the GIL anyway)
+  - python_abi=3.14=*_cp314           # the GIL build: under free-threaded 3.14t, DuckDB and orjson
+                                      # re-enable the GIL anyway (with a warning)
   - pigz                              # Parallel gzip decompression
   - zstd                              # Zstandard compression for intermediate JSONL
   - pyarrow>=23.0,<24                 # Arrow columnar format + Parquet read/write
   - duckdb>=1.5,<2                    # JSON/Parquet engine (Python bindings + C library)
   - orjson>=3.11,<4                   # Fast JSON serialisation for sorted JSONL
-  - ijson>=3.5,<4                     # Streaming JSON parser
   - zstandard>=0.25,<1                 # Zstd Python bindings for test fixtures
   - pytest>=9.0,<10                   # Test runner
   - frictionless>=5.18,<6              # Frictionless Data Package validation
@@ -24,3 +23,8 @@ dependencies:
   - polars>=1.39,<2                   # DataFrame library
   - pandas>=3.0,<4                    # DataFrame library
   - matplotlib>=3.10,<4               # Plotting
+  - pip
+  - pip:
+    # Streaming JSON parser.  From PyPI: its wheels carry the C backend
+    # (yajl2_c) stream_jsonl.py requires; conda-forge's ijson has none.
+    - ijson>=3.5,<4
