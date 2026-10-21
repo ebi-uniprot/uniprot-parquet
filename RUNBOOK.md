@@ -194,7 +194,7 @@ for t,v in m['tables'].items(): print(f'{t:15} {v[\"row_count\"]:>12,}  files={l
 # 3. Resource headroom: peak_rss of SORT_JSONL, PARQUET_TRANSFORM, VALIDATE under 16 GB;
 #    realtime × (250M / N_SUBSET) is a rough full-run estimate (compare the README time budgets)
 column -t -s $'\t' datalake/reports/trace.txt | cut -c1-200
-#    macOS without a container engine records no task metrics (those columns read '-'): run this
+#    macOS without a container engine records no peak_rss (nor %cpu, I/O; realtime it does): run this
 #    stage on Linux, or time a task by hand in a copy of its work dir (a copy, so the cached task's
 #    outputs keep their mtimes and -resume still reuses them); "maximum resident set size" is peak RSS, in bytes
 #    (repeat for PARQUET_TRANSFORM and VALIDATE; bin/ goes on PATH as Nextflow puts it there).
