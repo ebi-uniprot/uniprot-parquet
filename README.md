@@ -396,7 +396,7 @@ nextflow run upjson2lake.nf -profile prod \
 | Process | Does | Publishes | Time¹ | Memory |
 | --- | --- | --- | --- | --- |
 | `STREAM_JSONL` | pigz + ijson + zstd: JSON to JSONL; records the entry count, checks it against `--expected_count` and the compressed line count | — | 2–4 h (single-threaded decompression) | 4 GB |
-| `SORT_JSONL` | DuckDB out-of-core sort; up to 1 TB spill | `sorted.jsonl.zst` | 4–8 h | 96 GB |
+| `SORT_JSONL` | External merge sort: DuckDB sorts chunks that fit in memory, then the runs are merged; ~1.5× the compressed JSONL on disk | `sorted.jsonl.zst` | 4–8 h | 96 GB |
 | `PARQUET_TRANSFORM` | Stages the JSONL to Parquet once (schema inferred), then writes the six tables (DuckDB + PyArrow); up to 2 TB disk | `lake/` | 6–12 h | 96 GB |
 | `VALIDATE` | The checks under [Validation](#validation); one pass over the JSONL, files hashed 8 at a time | `validation_report.{txt,json}` | not yet timed (24 h limit) | 96 GB |
 | `PROVENANCE` | Metadata only | `SCHEMA.md`, `provenance.json`, `RELEASE_COMPLETE`² | < 1 min | 1 GB |

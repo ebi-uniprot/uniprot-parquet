@@ -247,8 +247,9 @@ def test_changed_bin_module_reruns_validate(launch_dir: pathlib.Path, project_co
 
 def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """--process_memory 2.5 GB gives DuckDB 1920MB at attempt 1, too little
-    to sort or transform the small fixture: each exits 75 and is re-submitted
-    at 5 GB (DuckDB 3840MB), and the run succeeds."""
+    to transform the small fixture: it exits 75 and is re-submitted at 5 GB
+    (DuckDB 3840MB), and the run succeeds.  (SORT_JSONL's chunked sort fits
+    in 1920MB; its exit 75 is tested in test_sort_jsonl.py.)"""
     # An input of its own, so -resume cannot reuse the baseline's SORT_JSONL.
     inputfile = tmp_path / "input.json.gz"
     shutil.copy(SMALL_JSON_GZ, inputfile)
@@ -258,7 +259,7 @@ def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir: pathlib.Pa
     # .nextflow.log records each attempt.
     with open(launch_dir / ".nextflow.log") as f:
         log = f.read()
-    for process in ("SORT_JSONL", "PARQUET_TRANSFORM"):
+    for process in ("PARQUET_TRANSFORM",):
         assert re.search(rf"name: {process} \(\w+\); status: COMPLETED; exit: 75;", log), process
         assert f"Re-submitted process > {process}" in log, process
         attempts = re.findall(rf"name: {process} \(\w+\); status: COMPLETED; exit: (\d+); "
@@ -319,10 +320,9 @@ def test_prod_profile_on_stand_in_slurm(tmp_path: pathlib.Path) -> None:
     jobs = [requests(j) for j in sorted(state.glob("*.sbatch"), key=lambda p: int(p.stem))]
     assert jobs == [
         ("STREAM_JSONL", "4", "48:00:00", "4096M", "production"),
-        ("SORT_JSONL", "4", "24:00:00", "2560M", "production"),         # DuckDB out of memory: exit 75
-        ("SORT_JSONL", "4", "48:00:00", "5120M", "production"),         # retry: twice memory and time
-        ("PARQUET_TRANSFORM", "4", "48:00:00", "2560M", "production"),
-        ("PARQUET_TRANSFORM", "4", "50:00:00", "5120M", "production"),  # 96h capped at --max_time
+        ("SORT_JSONL", "4", "24:00:00", "2560M", "production"),
+        ("PARQUET_TRANSFORM", "4", "48:00:00", "2560M", "production"),  # DuckDB out of memory: exit 75
+        ("PARQUET_TRANSFORM", "4", "50:00:00", "5120M", "production"),  # retry: twice memory; 96h capped at --max_time
         ("VALIDATE", "8", "24:00:00", "2560M", "production"),
         ("PROVENANCE", None, "24:00:00", "1024M", "production"),
     ], jobs

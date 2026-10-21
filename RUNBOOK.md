@@ -247,7 +247,7 @@ nextflow run upjson2lake.nf -profile short --inputfile $R/oom.json.gz --outdir $
 ```bash
 for f in $FAKE_SLURM_DIR/*.sbatch; do echo "$(grep -o 'nf-[A-Z_]*' $f) $(grep -oE -- '(-c|-t|--mem|-p) \S+' $f | tr '\n' ' ')"; done
 #   smoke: -t 04:00:00 -p short, --mem 16384M for SORT/TRANSFORM/VALIDATE
-#   oom:   SORT_JSONL and PARQUET_TRANSFORM each twice: --mem 2560M, then 5120M
+#   oom:   PARQUET_TRANSFORM twice: --mem 2560M, then 5120M (SORT_JSONL's chunked sort fits in 2560M)
 #   full:  the 8a table (-p production; transform -c 4 -t 48:00:00 --mem 98304M; VALIDATE -c 8)
 ```
 
@@ -366,10 +366,11 @@ nextflow run upjson2lake.nf -profile short --inputfile tests/fixtures/small.json
 
 ```bash
 ls /scratch/$USER/uplake_oom/oom/RELEASE_COMPLETE
-#   the run succeeded (exit 0, marker written) although two attempts failed
+#   the run succeeded (exit 0, marker written) although an attempt failed
 nextflow log last -f name,status,exit,memory,time
-#   SORT_JSONL and PARQUET_TRANSFORM twice each: FAILED 75 2.5 GB, then COMPLETED 0 5 GB (prod: 96 -> 192 GB)
-grep -l "FATAL — DuckDB ran out of memory" $NXF_WORK/*/*/.command.err   # the two failed attempts
+#   PARQUET_TRANSFORM twice: FAILED 75 2.5 GB, then COMPLETED 0 5 GB (prod: 96 -> 192 GB);
+#   SORT_JSONL once (its chunked sort fits in 2.5 GB)
+grep -l "FATAL — DuckDB ran out of memory" $NXF_WORK/*/*/.command.err   # the failed attempt
 rm -rf /scratch/$USER/uplake_oom /scratch/$USER/uplake_smoke
 ```
 
@@ -399,7 +400,8 @@ EXPECTED=248799253        # replace with the real number
 pigz -t /path/to/UniProtKB.json.gz && echo GZIP_OK
 ls -l /path/to/UniProtKB.json.gz          # ~160 GB compressed for 2026 releases
 
-# 4. Disk: spill under --duckdb_temp peaks at ~1-2 TB (SORT_JSONL ~1 TB, then PARQUET_TRANSFORM);
+# 4. Disk: under --duckdb_temp, SORT_JSONL's chunks and runs (~1.5x the compressed JSONL), then
+#    PARQUET_TRANSFORM's spill (~1-2 TB);
 #    the transform also stages the JSONL as Parquet in its work dir; the published release is
 #    tens to a few hundred GB. `disk` directives are not passed to SLURM, so nothing reserves this
 df -h /scratch/$USER                      # >= 3 TB free if $NXF_WORK and spill share it, plus the output

@@ -234,7 +234,7 @@ process SORT_JSONL {
     errorStrategy { oom_retry(task.exitStatus) }
     maxRetries 1
     time { scaled_time('24h', task.attempt) }
-    disk '1 TB'          // DuckDB spill space for ORDER BY
+    disk '1 TB'          // chunks and runs of the external sort (~1.5x the compressed JSONL)
 
     publishDir "${params.outdir}/${params.release}", mode: 'copy', overwrite: true
 
