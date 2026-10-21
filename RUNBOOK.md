@@ -227,8 +227,8 @@ executor, and each job script runs on this machine. Requests are recorded in
 the input, so nothing is served from an earlier stage's cache.
 
 ```bash
-R=/path/to/scratch/rehearse; mkdir -p $R/oom/reports
-export FAKE_SLURM_DIR=$R/slurm PATH=$(pwd)/tests/fake_slurm:$PATH
+R=${TMPDIR:-/tmp}/uplake_rehearse; mkdir -p $R/oom/reports   # outside the checkout; ~1 GB
+export FAKE_SLURM_DIR=$R/slurm PATH=$(pwd)/tests/fake_slurm:$PATH   # this shell only: see below
 for run in smoke oom full; do cp tests/fixtures/small.json.gz $R/$run.json.gz; done
 
 # 7a: short profile through run_lake.sh
@@ -236,10 +236,13 @@ for run in smoke oom full; do cp tests/fixtures/small.json.gz $R/$run.json.gz; d
 # 7b: DuckDB out of memory at 2.5 GB, retried at 5 GB
 nextflow run upjson2lake.nf -profile short --inputfile $R/oom.json.gz --outdir $R/oom \
     --release oom --process_memory '2.5 GB' -ansi-log false
-# 8b: prod profile through run_lake.sh, with your queue's MaxWall
+# 8b: prod profile through run_lake.sh (on the cluster, --max-time is your queue's MaxWall: 8a)
 ./run_lake.sh full --expected-count 52 --first-release --release full --input $R/full.json.gz \
-    --outdir $R/full --duckdb-tmp $R/duckdb_tmp --max-time <MaxWall, e.g. 72h>
+    --outdir $R/full --duckdb-tmp $R/duckdb_tmp --max-time 72h
 ```
+
+The stand-ins stay on this shell's PATH: open a new shell (or `unset FAKE_SLURM_DIR` and
+restore `PATH`) before running anything else, or its jobs go to the stand-in SLURM too.
 
 **Checks**: after each run, the checks of the stage it rehearses (7a checks
 2–4, 7b, and stage 9 checks 1 and 4); then the requests each job was submitted with:
@@ -265,12 +268,14 @@ scripts directly. Write the slice outside the checkout (`S`): an untracked
 `slice_2m_lake/` in it would make later provenance record `dirty: true`.
 
 ```bash
-S=/path/to/scratch/slice; mkdir -p $S
-pigz -dc /path/to/UniProtKB.json.gz | python bin/stream_jsonl.py \
+S=$HOME/uplake_slice; mkdir -p $S         # outside the checkout, with tens of GB free
+DUMP=$HOME/UniProtKB.json.gz              # the full UniProtKB JSON dump (~160 GB; 8a), wherever it is
+pigz -dc $DUMP | python bin/stream_jsonl.py \
   | python bin/sample_jsonl.py --n 2000000 --seed 1 > $S/slice_2m.jsonl
 python bin/sort_jsonl.py $S/slice_2m.jsonl -o $S/slice_2m.sorted.jsonl.zst --memory-limit 12GB --threads 4
-/usr/bin/time -v python bin/parquet_transform.py $S/slice_2m.sorted.jsonl.zst --outdir $S/slice_2m_lake \
-    --memory-limit 12GB --threads 4 --release slice          # macOS: /usr/bin/time -l
+/usr/bin/time $([ "$(uname)" = Darwin ] && echo -l || echo -v) \
+    python bin/parquet_transform.py $S/slice_2m.sorted.jsonl.zst --outdir $S/slice_2m_lake \
+    --memory-limit 12GB --threads 4 --release slice          # peak RSS: "maximum resident set size"
 python bin/validate_lake.py --lake $S/slice_2m_lake --jsonl $S/slice_2m.sorted.jsonl.zst --expected-count 2000000
 # the measurements the provisional settings wait for (results/ is git-ignored)
 python benchmarks/bench_zstd.py --jsonl $S/slice_2m.sorted.jsonl.zst --out benchmarks/results/
@@ -397,8 +402,9 @@ git rev-parse HEAD        # write this down
 EXPECTED=248799253        # replace with the real number
 
 # 3. The dump is that release and intact
-pigz -t /path/to/UniProtKB.json.gz && echo GZIP_OK
-ls -l /path/to/UniProtKB.json.gz          # ~160 GB compressed for 2026 releases
+DUMP=/scratch/$USER/UniProtKB.json.gz     # wherever you downloaded it; 8b and 9 use $DUMP
+pigz -t $DUMP && echo GZIP_OK
+ls -l $DUMP                               # ~160 GB compressed for 2026 releases
 
 # 4. Disk: under --duckdb_temp, SORT_JSONL's chunks and runs (~1.5x the compressed JSONL), then
 #    PARQUET_TRANSFORM's spill (~1-2 TB);
@@ -429,7 +435,7 @@ checkout (`sbatch -o /scratch/$USER/uplake-%j.out ...`; only the default
 ./run_lake.sh full \
     --expected-count $EXPECTED \
     --release 2026_03 \
-    --input /path/to/UniProtKB.json.gz \
+    --input $DUMP \
     --outdir /scratch/$USER/uniprot_parquet \
     --duckdb-tmp /scratch/$USER/duckdb_tmp \
     --previous-manifest /scratch/$USER/uniprot_parquet/<previous release>/lake/manifest.json
@@ -492,7 +498,7 @@ grep -E "VERDICT|expected count" $OUT/validation_report.txt    # ALL CHECKS PASS
 
 # 2. Provenance: {'commit': '<the hash you wrote down>', 'dirty': False}, and the dump you downloaded
 python -c "import json; p=json.load(open('$OUT/provenance.json')); print(p['pipeline'], p['release']); print(p['inputs']['source'], p['tools'])"
-sha256sum /path/to/UniProtKB.json.gz     # == inputs.source.sha256
+sha256sum $DUMP                          # == inputs.source.sha256
 
 # 3. Whole-lake checksums (slow: run it as a job, ~30–60 min)
 (cd $OUT/lake && sha256sum -c --quiet SHA256SUMS.txt && echo CHECKSUMS_OK)
