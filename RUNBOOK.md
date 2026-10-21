@@ -24,6 +24,7 @@ java -version                            # 21
 which pigz zstd                          # both resolve (STREAM_JSONL needs them)
 python -c "import pyarrow, duckdb, orjson, ijson, zstandard, frictionless; print(pyarrow.__version__, duckdb.__version__)"
                                          # pyarrow 23.x, duckdb 1.5.x
+python -c "import ijson; print(ijson.backend)"   # yajl2_c: stream_jsonl.py refuses the pure-Python one
 nextflow lint upjson2lake.nf nextflow.config   # "2 files had no errors"
 ```
 
@@ -523,6 +524,7 @@ completed process and republishes every output whole.
 | A job hit its wall time | SORT_JSONL, PARQUET_TRANSFORM and VALIDATE retry once with twice the time (capped at `--max_time`); STREAM_JSONL and PROVENANCE do not. If it still fails, raise `--max-time` within the queue's limit, or re-submit. PARQUET_TRANSFORM always restarts in a fresh work dir: the whole transform re-runs. |
 | `PARQUET_TRANSFORM` OOM twice | Raise `MEMORY=` in `run_lake.sh`'s `full` mode and commit it (an uncommitted edit makes provenance record `dirty: true`), or run Nextflow directly with `--process_memory`; then re-submit. |
 | `Process requirement exceeds available memory` (local) | `--process_memory` exceeds the machine; lower it (DuckDB spills to `--duckdb_temp`). |
+| `STREAM_JSONL`: `FATAL — ijson's C backend (yajl2_c) is not available` | The env's ijson has no C extension (the pure-Python parser would take ~11x as long). `python -m pip install --force-reinstall --no-deps ijson`, check stage 0's `ijson.backend` line, and re-submit. |
 | `STREAM_JSONL`: `FATAL — count mismatch` | The dump is not the release you think, or is truncated: re-check `EXPECTED` and `pigz -t`. |
 | `STREAM_JSONL`: `FATAL — LoneSurrogate` or `Integer exceeds 64-bit range` | The dump holds data a JSON line cannot carry exactly (an unpaired `\uD800`-style escape; an integer outside −2^63 … 2^64−1); the message names the entry (and byte offset). Report it to UniProt; the pipeline refuses rather than change data. |
 | `VALIDATE` fails | Read the failed task's report: `WD=$(nextflow log last -f process,status,workdir \| awk '$1=="VALIDATE" && $2=="FAILED" {print $3}' \| tail -1)`, then `$WD/validation_report.txt` (a failing report is not published: `$OUT/validation_report.txt` is missing or a previous run's). Fix and re-submit: only processes whose code or inputs changed re-run. |

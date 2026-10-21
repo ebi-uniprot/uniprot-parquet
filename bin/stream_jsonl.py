@@ -29,6 +29,9 @@ costs a Python call per key (~40% of this step's time).
     entry count and --expected-count go to that JSON sidecar, which
     provenance.json records: the release names the dump it was built from.
 
+ijson's C backend (yajl2_c) is required: without it the script exits 1
+unless --allow-pure-python accepts the ~11x slower pure-Python parser.
+
 Usage (standalone):
     pigz -dc input.json.gz | python3 stream_jsonl.py | zstd -3 -T0 -o output.jsonl.zst
 
@@ -51,14 +54,19 @@ from collections.abc import Callable
 from decimal import Decimal
 from typing import BinaryIO
 
+import orjson
+
+# ijson's pure-Python backend gives the same output ~11x slower than its C one
+# (yajl2_c): a day or two for a full release, against STREAM_JSONL's 48h wall
+# time, instead of 2-4 h.  main() refuses it without --allow-pure-python, so an
+# environment missing the C extension (as conda-forge's ijson was in a
+# free-threaded env) fails at once instead of crawling.
+C_BACKEND_ERROR: ImportError | None = None
 try:
     import ijson.backends.yajl2_c as ijson
-except ImportError:
+except ImportError as e:
     import ijson
-    print("Warning: yajl2_c backend not found; falling back to pure Python ijson.",
-          file=sys.stderr)
-
-import orjson
+    C_BACKEND_ERROR = e
 
 DUMPS = orjson.dumps
 OPT = orjson.OPT_APPEND_NEWLINE
@@ -180,7 +188,21 @@ def main() -> None:
         help="Write a JSON sidecar identifying --source (filename, size_bytes, sha256) "
              "with entry_count and expected_count.",
     )
+    parser.add_argument(
+        "--allow-pure-python", action="store_true",
+        help="Run with ijson's pure-Python backend when its C backend (yajl2_c) "
+             "cannot be imported: the same output, ~11x slower.",
+    )
     args = parser.parse_args()
+    if C_BACKEND_ERROR is not None:
+        if not args.allow_pure_python:
+            print(f"  stream_jsonl: FATAL — ijson's C backend (yajl2_c) is not available "
+                  f"({C_BACKEND_ERROR}); the pure-Python one is ~11x slower.  Install ijson "
+                  f"with its C extension (python -m pip install --force-reinstall --no-deps ijson), "
+                  f"or pass --allow-pure-python.", file=sys.stderr)
+            sys.exit(1)
+        print("  stream_jsonl: WARNING — using ijson's pure-Python backend (~11x slower)",
+              file=sys.stderr)
     if bool(args.source) != bool(args.input_manifest):
         parser.error("--source and --input-manifest go together")
     source_sha256 = _sha256_in_thread(args.source) if args.source else None

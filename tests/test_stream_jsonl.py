@@ -52,6 +52,32 @@ def test_input_manifest_identifies_the_source_file(tmp_path: pathlib.Path) -> No
         "sha256": digest, "entry_count": 52, "expected_count": 52}
 
 
+def _stream_without_c_backend(raw: bytes, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """stream_jsonl.py run as if ijson's yajl2_c could not be imported."""
+    script = os.path.join(BIN_DIR, "stream_jsonl.py")
+    code = ("import runpy, sys; sys.modules['ijson.backends.yajl2_c'] = None; "
+            f"sys.argv = [{script!r}, *sys.argv[1:]]; runpy.run_path({script!r}, run_name='__main__')")
+    return subprocess.run([sys.executable, "-c", code, *args], input=raw, capture_output=True)
+
+
+def test_pure_python_ijson_is_refused_unless_allowed(tmp_path: pathlib.Path) -> None:
+    """Without the C backend the parse is ~11x slower: refused at once (no
+    output, no count file) unless --allow-pure-python, which gives the same lines."""
+    with gzip.open(SMALL_JSON_GZ, "rb") as f:
+        raw = f.read()
+    count_file = tmp_path / "entry_count.txt"
+    refused = _stream_without_c_backend(raw, "--count-file", str(count_file))
+    assert refused.returncode == 1
+    assert "C backend (yajl2_c) is not available" in refused.stderr.decode()
+    assert refused.stdout == b"" and not count_file.exists()
+
+    allowed = _stream_without_c_backend(raw, "--allow-pure-python", "--count-file", str(count_file))
+    assert allowed.returncode == 0, allowed.stderr.decode()
+    assert "pure-Python backend" in allowed.stderr.decode()
+    assert allowed.stdout == _stream(raw).stdout
+    assert count_file.read_text() == "52"
+
+
 def test_interrupt_is_fatal_and_leaves_no_count_file(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
                                                      capsys: pytest.CaptureFixture[str]) -> None:
     """SIGINT mid-stream must not fall through to the success path: no DONE,

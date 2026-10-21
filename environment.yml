@@ -6,6 +6,8 @@ dependencies:
   - openjdk=21                        # Required for Nextflow (LTS, supported through 2029)
   - nextflow>=26.04                   # Pipeline orchestration (strict-syntax pipeline)
   - python>=3.14
+  - python_abi=3.14=*_cp314           # the GIL build, not free-threaded 3.14t (whose ijson lacked
+                                      # its C backend; DuckDB and orjson re-enable the GIL anyway)
   - pigz                              # Parallel gzip decompression
   - zstd                              # Zstandard compression for intermediate JSONL
   - pyarrow>=23.0,<24                 # Arrow columnar format + Parquet read/write
