@@ -169,7 +169,7 @@ N_SUBSET=$(pigz -dc ~/uniprot100k.json.gz | python bin/stream_jsonl.py | wc -l);
 the heavy processes most of the machine (here 16 GB; DuckDB gets 75%):
 
 ```bash
-TMPD=/path/to/scratch/duckdb_tmp         # a filesystem with room to spill
+TMPD=${TMPDIR:-/tmp}/duckdb_tmp          # spill dir: a few GB here; elsewhere if that disk is short
 mkdir -p datalake/reports
 nextflow run upjson2lake.nf -profile local --inputfile ~/uniprot100k.json.gz \
     --outdir $(pwd)/datalake --release subset --process_memory '16 GB' \
@@ -194,6 +194,14 @@ for t,v in m['tables'].items(): print(f'{t:15} {v[\"row_count\"]:>12,}  files={l
 # 3. Resource headroom: peak_rss of SORT_JSONL, PARQUET_TRANSFORM, VALIDATE under 16 GB;
 #    realtime × (250M / N_SUBSET) is a rough full-run estimate (compare the README time budgets)
 column -t -s $'\t' datalake/reports/trace.txt | cut -c1-200
+#    macOS without a container engine records no task metrics (those columns read '-'): run this
+#    stage on Linux, or time a task by hand in a copy of its work dir (a copy, so the cached task's
+#    outputs keep their mtimes and -resume still reuses them); "maximum resident set size" is peak RSS, in bytes
+#    (repeat for PARQUET_TRANSFORM and VALIDATE; bin/ goes on PATH as Nextflow puts it there).
+#    Only with no run of this release in progress: the task clears its spill dir under $TMPD
+WD=$(nextflow log last -f process,status,workdir | awk '$1=="SORT_JSONL" && $2!="FAILED" {print $3}' | tail -1)
+rm -rf /tmp/measure && cp -RL "$WD" /tmp/measure
+(B=$(pwd)/bin; cd /tmp/measure && PATH="$B:$PATH" /usr/bin/time -l bash .command.sh)
 
 # 4. Spill went to $TMPD: subset.{SORT_JSONL,PARQUET_TRANSFORM,VALIDATE}.<hash>/, each holding a
 #    duckdb_spill_*/ only while its task runs
