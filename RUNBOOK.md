@@ -89,8 +89,13 @@ python -c "from uniprot_parquet import connect; print(connect('datalake/small/la
 ./run_lake.sh                            # same command again
 ```
 
-**Checks**: `grep -o "cachedCount=[0-9]*" .nextflow.log` gives `cachedCount=5`;
-`RELEASE_COMPLETE` is back; `datalake/reports/report.html` has a fresh mtime.
+**Checks**
+
+```bash
+grep -o "cachedCount=[0-9]*" .nextflow.log   # cachedCount=5: every process cached
+ls datalake/small/RELEASE_COMPLETE           # the marker is back
+ls -l datalake/reports/report.html           # a fresh mtime
+```
 
 ### 2c. A second release: the schema diff
 
@@ -100,9 +105,13 @@ Every production release after the first runs this way (stage 8):
 ./run_lake.sh --release small2 --previous-manifest datalake/small/lake/manifest.json
 ```
 
-**Checks**: `datalake/small2/validation_report.txt` says `ALL CHECKS PASSED`,
-and `grep -A2 "^--- 14"` on it shows `previous: release small, ...` and
-`no table or column differences`.
+**Checks**
+
+```bash
+grep VERDICT datalake/small2/validation_report.txt          # VERDICT: ALL CHECKS PASSED ...
+grep -A2 "^--- 14" datalake/small2/validation_report.txt    # previous: release small, ...
+                                                            # no table or column differences
+```
 
 ## 3. Demo lake and notebook (~5K entries)
 
