@@ -5,6 +5,9 @@ machine with Nextflow's `local` executor, then **Part B** (stages 6–10) on the
 SLURM cluster once Part A is clean. Each stage ends with checks: do not move on
 until they pass. Commands assume the repo root and an active conda env.
 
+Walkthroughs with concrete settings, step by step: [RUNBOOK-macos.md](RUNBOOK-macos.md)
+(Part A on a Mac) and [RUNBOOK-codon.md](RUNBOOK-codon.md) (Part B on EBI's Codon).
+
 ---
 
 # Part A — local
@@ -278,7 +281,8 @@ python bin/sort_jsonl.py $S/slice_2m.jsonl -o $S/slice_2m.sorted.jsonl.zst --mem
 /usr/bin/time $([ "$(uname)" = Darwin ] && echo -l || echo -v) \
     python bin/parquet_transform.py $S/slice_2m.sorted.jsonl.zst --outdir $S/slice_2m_lake \
     --memory-limit 12GB --threads 4 --release slice          # peak RSS: "maximum resident set size"
-python bin/validate_lake.py --lake $S/slice_2m_lake --jsonl $S/slice_2m.sorted.jsonl.zst --expected-count 2000000
+python bin/validate_lake.py --lake $S/slice_2m_lake --jsonl $S/slice_2m.sorted.jsonl.zst --expected-count 2000000 \
+    -o $S/validation_report.txt           # not the default ./validation_report.txt: an untracked file in the checkout
 # the measurements the provisional settings wait for (results/ is git-ignored)
 python benchmarks/bench_zstd.py --jsonl $S/slice_2m.sorted.jsonl.zst --out benchmarks/results/
 python benchmarks/bench_file_size.py --jsonl $S/slice_2m.sorted.jsonl.zst --out benchmarks/results/
@@ -382,10 +386,11 @@ column -t -s $'\t' $SCRATCH/uplake_smoke/reports/trace.txt | cut -c1-160
 
 ### 7b. Prove the OOM retry (recommended, ~5 min)
 
-With `--process_memory '2.5 GB'` DuckDB gets 1920MB: too little for the sort
-and the transform, which each allocate a 1 GiB JSON buffer, so both exit 75
-(DuckDB's out-of-memory error) and are retried at 5 GB (DuckDB 3840MB), which
-passes. `run_lake.sh subset` fixes 16 GB, so run Nextflow directly:
+With `--process_memory '2.5 GB'` DuckDB gets 1920MB: too little for the
+transform, which allocates a 1 GiB JSON buffer per thread, so it exits 75
+(DuckDB's out-of-memory error) and is retried at 5 GB (DuckDB 3840MB), which
+passes. (The sort's chunks fit in 1920MB.) `run_lake.sh subset` fixes 16 GB, so
+run Nextflow directly:
 
 ```bash
 mkdir -p $SCRATCH/uplake_oom/reports
@@ -489,7 +494,9 @@ cat $WD/entry_count.txt            # on completion: == $EXPECTED (otherwise it e
 grep "Verified:" $WD/.command.log  # zstd line count matched the streamed count
 
 # SORT_JSONL (4–8 h)
-du -sh $SCRATCH/duckdb_tmp         # grows to hundreds of GB, then shrinks
+grep -E "chunks of|chunk\(s\)|run [0-9]+/|runs merged" $WD/.command.err | tail -3
+#   "N chunk(s)" once the input is cut, then "run i/N sorted" per chunk, then "N runs merged"
+du -sh $SCRATCH/duckdb_tmp         # the chunks and runs: ~1.5x the compressed JSONL at most
 ls -l $SCRATCH/uniprot_parquet/2026_03/sorted.jsonl.zst   # published when done
 
 # PARQUET_TRANSFORM (6–12 h)
