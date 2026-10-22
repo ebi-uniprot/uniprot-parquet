@@ -322,17 +322,19 @@ cd ~/uniprot-parquet                     # run_lake.sh and the checks run from t
 micromamba activate uniprot-parquet      # carried to the compute nodes (no container)
 export SCRATCH=/scratch/$USER            # your scratch filesystem, seen by every compute node
 export NXF_WORK=$SCRATCH/nf_work         # Nextflow's work dir; the same on every re-submit (-resume looks there)
-wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //'; }
+wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //' | grep . \
+       || nextflow log last -f process,workdir | awk -v p="$1" '$1 == p {d = $2} END {print d}'; }
 ```
 
 Part B writes everything under `$SCRATCH`. `NXF_WORK` holds every intermediate
 file (the JSONL twice, the transform's staging Parquet, each output before it
 is published): hundreds of GB at full scale, so not `work/` in the checkout,
 which is often under a home-directory quota. `wd PROCESS` prints the work
-directory of PROCESS's latest attempt in the latest run from this directory
-(tasks it submitted, not cached ones: `.nextflow.log` is rewritten by every
-run). Before the first run it has nothing to show; the checks from stage 7 on
-use it.
+directory of PROCESS's latest attempt in the latest run from this directory:
+from `.nextflow.log` (rewritten by every run) for a task that run submitted,
+also while it runs; else from `nextflow log` for a task it took from the
+cache. Before the first run it has nothing to show; the checks from stage 7
+on use it.
 
 **Checks**
 

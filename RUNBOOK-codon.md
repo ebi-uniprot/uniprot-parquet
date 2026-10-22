@@ -33,11 +33,14 @@ cd ~/uniprot-parquet
 micromamba activate uniprot-parquet
 export SCRATCH=/hps/nobackup/martin/uniprot/users/$USER
 export NXF_WORK=$SCRATCH/nf_work       # the same on every re-submit: -resume looks for its cache here
-wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //'; }
+wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //' | grep . \
+       || nextflow log last -f process,workdir | awk -v p="$1" '$1 == p {d = $2} END {print d}'; }
 ```
 
 `wd PROCESS` prints the work directory of PROCESS's latest attempt in the last
-run from this directory. It has nothing to show until a run has started.
+run from this directory: from `.nextflow.log` for a task that run submitted
+(also while it runs), else from `nextflow log` (a task it took from the cache).
+It has nothing to show until a run has started.
 
 ---
 
