@@ -41,6 +41,7 @@ params.duckdb_temp    = null      // DuckDB spill directory (null = use $TMPDIR 
 params.expected_count = null      // Expected entry count (from UniProt release stats, null = skip)
 params.previous_manifest = null   // Previous release's lake/manifest.json: schema diff in the validation report
 params.max_time       = '72h'     // Wall-time cap of a retried heavy process: at most the SLURM queue's limit
+params.queue          = null      // SLURM partition (prod: the cluster's default; short: short). Read by nextflow.config
 
 // Final output directory: <outdir>/<release>/.  Process directives cannot
 // call script functions, so every publishDir spells the same path out.

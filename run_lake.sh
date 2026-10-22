@@ -36,6 +36,7 @@ RELEASE_OVERRIDE=""
 PREVIOUS_MANIFEST=""
 FIRST_RELEASE=""
 MAX_TIME=""
+QUEUE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -47,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --previous-manifest) PREVIOUS_MANIFEST="$2";  shift 2 ;;
         --first-release)  FIRST_RELEASE=1;            shift ;;
         --max-time)       MAX_TIME="$2";              shift 2 ;;
+        --queue)          QUEUE="$2";                 shift 2 ;;
         *)                echo "Unknown flag: $1"; exit 1  ;;
     esac
 done
@@ -75,7 +77,7 @@ case "$MODE" in
         PROFILE="prod"
         ;;
     *)
-        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL] [--previous-manifest FILE | --first-release] [--max-time DURATION]"
+        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL] [--previous-manifest FILE | --first-release] [--max-time DURATION] [--queue PARTITION]"
         exit 1
         ;;
 esac
@@ -116,6 +118,7 @@ fi
 TITLE="UniProtKB → Parquet Data Lake"
 ROWS=("Mode:      $MODE" "Release:   $RELEASE" "Input:     $INPUTFILE"
       "Output:    $OUTDIR" "Memory:    $MEMORY" "Profile:   $PROFILE")
+[[ "$PROFILE" == local ]] || ROWS+=("Queue:     ${QUEUE:-the profile's (prod: the cluster's default)}")
 W=55
 for row in "$TITLE" "${ROWS[@]}"; do
     if (( ${#row} + 3 > W )); then W=$(( ${#row} + 3 )); fi
@@ -190,6 +193,11 @@ fi
 # queue's limit, or SLURM rejects the retry.
 if [[ -n "$MAX_TIME" ]]; then
     NF_CMD+=(--max_time "$MAX_TIME")
+fi
+
+# SLURM partition; unset, prod leaves it to the cluster's default and short uses short.
+if [[ -n "$QUEUE" ]]; then
+    NF_CMD+=(--queue "$QUEUE")
 fi
 
 echo "Running: ${NF_CMD[*]}"

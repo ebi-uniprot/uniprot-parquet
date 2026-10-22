@@ -382,12 +382,13 @@ nextflow run upjson2lake.nf -profile prod \
 | `--expected_count` | `null` | Expected entry count, checked while streaming |
 | `--previous_manifest` | `null` | Previous release's `lake/manifest.json`, for the schema diff in the validation report |
 | `--notify_email` | `null` | Email for SLURM failure notifications |
+| `--queue` | `null` | SLURM partition: `prod` uses the cluster's default unless given, `short` uses `short` |
 
 | Profile | Executor | Queue | Notes |
 | --- | --- | --- | --- |
 | `local` | local | — | Laptop testing; CPU requests capped to the machine's cores |
-| `prod` | SLURM | `production` | Defaults 16 GB / 1 day; process directives take priority |
-| `short` | SLURM | `short` | Defaults 4 GB / 4 hours, and every process capped at 4 hours; for subset runs |
+| `prod` | SLURM | the cluster's default (`--queue` names one) | Defaults 16 GB / 1 day; process directives take priority |
+| `short` | SLURM | `short` (or `--queue`) | Defaults 4 GB / 4 hours, and every process capped at 4 hours; for subset runs |
 
 `RUNBOOK.md` is the step-by-step operator guide: locally (tests, the small lake, a schema diff, the demo, a ~200K-entry rehearsal, an optional real-data slice), then on SLURM (smoke test and OOM retry, the full build, post-run checks, recovery).
 

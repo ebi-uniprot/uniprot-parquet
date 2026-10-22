@@ -329,19 +329,20 @@ def test_prod_profile_on_stand_in_slurm(tmp_path: pathlib.Path) -> None:
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
     assert (launch / "out" / "slurm" / "RELEASE_COMPLETE").exists()
 
-    def requests(job: pathlib.Path) -> tuple[str, str | None, str, str, str]:
+    def requests(job: pathlib.Path) -> tuple[str, str | None, str, str, str | None]:
         text = job.read_text()
         name = _group(r"#SBATCH -J nf-([A-Z_]+)", text).rstrip("_")
         opts = dict(re.findall(r"#SBATCH (-c|-t|--mem|-p) (\S+)", text))
-        return name, opts.get("-c"), opts["-t"], opts["--mem"], opts["-p"]
+        return name, opts.get("-c"), opts["-t"], opts["--mem"], opts.get("-p")
     jobs = [requests(j) for j in sorted(state.glob("*.sbatch"), key=lambda p: int(p.stem))]
     assert jobs == [
-        ("STREAM_JSONL", "4", "48:00:00", "4096M", "production"),
-        ("SORT_JSONL", "4", "24:00:00", "2560M", "production"),
-        ("PARQUET_TRANSFORM", "4", "48:00:00", "2560M", "production"),  # DuckDB out of memory: exit 75
-        ("PARQUET_TRANSFORM", "4", "50:00:00", "5120M", "production"),  # retry: twice memory; 96h capped at --max_time
-        ("VALIDATE", "8", "24:00:00", "2560M", "production"),
-        ("PROVENANCE", None, "24:00:00", "1024M", "production"),
+        # no -p: the cluster's default partition (--queue names one)
+        ("STREAM_JSONL", "4", "48:00:00", "4096M", None),
+        ("SORT_JSONL", "4", "24:00:00", "2560M", None),
+        ("PARQUET_TRANSFORM", "4", "48:00:00", "2560M", None),  # DuckDB out of memory: exit 75
+        ("PARQUET_TRANSFORM", "4", "50:00:00", "5120M", None),  # retry: twice memory; 96h capped at --max_time
+        ("VALIDATE", "8", "24:00:00", "2560M", None),
+        ("PROVENANCE", None, "24:00:00", "1024M", None),
     ], jobs
     assert all("--mail-type=FAIL" in j.read_text() for j in state.glob("*.sbatch"))
 

@@ -253,7 +253,7 @@ restore `PATH`) before running anything else, or its jobs go to the stand-in SLU
 for f in $FAKE_SLURM_DIR/*.sbatch; do echo "$(grep -o 'nf-[A-Z_]*' $f) $(grep -oE -- '(-c|-t|--mem|-p) \S+' $f | tr '\n' ' ')"; done
 #   smoke: -t 04:00:00 -p short, --mem 16384M for SORT/TRANSFORM/VALIDATE
 #   oom:   PARQUET_TRANSFORM twice: --mem 2560M, then 5120M (SORT_JSONL's chunked sort fits in 2560M)
-#   full:  the 8a table (-p production; transform -c 4 -t 48:00:00 --mem 98304M; VALIDATE -c 8)
+#   full:  the 8a table (no -p; transform -c 4 -t 48:00:00 --mem 98304M; VALIDATE -c 8)
 ```
 
 This proves the profiles, the headers, the retry scaling, `run_lake.sh` and
@@ -445,10 +445,11 @@ echo $NXF_WORK                            # set (stage 6), on that scratch files
 #      SORT_JSONL         4 CPUs  96 -> 192 GB   24h -> 48h
 #      PARQUET_TRANSFORM  4 CPUs  96 -> 192 GB   48h -> 72h  (capped at --max_time)
 #      VALIDATE           8 CPUs  96 -> 192 GB   24h -> 48h
-#    (transform headers: -c 4 -t 48:00:00 --mem 98304M -p production). If MaxWall is under
+#    (transform headers: -c 4 -t 48:00:00 --mem 98304M, no -p: the cluster's default
+#    partition, or run_lake.sh --queue <partition>). If that partition's MaxWall is under
 #    72h, pass --max-time <limit> to run_lake.sh, or SLURM rejects the retry.
-sinfo -p production -o "%P %l %m %c"
-sacctmgr show qos format=name,maxwall,maxtres | grep -i production
+sinfo -o "%P %l %m %c"                    # the default partition is marked *
+sacctmgr show qos format=name,maxwall,maxtres
 ```
 
 ### 8b. Submit
@@ -468,6 +469,7 @@ checkout (`sbatch -o $SCRATCH/uplake-%j.out ...`; only the default
     --previous-manifest $SCRATCH/uniprot_parquet/<previous release>/lake/manifest.json
 #   --first-release instead of --previous-manifest for the very first release
 #   --max-time <limit> if the queue's MaxWall is under 72h
+#   --queue <partition> for one other than the cluster's default
 ```
 
 Pass `--release` explicitly (the default is `2026_03`) so the output directory

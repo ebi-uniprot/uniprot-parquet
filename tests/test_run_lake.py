@@ -53,6 +53,15 @@ def test_expected_count_must_be_a_whole_number(stub: Stub, count: str) -> None:
     assert not args_file.exists(), "nextflow was launched"
 
 
+def test_queue_reaches_nextflow_only_when_given(stub: Stub) -> None:
+    run, args_file = stub
+    assert run().returncode == 0
+    assert "--queue" not in args_file.read_text().splitlines()
+    assert run("--queue", "research").returncode == 0
+    args = args_file.read_text().splitlines()
+    assert args[args.index("--queue") + 1] == "research"
+
+
 class TestPreviousManifest:
     def test_missing_file_is_refused_by_name(self, stub: Stub) -> None:
         run, args_file = stub
