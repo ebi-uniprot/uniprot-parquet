@@ -15,6 +15,7 @@ results/
 # Test fixtures (fetched on demand, not committed)
 tests/fixtures/diverse.json.gz
 tests/fixtures/diverse_stress.json.gz
+tests/fixtures/*.tmp
 
 # Test results
 test_results/

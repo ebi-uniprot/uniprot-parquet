@@ -18,6 +18,7 @@ Usage:
 import argparse
 import gzip
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -299,8 +300,13 @@ def write_fixture(entries: list[dict[str, Any]], output: Path) -> None:
     """Write entries to gzipped JSON in {"results": [...]} format."""
     output.parent.mkdir(parents=True, exist_ok=True)
     wrapped = {"results": entries}
-    with gzip.open(output, "wt", encoding="utf-8") as f:
+    # Written beside, then renamed into place: the tests use any file at
+    # ``output``, so a fetch cut short, or two at once (a login node and a
+    # compute node sharing the checkout), must never leave a partial one.
+    tmp = output.with_name(f"{output.name}.{os.getpid()}.tmp")
+    with gzip.open(tmp, "wt", encoding="utf-8") as f:
         json.dump(wrapped, f)
+    os.replace(tmp, output)
     size_mb = output.stat().st_size / 1024 / 1024
     print(f"  Written to {output} ({size_mb:.1f} MB)")
 
