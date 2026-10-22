@@ -401,7 +401,8 @@ ls $SCRATCH/uplake_oom/oom/RELEASE_COMPLETE
 nextflow log last -f name,status,exit,memory,time
 #   PARQUET_TRANSFORM twice: FAILED 75 2.5 GB, then COMPLETED 0 5 GB (prod: 96 -> 192 GB);
 #   SORT_JSONL once (its chunked sort fits in 2.5 GB)
-grep -l "FATAL — DuckDB ran out of memory" $NXF_WORK/*/*/.command.err   # the failed attempt
+WD=$(nextflow log last -f workdir -F "status == 'FAILED'")   # the failed attempt's work dir
+grep "FATAL — DuckDB ran out of memory" $WD/.command.err
 rm -rf $SCRATCH/uplake_oom $SCRATCH/uplake_smoke
 ```
 

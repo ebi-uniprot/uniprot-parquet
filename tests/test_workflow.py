@@ -26,12 +26,18 @@ pytestmark = pytest.mark.skipif(shutil.which("nextflow") is None and not os.envi
                                 reason="nextflow not on PATH")
 
 
+def _environ() -> dict[str, str]:
+    """os.environ but the shell's NXF_WORK (RUNBOOK stage 6): each launch
+    directory keeps its own work/, out of the cluster's shared one."""
+    return {k: v for k, v in os.environ.items() if k != "NXF_WORK"}
+
+
 def _launch(launch_dir: pathlib.Path, release: str, *extra: str,
             workflow: str | pathlib.Path = WORKFLOW) -> subprocess.CompletedProcess[str]:
     """Run ``workflow`` from ``launch_dir`` into ``launch_dir/out/<release>``;
     the CompletedProcess."""
     # The bin/ scripts resolve python3 from PATH: use the interpreter running the tests.
-    env = {**os.environ, "PATH": os.path.dirname(sys.executable) + os.pathsep + os.environ["PATH"]}
+    env = {**_environ(), "PATH": os.path.dirname(sys.executable) + os.pathsep + os.environ["PATH"]}
     env.setdefault("NXF_OFFLINE", "true")
     cmd = ["nextflow", "run", str(workflow), "-c", "no_reports.config", "-profile", "local",
            "-ansi-log", "false", "-resume",
@@ -313,7 +319,7 @@ def test_prod_profile_on_stand_in_slurm(tmp_path: pathlib.Path) -> None:
         "timeline.enabled = false\ndag.enabled = false\n")
     state = tmp_path / "slurm"
     fake = os.path.join(PROJECT_ROOT, "tests", "fake_slurm")
-    env = {**os.environ, "FAKE_SLURM_DIR": str(state), "NXF_OFFLINE": "true",
+    env = {**_environ(), "FAKE_SLURM_DIR": str(state), "NXF_OFFLINE": "true",
            "PATH": os.pathsep.join([fake, os.path.dirname(sys.executable), os.environ["PATH"]])}
     result = subprocess.run(
         ["nextflow", "run", WORKFLOW, "-c", "no_reports.config", "-profile", "prod", "-ansi-log", "false",
