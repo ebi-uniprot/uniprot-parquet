@@ -298,32 +298,55 @@ production. Commit that state; stage 8 checks for it.
 
 ## 6. Cluster environment
 
-Check out the same commit (`git rev-parse HEAD`) and create the environment as
-in stage 0. `run_lake.sh` relies on the active conda env carrying over to the
-compute nodes (no container), so run the stage 0 checks, and optionally
-stage 1's tests, inside `srun --pty bash`.
-
-Nextflow's work directory holds every intermediate file (the JSONL twice, the
-transform's staging Parquet, each output before it is published): hundreds of
-GB at full scale. It defaults to `work/` in the launch directory, the checkout,
-which on a cluster is often a home directory with a quota. Put it on scratch
-that every compute node can see, in every shell you launch from:
+Once, on the login node:
 
 ```bash
-export NXF_WORK=/scratch/$USER/nf_work   # keep it the same for every re-submit: -resume looks there
+# 1. The commit Part A passed on (git rev-parse HEAD on your machine)
+git clone <repo URL> ~/uniprot-parquet        # or in an existing clone: git fetch
+cd ~/uniprot-parquet && git checkout static-lake && git pull
+git rev-parse HEAD                            # == the commit Part A passed on
+
+# 2. The environment, as in stage 0
+micromamba create -f environment.yml -y
+```
+
+Then, in **every** shell you launch from (each `tmux`/`screen` window, each new
+login; an `sbatch` head job inherits them from the shell that submits it):
+
+```bash
+cd ~/uniprot-parquet                     # run_lake.sh and the checks run from the checkout
+micromamba activate uniprot-parquet      # carried to the compute nodes (no container)
+export SCRATCH=/scratch/$USER            # your scratch filesystem, seen by every compute node
+export NXF_WORK=$SCRATCH/nf_work         # Nextflow's work dir; the same on every re-submit (-resume looks there)
+wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //'; }
+```
+
+Part B writes everything under `$SCRATCH`. `NXF_WORK` holds every intermediate
+file (the JSONL twice, the transform's staging Parquet, each output before it
+is published): hundreds of GB at full scale, so not `work/` in the checkout,
+which is often under a home-directory quota. `wd PROCESS` prints the work
+directory of PROCESS's latest attempt in the latest run from this directory
+(tasks it submitted, not cached ones: `.nextflow.log` is rewritten by every
+run). Before the first run it has nothing to show; the checks from stage 7 on
+use it.
+
+**Checks**
+
+```bash
+# 1. The stage 0 checks, on the login node
+# 2. The same on a compute node, as Nextflow's jobs see it
+srun -p short -c 4 --mem 16G -t 1:00:00 --pty bash
+#    in that shell: the every-shell block above, the stage 0 checks, and optionally
+#    stage 1's tests (~10 min); then exit
+# 3. Scratch is writable and has room (stage 8a: ~3 TB for the full run)
+mkdir -p $NXF_WORK && df -h $SCRATCH
 ```
 
 ## 7. SLURM smoke test and OOM retry (`short` queue)
 
 Run `run_lake.sh` from `tmux`/`screen` on the login node, or as a light `sbatch`
-head job: it blocks until Nextflow finishes. To find a task's work directory
-(latest attempt) during or after a run (only tasks submitted by the latest run,
-not cached ones; `.nextflow.log` is rewritten by every run):
-
-```bash
-wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //'; }
-WD=$(wd STREAM_JSONL)
-```
+head job: it blocks until Nextflow finishes. Each shell needs stage 6's
+every-shell block.
 
 ### 7a. Smoke test (52 entries)
 
@@ -333,7 +356,7 @@ PARQUET_TRANSFORM and VALIDATE.
 
 ```bash
 ./run_lake.sh subset --input tests/fixtures/small.json.gz \
-    --outdir /scratch/$USER/uplake_smoke --duckdb-tmp /scratch/$USER/duckdb_tmp
+    --outdir $SCRATCH/uplake_smoke --duckdb-tmp $SCRATCH/duckdb_tmp
 ```
 
 **Checks**
@@ -347,11 +370,11 @@ grep -c "executor > slurm" .nextflow.log              # >= 1
 grep "SLURM Job ID" $(wd STREAM_JSONL)/.command.log   # beforeScript ran on a node
 grep -l "command not found" $NXF_WORK/*/*/.command.err   # no output
 
-# 3. The 2a end-state checks on /scratch/$USER/uplake_smoke/subset/
+# 3. The 2a end-state checks on $SCRATCH/uplake_smoke/subset/
 #    (RELEASE_COMPLETE, VERDICT, expected count, provenance commit, checksums, SCHEMA.md)
 
 # 4. Resource accounting works: every row COMPLETED, exit 0, peak_rss populated
-column -t -s $'\t' /scratch/$USER/uplake_smoke/reports/trace.txt | cut -c1-160
+column -t -s $'\t' $SCRATCH/uplake_smoke/reports/trace.txt | cut -c1-160
 
 # 5. Resume: the same command again -> cachedCount=5 (before 7b: -resume continues the
 #    launch directory's last run)
@@ -365,21 +388,21 @@ and the transform, which each allocate a 1 GiB JSON buffer, so both exit 75
 passes. `run_lake.sh subset` fixes 16 GB, so run Nextflow directly:
 
 ```bash
-mkdir -p /scratch/$USER/uplake_oom/reports
+mkdir -p $SCRATCH/uplake_oom/reports
 nextflow run upjson2lake.nf -profile short --inputfile tests/fixtures/small.json.gz \
-    --outdir /scratch/$USER/uplake_oom --release oom --process_memory '2.5 GB' -ansi-log false
+    --outdir $SCRATCH/uplake_oom --release oom --process_memory '2.5 GB' -ansi-log false
 ```
 
 **Checks**
 
 ```bash
-ls /scratch/$USER/uplake_oom/oom/RELEASE_COMPLETE
+ls $SCRATCH/uplake_oom/oom/RELEASE_COMPLETE
 #   the run succeeded (exit 0, marker written) although an attempt failed
 nextflow log last -f name,status,exit,memory,time
 #   PARQUET_TRANSFORM twice: FAILED 75 2.5 GB, then COMPLETED 0 5 GB (prod: 96 -> 192 GB);
 #   SORT_JSONL once (its chunked sort fits in 2.5 GB)
 grep -l "FATAL — DuckDB ran out of memory" $NXF_WORK/*/*/.command.err   # the failed attempt
-rm -rf /scratch/$USER/uplake_oom /scratch/$USER/uplake_smoke
+rm -rf $SCRATCH/uplake_oom $SCRATCH/uplake_smoke
 ```
 
 If the run stopped at the first failure, the retry directives are not applied
@@ -387,8 +410,8 @@ on your cluster: stop and find out why. (The OOM killer, 137/140, and SLURM's
 pre-kill, 143, are retried the same way; 8a lists the retry limits.)
 
 If the nodes differ much from the stage 4 machine, repeat stage 4 here
-(`./run_lake.sh subset --outdir /scratch/$USER/uplake_subset --duckdb-tmp
-/scratch/$USER/duckdb_tmp`) and size the full run from that trace.
+(`./run_lake.sh subset --outdir $SCRATCH/uplake_subset --duckdb-tmp
+$SCRATCH/duckdb_tmp`) and size the full run from that trace.
 
 ## 8. Full UniProtKB build (`prod` queue)
 
@@ -405,7 +428,7 @@ git rev-parse HEAD        # write this down
 EXPECTED=248799253        # replace with the real number
 
 # 3. The dump is that release and intact
-DUMP=/scratch/$USER/UniProtKB.json.gz     # wherever you downloaded it; 8b and 9 use $DUMP
+DUMP=$SCRATCH/UniProtKB.json.gz           # wherever you downloaded it; 8b and 9 use $DUMP
 pigz -t $DUMP && echo GZIP_OK
 ls -l $DUMP                               # ~160 GB compressed for 2026 releases
 
@@ -413,7 +436,7 @@ ls -l $DUMP                               # ~160 GB compressed for 2026 releases
 #    PARQUET_TRANSFORM's spill (~1-2 TB);
 #    the transform also stages the JSONL as Parquet in its work dir; the published release is
 #    tens to a few hundred GB. `disk` directives are not passed to SLURM, so nothing reserves this
-df -h /scratch/$USER                      # >= 3 TB free if $NXF_WORK and spill share it, plus the output
+df -h $SCRATCH                            # >= 3 TB free if $NXF_WORK and spill share it, plus the output
 echo $NXF_WORK                            # set (stage 6), on that scratch filesystem
 
 # 5. Queue limits. Requests, attempt 1 -> retry:
@@ -431,7 +454,7 @@ sacctmgr show qos format=name,maxwall,maxtres | grep -i production
 
 From `tmux`/`screen` on the login node, or an `sbatch` head job with a wall
 time longer than the whole pipeline (2–3 days) and its output outside the
-checkout (`sbatch -o /scratch/$USER/uplake-%j.out ...`; only the default
+checkout (`sbatch -o $SCRATCH/uplake-%j.out ...`; only the default
 `slurm-<jobid>.out` is git-ignored).
 
 ```bash
@@ -439,9 +462,9 @@ checkout (`sbatch -o /scratch/$USER/uplake-%j.out ...`; only the default
     --expected-count $EXPECTED \
     --release 2026_03 \
     --input $DUMP \
-    --outdir /scratch/$USER/uniprot_parquet \
-    --duckdb-tmp /scratch/$USER/duckdb_tmp \
-    --previous-manifest /scratch/$USER/uniprot_parquet/<previous release>/lake/manifest.json
+    --outdir $SCRATCH/uniprot_parquet \
+    --duckdb-tmp $SCRATCH/duckdb_tmp \
+    --previous-manifest $SCRATCH/uniprot_parquet/<previous release>/lake/manifest.json
 #   --first-release instead of --previous-manifest for the very first release
 #   --max-time <limit> if the queue's MaxWall is under 72h
 ```
@@ -463,8 +486,8 @@ cat $WD/entry_count.txt            # on completion: == $EXPECTED (otherwise it e
 grep "Verified:" $WD/.command.log  # zstd line count matched the streamed count
 
 # SORT_JSONL (4–8 h)
-du -sh /scratch/$USER/duckdb_tmp   # grows to hundreds of GB, then shrinks
-ls -l /scratch/$USER/uniprot_parquet/2026_03/sorted.jsonl.zst   # published when done
+du -sh $SCRATCH/duckdb_tmp         # grows to hundreds of GB, then shrinks
+ls -l $SCRATCH/uniprot_parquet/2026_03/sorted.jsonl.zst   # published when done
 
 # PARQUET_TRANSFORM (6–12 h)
 grep -E "^--- |rows so far|rows in" $WD/.command.log | tail -5
@@ -493,7 +516,7 @@ ls $WD/lake/.complete/             # a <table>.json per finished table, for a ma
 ## 9. After the run
 
 ```bash
-OUT=/scratch/$USER/uniprot_parquet/2026_03
+OUT=$SCRATCH/uniprot_parquet/2026_03
 
 # 1. Marker and verdict
 ls $OUT/RELEASE_COMPLETE
@@ -512,7 +535,7 @@ import json; m=json.load(open('$OUT/lake/manifest.json'))['tables']['entries']
 print(m['row_count'], m['partitioning']['keys'][0]['row_counts'])"
 
 # 5. Resource actuals: keep them for the next release's budget
-column -t -s $'\t' /scratch/$USER/uniprot_parquet/reports/trace.txt | cut -c1-220
+column -t -s $'\t' $SCRATCH/uniprot_parquet/reports/trace.txt | cut -c1-220
 
 # 6. Query smoke tests
 python -c "
