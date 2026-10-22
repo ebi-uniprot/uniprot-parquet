@@ -43,6 +43,16 @@ done
     return run, args_file
 
 
+@pytest.mark.parametrize("count", ["--release", "abc", "0"])
+def test_expected_count_must_be_a_whole_number(stub: Stub, count: str) -> None:
+    """--expected-count $EXPECTED with EXPECTED unset takes the next flag as the count."""
+    run, args_file = stub
+    result = run("--expected-count", count, "--release", "rel")
+    assert result.returncode != 0
+    assert "must be the release's entry count" in result.stdout + result.stderr
+    assert not args_file.exists(), "nextflow was launched"
+
+
 class TestPreviousManifest:
     def test_missing_file_is_refused_by_name(self, stub: Stub) -> None:
         run, args_file = stub

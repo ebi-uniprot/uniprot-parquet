@@ -476,6 +476,10 @@ workflow {
     if (params.previous_manifest && !file(params.previous_manifest).exists()) {
         error "Previous manifest not found: ${params.previous_manifest}"
     }
+    // A flag given no value (an unset shell variable: --expected_count $N) arrives as true.
+    if (params.expected_count != null && !(params.expected_count.toString() ==~ /[1-9][0-9]*/)) {
+        error "--expected_count must be the release's entry count, a positive whole number, not '${params.expected_count}'"
+    }
     // PARQUET_TRANSFORM republishes into release_dir while VALIDATE reads the
     // previous manifest, so one from inside it would be diffed against itself
     // (and its new mtime would re-run VALIDATE on every -resume).

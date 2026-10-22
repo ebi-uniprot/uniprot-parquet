@@ -99,6 +99,17 @@ class TestPreviousManifest:
         assert "inside the release being built" in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("count", [(), ("abc",)])
+def test_expected_count_must_be_a_whole_number(launch_dir: pathlib.Path, count: tuple[str, ...]) -> None:
+    """--expected_count $N with N unset arrives as true: refused before any
+    task runs, and before the release's RELEASE_COMPLETE is removed."""
+    marker = launch_dir / "out" / "prev" / "RELEASE_COMPLETE"
+    result = _launch(launch_dir, "prev", "--expected_count", *count)
+    assert result.returncode != 0
+    assert "must be the release's entry count" in result.stdout + result.stderr
+    assert marker.exists()
+
+
 def _spill_dir_name(release_dir: pathlib.Path, process: str) -> str:
     """spill_setup's directory for a release directory and process:
     <release>.<process>.<first 8 hex digits of md5(absolute release dir)>."""

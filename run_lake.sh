@@ -88,6 +88,11 @@ if [[ "$MODE" == "full" && -z "$EXPECTED_COUNT" ]]; then
     echo "    $0 full --expected-count <N>"
     exit 1
 fi
+# An unset variable (--expected-count $EXPECTED) would take the next flag as the count.
+if [[ -n "$EXPECTED_COUNT" && ! "$EXPECTED_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: --expected-count must be the release's entry count, a positive whole number, not '$EXPECTED_COUNT'."
+    exit 1
+fi
 
 # In full mode, every release's validation report compares its schema with
 # the previous release's (README §2): say which one, or that there is none.
