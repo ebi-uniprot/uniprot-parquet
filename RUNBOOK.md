@@ -207,7 +207,9 @@ rm -rf /tmp/measure && cp -RL "$WD" /tmp/measure
 #    duckdb_spill_*/ only while its task runs
 ls $TMPD
 
-# 5. Resume: the same nextflow command again -> cachedCount=5 in .nextflow.log
+# 5. Resume: the same nextflow command again -> cachedCount=5 in .nextflow.log.  -resume continues
+#    the launch directory's last run: do this before 4c (or any other run from here), or name
+#    the run to continue: -resume <run name from nextflow log>
 
 # 6. Query it the way users will
 python -c "
@@ -351,7 +353,8 @@ grep -l "command not found" $NXF_WORK/*/*/.command.err   # no output
 # 4. Resource accounting works: every row COMPLETED, exit 0, peak_rss populated
 column -t -s $'\t' /scratch/$USER/uplake_smoke/reports/trace.txt | cut -c1-160
 
-# 5. Resume: the same command again -> cachedCount=5
+# 5. Resume: the same command again -> cachedCount=5 (before 7b: -resume continues the
+#    launch directory's last run)
 ```
 
 ### 7b. Prove the OOM retry (recommended, ~5 min)
