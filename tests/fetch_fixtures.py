@@ -317,10 +317,10 @@ def write_fixture(entries: list[dict[str, Any]], output: Path) -> None:
 def run_queries(queries: list[tuple[str, str] | tuple[str, str, int]]) -> list[list[dict[str, Any]]]:
     """Execute a list of (name, query[, limit]) tuples, return results."""
     results = []
-    for item in queries:
+    for i, item in enumerate(queries, 1):
         name, query = item[0], item[1]
         limit = item[2] if len(item) > 2 else MAX_PER_QUERY
-        entries = fetch_search(name, query, limit)
+        entries = fetch_search(f"[{i}/{len(queries)}] {name}", query, limit)
         results.append(entries)
     return results
 

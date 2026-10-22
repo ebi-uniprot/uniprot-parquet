@@ -44,16 +44,42 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+def _fixture_path(scale: str) -> str:
+    return STRESS_JSON_GZ if scale == "stress" else DIVERSE_JSON_GZ
+
+
+def _fetch_fixture(scale: str) -> bool:
+    """Run fetch_fixtures.py for ``scale``, its progress on the terminal;
+    True if the fixture is then present."""
+    result = subprocess.run([sys.executable, "-u", FETCH_SCRIPT, "--scale", scale], cwd=PROJECT_ROOT)
+    return result.returncode == 0 and os.path.exists(_fixture_path(scale))
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Download a missing fixture the selected tests need before the first of
+    them runs, with its progress shown: fetched from inside a test, it would
+    be hidden by pytest's output capture and look like a hang."""
+    scale = "stress" if session.config.getoption("--stress") else "default"
+    if (session.config.option.collectonly or os.path.exists(_fixture_path(scale))
+            or not any("fixture_json_gz" in getattr(item, "fixturenames", ()) for item in session.items)):
+        return
+    entries = "~14K" if scale == "stress" else "~4.6K"
+    capture = session.config.pluginmanager.getplugin("capturemanager")
+    with capture.global_and_fixture_disabled():
+        print(f"\n\nDownloading the {scale} test fixture, {entries} entries from rest.uniprot.org, to "
+              f"{os.path.relpath(_fixture_path(scale), PROJECT_ROOT)}.\nOne time only; a few minutes. "
+              f"Each request waits up to 180 s, so a node without internet access stalls here.\n", flush=True)
+        if not _fetch_fixture(scale):
+            pytest.exit(f"Failed to fetch the {scale} test fixture: run "
+                        f"`python tests/fetch_fixtures.py --scale {scale}` where rest.uniprot.org is reachable.",
+                        returncode=1)
+        print(flush=True)
+
+
 def _ensure_fixture(scale: str = "default") -> str:
-    """Download test fixtures from UniProtKB REST API if not already present."""
-    target = STRESS_JSON_GZ if scale == "stress" else DIVERSE_JSON_GZ
-    if os.path.exists(target):
-        return target
-    print(f"\nTest fixture not found: {target}")
-    print("Fetching from UniProtKB REST API (one-time download)...\n")
-    cmd = [sys.executable, FETCH_SCRIPT, "--scale", scale]
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT)
-    if result.returncode != 0 or not os.path.exists(target):
+    """The fixture's path, fetched first if pytest_collection_finish did not."""
+    target = _fixture_path(scale)
+    if not os.path.exists(target) and not _fetch_fixture(scale):
         pytest.fail(f"Failed to fetch test fixtures (scale={scale}). Run `python tests/fetch_fixtures.py` manually.")
     return target
 
