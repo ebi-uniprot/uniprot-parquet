@@ -124,9 +124,12 @@ column -t -s $'\t' $SCRATCH/uplake_smoke/reports/trace.txt | cut -c1-160
 #   every row COMPLETED, exit 0, peak_rss filled in (Linux records it)
 ```
 
-Then the same `run_lake.sh` command again, straight away:
+Then the smoke command again, straight away (before any other run from this
+directory: `-resume` continues the last one):
 
 ```bash
+./run_lake.sh subset --input tests/fixtures/small.json.gz \
+    --outdir $SCRATCH/uplake_smoke --duckdb-tmp $SCRATCH/duckdb_tmp
 grep -o "cachedCount=[0-9]*" .nextflow.log               # cachedCount=5
 ```
 
