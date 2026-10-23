@@ -173,7 +173,8 @@ rm -rf $SCRATCH/uplake_oom $SCRATCH/uplake_smoke
 The full run has not been sized: a 2M-entry sample of the real dump gives the
 memory, time and disk to expect (×75 for 2026_03's 150M entries: `$EXPECTED` / 2M). It reads
 the whole dump once (2–4 hours), so it runs as a job of its own. With the
-"every shell" block (it sets `DUMP`):
+"every shell" block (it sets `DUMP` and `EXPECTED`; `--total $EXPECTED` lets
+the sampler draw its 2M entries in constant memory):
 
 ```bash
 cat > $SCRATCH/slice.sh <<'EOF'
@@ -182,18 +183,19 @@ set -euo pipefail
 cd ~/uniprot-parquet
 S=$SCRATCH/uplake_slice; mkdir -p $S
 pigz -dc $DUMP | python bin/stream_jsonl.py \
-  | python bin/sample_jsonl.py --n 2000000 --seed 1 > $S/slice_2m.jsonl
+  | python bin/sample_jsonl.py --n 2000000 --total $EXPECTED --seed 1 > $S/slice_2m.jsonl
 echo "== sort";      /usr/bin/time -v python bin/sort_jsonl.py $S/slice_2m.jsonl \
     -o $S/slice_2m.sorted.jsonl.zst --memory-limit 12GB --threads 4 --temp-dir $SCRATCH/duckdb_tmp
 echo "== transform"; /usr/bin/time -v python bin/parquet_transform.py $S/slice_2m.sorted.jsonl.zst \
     --outdir $S/slice_2m_lake --memory-limit 12GB --threads 4 --release slice --temp-dir $SCRATCH/duckdb_tmp
 python bin/validate_lake.py --lake $S/slice_2m_lake --jsonl $S/slice_2m.sorted.jsonl.zst \
-    --expected-count 2000000 --temp-dir $SCRATCH/duckdb_tmp -o $S/validation_report.txt 2>/dev/null || true
+    --expected-count $(wc -l < $S/slice_2m.jsonl) --temp-dir $SCRATCH/duckdb_tmp \
+    -o $S/validation_report.txt 2>/dev/null || true
 grep VERDICT $S/validation_report.txt
 du -sh $S/slice_2m_lake
 EOF
 sbatch -p standard -c 4 --mem 16G -t 24:00:00 -J uplake-slice -o $SCRATCH/slice-%j.out \
-    --export=ALL,DUMP=$DUMP $SCRATCH/slice.sh
+    --export=ALL,DUMP=$DUMP,EXPECTED=$EXPECTED $SCRATCH/slice.sh
 ```
 
 When `squeue -u $USER` no longer lists `uplake-slice`:

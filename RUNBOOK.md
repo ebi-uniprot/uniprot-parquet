@@ -275,13 +275,15 @@ scripts directly. Write the slice outside the checkout (`S`): an untracked
 ```bash
 S=$HOME/uplake_slice; mkdir -p $S         # outside the checkout, with tens of GB free
 DUMP=$HOME/UniProtKB.json.gz              # the full UniProtKB JSON dump (~160 GB; 8a), wherever it is
+EXPECTED=150006383                        # its entry count (8a): --total keeps the sampler's memory constant
 pigz -dc $DUMP | python bin/stream_jsonl.py \
-  | python bin/sample_jsonl.py --n 2000000 --seed 1 > $S/slice_2m.jsonl
+  | python bin/sample_jsonl.py --n 2000000 --total $EXPECTED --seed 1 > $S/slice_2m.jsonl
 python bin/sort_jsonl.py $S/slice_2m.jsonl -o $S/slice_2m.sorted.jsonl.zst --memory-limit 12GB --threads 4
 /usr/bin/time $([ "$(uname)" = Darwin ] && echo -l || echo -v) \
     python bin/parquet_transform.py $S/slice_2m.sorted.jsonl.zst --outdir $S/slice_2m_lake \
     --memory-limit 12GB --threads 4 --release slice          # peak RSS: "maximum resident set size"
-python bin/validate_lake.py --lake $S/slice_2m_lake --jsonl $S/slice_2m.sorted.jsonl.zst --expected-count 2000000 \
+python bin/validate_lake.py --lake $S/slice_2m_lake --jsonl $S/slice_2m.sorted.jsonl.zst \
+    --expected-count $(wc -l < $S/slice_2m.jsonl) \
     -o $S/validation_report.txt           # not the default ./validation_report.txt: an untracked file in the checkout
 # the measurements the provisional settings wait for (results/ is git-ignored)
 python benchmarks/bench_zstd.py --jsonl $S/slice_2m.sorted.jsonl.zst --out benchmarks/results/
