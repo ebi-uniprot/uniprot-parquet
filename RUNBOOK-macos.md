@@ -57,7 +57,7 @@ REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q --stress     # ~8 min, ~8 GB RAM
 ruff check . && mypy
 ```
 
-**Expect**: `403 passed, 1 xfailed` for each pytest run (no failures, no
+**Expect**: `407 passed, 1 xfailed` for each pytest run (no failures, no
 skips); `All checks passed!` and `Success: no issues found in 38 source files`.
 
 The first run of each downloads a fixture from `rest.uniprot.org` before any
