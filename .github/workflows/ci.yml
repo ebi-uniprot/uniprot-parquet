@@ -27,9 +27,11 @@ jobs:
           python-version: "3.14"
 
       - name: Install dependencies
+        # DuckDB and PyArrow pinned as in environment.yml: unpinned, pip takes
+        # DuckDB 2, which this code does not run on yet (UPGRADE-duckdb2.md).
         run: |
           python -m pip install --upgrade pip
-          pip install duckdb pyarrow orjson ijson zstandard pytest frictionless polars pandas
+          pip install "duckdb>=1.5,<2" "pyarrow>=23,<24" orjson ijson zstandard pytest frictionless polars pandas
 
       - name: Cache test fixtures
         uses: actions/cache@v4
@@ -78,7 +80,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install duckdb pyarrow orjson ijson zstandard pytest frictionless
+          pip install "duckdb>=1.5,<2" "pyarrow>=23,<24" orjson ijson zstandard pytest frictionless
 
       - name: Run workflow tests
         env:
@@ -102,7 +104,7 @@ jobs:
       - name: Install linters
         run: |
           python -m pip install --upgrade pip
-          pip install ruff==0.16.10 mypy==2.3.1 duckdb orjson pytest
+          pip install ruff==0.16.10 mypy==2.3.1 "duckdb>=1.5,<2" orjson pytest
 
       - name: Ruff
         run: ruff check .

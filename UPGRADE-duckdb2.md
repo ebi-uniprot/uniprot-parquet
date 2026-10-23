@@ -1,6 +1,6 @@
 # DuckDB 2.0 upgrade plan
 
-Status: **planned, not started.** The first full release builds on DuckDB
+Status: **Task 0 done; Tasks 1–6 planned.** The first full release builds on DuckDB
 1.5.6, the version every local and Codon check so far has run. The upgrade
 follows that release, on DuckDB **2.0.1** (planned for 2026-11-18), except
 Task 0, which is due now.
@@ -87,7 +87,7 @@ Neither B nor G mentions a change to sorting large payloads.
 
 ---
 
-## Task 0 — pin DuckDB in CI (now, before the next push)
+## Task 0 — pin DuckDB in CI (done)
 
 **Why:** CI installs DuckDB with no version:
 `.github/workflows/ci.yml:32`, `:81` and `:105` say `pip install duckdb …`.
@@ -101,6 +101,10 @@ there, pin `pyarrow` the same way as `environment.yml` (`>=23,<24`): it is
 unpinned on lines 32 and 81 too.
 
 **Done when:** CI is green, and its log shows DuckDB 1.5.x installed.
+
+**Status:** done. `ci.yml:34, 83, 107` pin `"duckdb>=1.5,<2"` (and `:34, 83`
+`"pyarrow>=23,<24"`); in a fresh env those specs resolve to DuckDB 1.5.6 and
+PyArrow 23.0.1. The first CI run after the push confirms it.
 
 ---
 
@@ -229,7 +233,7 @@ the transform's or validator's stderr. P: methods on `execute()` results
 |---|---|---|
 | `environment.yml` | 14 | `duckdb>=1.5,<2` |
 | `pyproject.toml` | 16 | `"duckdb>=1.5,<2"` |
-| `.github/workflows/ci.yml` | 32, 81, 105 | after Task 0: `duckdb>=1.5,<2` |
+| `.github/workflows/ci.yml` | 34, 83, 107 | `"duckdb>=1.5,<2"` (Task 0) |
 | `RUNBOOK.md` | 29 | `# pyarrow 23.x, duckdb 1.5.x` |
 | `RUNBOOK-macos.md` | 45 | `# 23.x 1.5.x` |
 
