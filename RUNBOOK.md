@@ -195,7 +195,7 @@ import json; m=json.load(open('$OUT/lake/manifest.json'))
 for t,v in m['tables'].items(): print(f'{t:15} {v[\"row_count\"]:>12,}  files={len(v[\"files\"])}')"
 
 # 3. Resource headroom: peak_rss of SORT_JSONL, PARQUET_TRANSFORM, VALIDATE under 16 GB;
-#    realtime × (250M / N_SUBSET) is a rough full-run estimate (compare the README time budgets)
+#    realtime × (release entries / N_SUBSET; 150M for 2026_03) is a rough full-run estimate (README budgets)
 column -t -s $'\t' datalake/reports/trace.txt | cut -c1-200
 #    macOS without a container engine records no peak_rss (nor %cpu, I/O; realtime it does): run this
 #    stage on Linux, or time a task by hand in a copy of its work dir (a copy, so the cached task's
@@ -289,7 +289,8 @@ python benchmarks/bench_file_size.py --jsonl $S/slice_2m.sorted.jsonl.zst --out 
 python benchmarks/bench_point_lookup.py --lake $S/slice_2m_lake --serve --label slice
 ```
 
-**Checks**: the validator exits 0; `du -sh $S/slice_2m_lake` × 125 estimates the
+**Checks**: the validator exits 0; `du -sh $S/slice_2m_lake` × (release entries / 2M; 75 for
+2026_03's 150M) estimates the
 full lake; peak RSS does not scale linearly (DuckDB spills) but should stay well
 under the 96 GB the full run requests.
 

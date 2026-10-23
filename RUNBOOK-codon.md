@@ -35,6 +35,10 @@ export SCRATCH=/hps/nobackup/martin/uniprot/users/$USER
 export NXF_WORK=$SCRATCH/nf_work       # the same on every re-submit: -resume looks for its cache here
 wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //' | grep . \
        || nextflow log last -f process,workdir | awk -v p="$1" '$1 == p {d = $2} END {print d}'; }
+# The release to build (steps 6-10; step 7 checks them)
+DUMP=$SCRATCH/uniprotkb.json.gz        # the full UniProtKB JSON dump
+RELEASE=2026_03                        # the dump's UniProt release
+EXPECTED=150006383                     # its entries: 575,748 Swiss-Prot + 149,430,635 TrEMBL (2026_03)
 ```
 
 `wd PROCESS` prints the work directory of PROCESS's latest attempt in the last
@@ -167,9 +171,9 @@ rm -rf $SCRATCH/uplake_oom $SCRATCH/uplake_smoke
 ## 6. Real-data slice (RUNBOOK stage 5; optional, recommended)
 
 The full run has not been sized: a 2M-entry sample of the real dump gives the
-memory, time and disk to expect (×125 for the full ~250M entries). It reads
+memory, time and disk to expect (×75 for 2026_03's 150M entries: `$EXPECTED` / 2M). It reads
 the whole dump once (2–4 hours), so it runs as a job of its own. With the
-"every shell" block and `DUMP` (step 7) set:
+"every shell" block (it sets `DUMP`):
 
 ```bash
 cat > $SCRATCH/slice.sh <<'EOF'
@@ -200,9 +204,9 @@ grep -E "^== |Elapsed \(wall clock\)|Maximum resident|VERDICT|slice_2m_lake" $SC
 
 - **Expect**: `VERDICT: ALL CHECKS PASSED`; for the sort and the transform, a
   peak RSS (`Maximum resident set size`, in kB) well under 12 GB.
-- **Full-run estimate**: wall time ×125 (rough: memory does not grow with the
+- **Full-run estimate**: wall time ×75 (rough: memory does not grow with the
   input, time roughly does) against the README budgets (sort 4–8 h, transform
-  6–12 h); the lake's size ×125 against your space on `$SCRATCH`.
+  6–12 h); the lake's size ×75 against your space on `$SCRATCH`.
 - If the transform's estimate is over 48 h, raise the retry's time cap before
   step 8 (`--max-time`, default 72 h; `standard` allows 7 days).
 
@@ -215,12 +219,14 @@ Then `rm -rf $SCRATCH/uplake_slice $SCRATCH/slice.sh`.
 git status --short                         # nothing
 git rev-parse HEAD
 
-# 2. The release's entry count (Swiss-Prot + TrEMBL):
-#    https://www.uniprot.org/help/release-statistics, or the FTP release's relnotes.txt
-EXPECTED=<the count>
+# 2. RELEASE and EXPECTED match the dump. UniProt's current release and entry count (or
+#    https://www.uniprot.org/help/release-statistics); the dump must be from that release:
+#    downloaded on or after its release date, through the REST stream with query=*
+curl -sI "https://rest.uniprot.org/uniprotkb/search?query=*&size=1" \
+    | grep -iE "x-uniprot-release:|x-uniprot-release-date|x-total-results"   # == $RELEASE, $EXPECTED
+ls -lh --time-style=long-iso $DUMP          # dated on or after that release date
 
-# 3. The dump: that release, intact (reads all ~160 GB: ~30-60 min)
-DUMP=$SCRATCH/UniProtKB.json.gz            # wherever it is
+# 3. The dump is intact (reads all of it: ~30-60 min)
 pigz -t $DUMP && echo GZIP_OK
 
 # 4. Space: ~3 TB free on $SCRATCH (work dir, spill, release)
@@ -230,17 +236,17 @@ df -h $SCRATCH
 sacctmgr show qos format=name,maxwall,maxtres
 
 # 6. The variables the submit command expands
-echo "EXPECTED=$EXPECTED DUMP=$DUMP NXF_WORK=$NXF_WORK"
+echo "RELEASE=$RELEASE EXPECTED=$EXPECTED DUMP=$DUMP NXF_WORK=$NXF_WORK"
 ```
 
 ## 8. Submit the full run (RUNBOOK 8b)
 
-From `~/uniprot-parquet`, in a shell with the "every shell" block and step 7's
-`EXPECTED` and `DUMP`. Use the dump's release as `--release`.
+From `~/uniprot-parquet`, in a shell with the "every shell" block (it sets
+`RELEASE`, `EXPECTED` and `DUMP`, which step 7 checked).
 
 ```bash
 sbatch -p datamover -c 2 --mem 8G -t 7-00:00:00 -J uplake -o $SCRATCH/uplake-%j.out \
-    --wrap "./run_lake.sh full --expected-count $EXPECTED --release 2026_03 --input $DUMP \
+    --wrap "./run_lake.sh full --expected-count $EXPECTED --release $RELEASE --input $DUMP \
             --outdir $SCRATCH/uniprot_parquet --duckdb-tmp $SCRATCH/duckdb_tmp --first-release"
 ```
 
@@ -294,7 +300,7 @@ retried (1)` in the log. To stop the whole run: `scancel <head job id>`
 The log ends `RELEASE_COMPLETE written to ...` and `'-- ENDED`.
 
 ```bash
-OUT=$SCRATCH/uniprot_parquet/2026_03
+OUT=$SCRATCH/uniprot_parquet/$RELEASE
 ls $OUT/RELEASE_COMPLETE
 grep -E "VERDICT|expected count" $OUT/validation_report.txt     # ALL CHECKS PASSED; expected = jsonl = entries = $EXPECTED
 python -c "import json; p=json.load(open('$OUT/provenance.json')); print(p['pipeline'])"
