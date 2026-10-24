@@ -169,6 +169,21 @@ def test_validate_duckdb_is_sized_to_its_task(launch_dir: pathlib.Path) -> None:
         assert "DuckDB: memory_limit 3072MB, threads " in f.read()   # 75% of 4 GB, in MB
 
 
+def test_rerun_of_the_transform_reuses_schema_and_staging(launch_dir: pathlib.Path) -> None:
+    """The input's columns and its staged Parquet come from the cache when
+    only the transform runs again: here a new release label, which only
+    PARQUET_TRANSFORM's command names, as a re-run after its failure does."""
+    _run(launch_dir, "relabel")
+    with open(launch_dir / ".nextflow.log") as f:
+        log = f.read()
+    for process in ("STREAM_JSONL", "SORT_JSONL", "INFER_SCHEMA", "STAGE_PARQUET"):
+        assert f"Cached process > {process} (" in log, process
+    # and the transform read the staged file it was handed
+    hash_prefix = _group(r"\[(\w\w/\w+)\] Submitted process > PARQUET_TRANSFORM \(", log)
+    (workdir,) = (launch_dir / "work").glob(f"{hash_prefix}*")
+    assert "PARQUET STAGING (reused:" in (workdir / ".command.err").read_text()
+
+
 def test_duckdb_pct_from_the_command_line(launch_dir: pathlib.Path) -> None:
     """--duckdb_pct arrives as a string: every DuckDB process still gets that
     share of its task's memory (it once failed: Long.multiply(String))."""
@@ -273,12 +288,13 @@ def test_changed_bin_module_reruns_validate(launch_dir: pathlib.Path, project_co
     finally:
         module.write_text(original)
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
-    # STREAM_JSONL, SORT_JSONL and PARQUET_TRANSFORM cached; VALIDATE and PROVENANCE run.
+    # STREAM_JSONL, SORT_JSONL, INFER_SCHEMA, STAGE_PARQUET and PARQUET_TRANSFORM cached;
+    # VALIDATE and PROVENANCE run.
     # From .nextflow.log, not the console: which lines the console shows depends
     # on where Nextflow runs (under an AI agent it prints only a summary).
     with open(launch_dir / ".nextflow.log") as f:
         log = f.read()
-    for process in ("STREAM_JSONL", "SORT_JSONL", "PARQUET_TRANSFORM"):
+    for process in ("STREAM_JSONL", "SORT_JSONL", "INFER_SCHEMA", "STAGE_PARQUET", "PARQUET_TRANSFORM"):
         assert f"Cached process > {process} (" in log, process
     for process in ("VALIDATE", "PROVENANCE"):
         assert f"Submitted process > {process} (" in log, process
@@ -286,9 +302,10 @@ def test_changed_bin_module_reruns_validate(launch_dir: pathlib.Path, project_co
 
 def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """--process_memory 2.5 GB gives DuckDB 1920MB at attempt 1, too little
-    to transform the small fixture: it exits 75 and is re-submitted at 5 GB
-    (DuckDB 3840MB), and the run succeeds.  (SORT_JSONL's chunked sort fits
-    in 1920MB; its exit 75 is tested in test_sort_jsonl.py.)"""
+    to stage the small fixture (the JSON reader's 1 GiB buffer per thread): it
+    exits 75 and is re-submitted at 5 GB (DuckDB 3840MB), and the run
+    succeeds.  (The other DuckDB processes fit in 1920MB; SORT_JSONL's exit 75
+    is tested in test_sort_jsonl.py.)"""
     # An input of its own, so -resume cannot reuse the baseline's SORT_JSONL.
     inputfile = tmp_path / "input.json.gz"
     shutil.copy(SMALL_JSON_GZ, inputfile)
@@ -298,7 +315,7 @@ def test_duckdb_out_of_memory_is_retried_with_more_memory(launch_dir: pathlib.Pa
     # .nextflow.log records each attempt.
     with open(launch_dir / ".nextflow.log") as f:
         log = f.read()
-    for process in ("PARQUET_TRANSFORM",):
+    for process in ("STAGE_PARQUET",):
         assert re.search(rf"name: {process} \(\w+\); status: COMPLETED; exit: 75;", log), process
         assert f"Re-submitted process > {process}" in log, process
         attempts = re.findall(rf"name: {process} \(\w+\); status: COMPLETED; exit: (\d+); "
@@ -346,7 +363,7 @@ def test_prod_profile_on_stand_in_slurm(tmp_path: pathlib.Path) -> None:
     result = subprocess.run(
         ["nextflow", "run", WORKFLOW, "-c", "no_reports.config", "-profile", "prod", "-ansi-log", "false",
          "--inputfile", SMALL_JSON_GZ, "--outdir", "out", "--release", "slurm",
-         "--process_memory", "2.5 GB", "--max_time", "50h", "--expected_count", "52"],
+         "--process_memory", "2.5 GB", "--max_time", "30h", "--expected_count", "52"],
         cwd=launch, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
     assert (launch / "out" / "slurm" / "RELEASE_COMPLETE").exists()
@@ -361,8 +378,10 @@ def test_prod_profile_on_stand_in_slurm(tmp_path: pathlib.Path) -> None:
         # no -p: the cluster's default partition (--queue names one)
         ("STREAM_JSONL", "4", "48:00:00", "4096M", None),
         ("SORT_JSONL", "4", "24:00:00", "2560M", None),
-        ("PARQUET_TRANSFORM", "4", "48:00:00", "2560M", None),  # DuckDB out of memory: exit 75
-        ("PARQUET_TRANSFORM", "4", "50:00:00", "5120M", None),  # retry: twice memory; 96h capped at --max_time
+        ("INFER_SCHEMA", "4", "24:00:00", "2560M", None),       # 16 GB, but at most --process_memory
+        ("STAGE_PARQUET", "4", "24:00:00", "2560M", None),      # DuckDB out of memory: exit 75
+        ("STAGE_PARQUET", "4", "30:00:00", "5120M", None),      # retry: twice memory; 48h capped at --max_time
+        ("PARQUET_TRANSFORM", "4", "30:00:00", "2560M", None),  # 48h capped at --max_time
         ("VALIDATE", "8", "24:00:00", "2560M", None),
         ("PROVENANCE", None, "24:00:00", "1024M", None),
     ], jobs

@@ -57,7 +57,7 @@ REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q --stress     # ~8 min, ~8 GB RAM
 ruff check . && mypy
 ```
 
-**Expect**: `407 passed, 1 xfailed` for each pytest run (no failures, no
+**Expect**: `418 passed, 1 xfailed` for each pytest run (no failures, no
 skips); `All checks passed!` and `Success: no issues found in 38 source files`.
 
 The first run of each downloads a fixture from `rest.uniprot.org` before any
@@ -86,7 +86,7 @@ Then the same command again, and a second release diffed against the first:
 
 ```bash
 ./run_lake.sh
-grep -o "cachedCount=[0-9]*" .nextflow.log                          # cachedCount=5
+grep -o "cachedCount=[0-9]*" .nextflow.log                          # cachedCount=7
 ./run_lake.sh --release small2 --previous-manifest datalake/small/lake/manifest.json
 grep -A2 "^--- 14" datalake/small2/validation_report.txt            # previous: release small ...
                                                                     # no table or column differences
@@ -145,7 +145,7 @@ nextflow run upjson2lake.nf -profile local --inputfile ~/uniprot100k.json.gz \
     --duckdb_temp $TMPD --expected_count $N_SUBSET -resume
 ```
 
-**Expect** (about 3 minutes): five processes ✔, no retries,
+**Expect** (about 3 minutes): seven processes ✔, no retries,
 `RELEASE_COMPLETE written to .../datalake/subset`, and the macOS warning
 `Task runtime metrics are not reported` (harmless; see step 9).
 
@@ -160,7 +160,7 @@ python -c "
 import json; m=json.load(open('$OUT/lake/manifest.json'))
 for t,v in m['tables'].items(): print(f'{t:15} {v[\"row_count\"]:>12,}  files={len(v[\"files\"])}')"
 #   entries 210,706; features ~1.8M; xrefs ~7.1M; comments ~0.6M; publications ~0.9M; accession_map ~283K
-ls $TMPD                                          # subset.{SORT_JSONL,PARQUET_TRANSFORM,VALIDATE}.<hash>
+ls $TMPD                                          # subset.{SORT_JSONL,INFER_SCHEMA,STAGE_PARQUET,PARQUET_TRANSFORM,VALIDATE}.<hash>
 python -c "
 from uniprot_parquet import connect
 con = connect('$OUT/lake')
@@ -176,7 +176,7 @@ Straight after step 7, before any other `nextflow` run from this directory:
 nextflow run upjson2lake.nf -profile local --inputfile ~/uniprot100k.json.gz \
     --outdir $(pwd)/datalake --release subset --process_memory '9 GB' \
     --duckdb_temp $TMPD --expected_count $N_SUBSET -resume
-grep -o "cachedCount=[0-9]*" .nextflow.log       # cachedCount=5
+grep -o "cachedCount=[0-9]*" .nextflow.log       # cachedCount=7
 ```
 
 `cachedCount=0` means another run came in between (`nextflow log` lists
@@ -218,34 +218,40 @@ nextflow run upjson2lake.nf -profile short --inputfile $R/oom.json.gz --outdir $
 ```
 
 **Expect**: three `RELEASE_COMPLETE written` lines; in the middle run,
-`PARQUET_TRANSFORM` exits 75 and is re-submitted (that is the test).
+`STAGE_PARQUET` exits 75 and is re-submitted (that is the test).
 
 ```bash
 for f in $FAKE_SLURM_DIR/*.sbatch; do echo "$(grep -o 'nf-[A-Z_]*' $f) $(grep -oE -- '(-c|-t|--mem|-p) \S+' $f | tr '\n' ' ')"; done
 ```
 
-Sixteen lines, exactly:
+Twenty-two lines, exactly:
 
 ```
 nf-STREAM_JSONL_ -c 4 -t 04:00:00 --mem 4096M -p short
 nf-SORT_JSONL_ -c 4 -t 04:00:00 --mem 16384M -p short
+nf-INFER_SCHEMA_ -c 4 -t 04:00:00 --mem 16384M -p short
+nf-STAGE_PARQUET_ -c 4 -t 04:00:00 --mem 16384M -p short
 nf-PARQUET_TRANSFORM_ -c 4 -t 04:00:00 --mem 16384M -p short
 nf-VALIDATE_ -c 8 -t 04:00:00 --mem 16384M -p short
 nf-PROVENANCE_ -t 04:00:00 --mem 1024M -p short
 nf-STREAM_JSONL_ -c 4 -t 04:00:00 --mem 4096M -p short
 nf-SORT_JSONL_ -c 4 -t 04:00:00 --mem 2560M -p short
+nf-INFER_SCHEMA_ -c 4 -t 04:00:00 --mem 2560M -p short
+nf-STAGE_PARQUET_ -c 4 -t 04:00:00 --mem 2560M -p short
+nf-STAGE_PARQUET_ -c 4 -t 04:00:00 --mem 5120M -p short
 nf-PARQUET_TRANSFORM_ -c 4 -t 04:00:00 --mem 2560M -p short
-nf-PARQUET_TRANSFORM_ -c 4 -t 04:00:00 --mem 5120M -p short
 nf-VALIDATE_ -c 8 -t 04:00:00 --mem 2560M -p short
 nf-PROVENANCE_ -t 04:00:00 --mem 1024M -p short
 nf-STREAM_JSONL_ -c 4 -t 48:00:00 --mem 4096M
 nf-SORT_JSONL_ -c 4 -t 24:00:00 --mem 98304M
+nf-INFER_SCHEMA_ -c 4 -t 24:00:00 --mem 16384M
+nf-STAGE_PARQUET_ -c 4 -t 24:00:00 --mem 98304M
 nf-PARQUET_TRANSFORM_ -c 4 -t 48:00:00 --mem 98304M
 nf-VALIDATE_ -c 8 -t 24:00:00 --mem 98304M
 nf-PROVENANCE_ -t 24:00:00 --mem 1024M
 ```
 
-(The last five carry no `-p`: the prod profile leaves the partition to the
+(The last seven carry no `-p`: the prod profile leaves the partition to the
 cluster's default.) Now close this terminal.
 
 ## 11. Finish Part A

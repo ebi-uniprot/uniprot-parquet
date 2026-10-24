@@ -15,7 +15,9 @@
 // Architecture:
 //   1. Stream JSON(.gz) → single zstd-compressed JSONL
 //   2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (Swiss-Prot first)
-//   3. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow
+//   3. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow, in three
+//      processes so a re-run reuses each finished phase: INFER_SCHEMA (the columns),
+//      STAGE_PARQUET (one JSON parse), PARQUET_TRANSFORM (the tables)
 //   4. Production validation against the sorted JSONL (lossless reconstruction
 //      of a sample, counts, keys, sort order, checksums, partitions, ...)
 //   5. SCHEMA.md, provenance and the release marker (only if validation passes)
@@ -98,6 +100,8 @@ def bin_modules(String process) {
     [
         STREAM_JSONL:      [],
         SORT_JSONL:        ['duckdb_util.py'],
+        INFER_SCHEMA:      ['duckdb_util.py'],
+        STAGE_PARQUET:     ['duckdb_util.py'],
         PARQUET_TRANSFORM: ['duckdb_util.py'],
         VALIDATE:          ['parquet_transform.py', 'duckdb_util.py', 'reconstruct.py', 'shortcut_reference.py'],
         PROVENANCE:        ['parquet_transform.py', 'duckdb_util.py'],
@@ -267,12 +271,92 @@ process SORT_JSONL {
 }
 
 
-/* ── PROCESS: Transform sorted JSONL → Parquet tables ───────────── */
-// Stages the sorted JSONL to Parquet once (single JSON parse), then all
-// six table queries read from the staged Parquet — roughly 2× faster than
-// re-parsing JSON for each table.  Every table has its own ORDER BY; the
-// pre-sorted input gives them locality (child tables add the element's
-// array position as the last key).
+/* ── PROCESS: Infer the input's columns (a full scan of the JSONL) ── */
+// The transform's first phase, run on its own so that a re-run or a retry of
+// STAGE_PARQUET or PARQUET_TRANSFORM reuses it instead of scanning ~1 TB of
+// JSON again (~1.5 h at full scale).  schema.json is tied to its input by
+// size and mtime (parquet_transform.py --schema refuses another input).
+// Light: ~1.6 GiB at full scale, so not the heavy processes' memory.
+process INFER_SCHEMA {
+    tag 'infer_schema'
+    cpus 4
+    memory { [16.GB * task.attempt, scaled_memory(task.attempt)].min() }
+    errorStrategy { oom_retry(task.exitStatus) }
+    maxRetries 1
+    time { scaled_time('24h', task.attempt) }
+
+    input:
+    path sorted_jsonl
+    val bin_code         // bin_digest: the imported bin/ modules
+
+    output:
+    path "schema.json", emit: schema
+
+    script:
+    """
+    set -euo pipefail
+    # bin/ modules: ${bin_code}
+    echo " .-- INFER_SCHEMA BEGUN \$(date)"
+
+    ${spill_setup(task.process)}
+
+    parquet_transform.py ${sorted_jsonl} \
+        --write-schema schema.json \
+        --memory-limit ${duckdb_mem(task.memory)} \
+        --threads ${task.cpus} \
+        ${spill_flag()}
+
+    echo " '-- INFER_SCHEMA ENDED \$(date)"
+    """
+}
+
+
+/* ── PROCESS: Stage the sorted JSONL to Parquet (one JSON parse) ─── */
+// The transform's second phase: all six table queries then read the staged
+// Parquet, roughly 2× faster than re-parsing JSON for each table.  On its own
+// so that a re-run or a retry of PARQUET_TRANSFORM reuses it (~35 min at full
+// scale; the file, ~80 GB, stays in the work directory).
+process STAGE_PARQUET {
+    tag 'stage'
+    cpus 4
+    memory { scaled_memory(task.attempt) }
+    errorStrategy { oom_retry(task.exitStatus) }
+    maxRetries 1
+    time { scaled_time('24h', task.attempt) }
+    disk '200 GB'        // the staged Parquet (~80 GB at full scale)
+
+    input:
+    path sorted_jsonl
+    path schema
+    val bin_code         // bin_digest: the imported bin/ modules
+
+    output:
+    path "staged.parquet", emit: staged
+
+    script:
+    """
+    set -euo pipefail
+    # bin/ modules: ${bin_code}
+    echo " .-- STAGE_PARQUET BEGUN \$(date)"
+
+    ${spill_setup(task.process)}
+
+    parquet_transform.py ${sorted_jsonl} \
+        --schema ${schema} \
+        --write-staged staged.parquet \
+        --memory-limit ${duckdb_mem(task.memory)} \
+        --threads ${task.cpus} \
+        ${spill_flag()}
+
+    echo " '-- STAGE_PARQUET ENDED \$(date)"
+    """
+}
+
+
+/* ── PROCESS: Transform the staged Parquet → Parquet tables ──────── */
+// Builds the six tables from STAGE_PARQUET's file.  Every table has its own
+// ORDER BY; the pre-sorted input gives them locality (child tables add the
+// element's array position as the last key).
 //
 // NOTE on --skip-existing and retries:
 //   --skip-existing is useful for manual re-runs (e.g. fix root cause, then
@@ -298,7 +382,8 @@ process PARQUET_TRANSFORM {
     publishDir "${params.outdir}/${params.release}", mode: 'copy', overwrite: true, pattern: 'lake'
 
     input:
-    path sorted_jsonl
+    path sorted_jsonl    // for the completion sentinels' input fingerprint
+    path staged
     val bin_code         // bin_digest: the imported bin/ modules
 
     output:
@@ -313,6 +398,7 @@ process PARQUET_TRANSFORM {
     ${spill_setup(task.process)}
 
     parquet_transform.py ${sorted_jsonl} \
+        --staged ${staged} \
         --outdir ./lake \
         --memory-limit ${duckdb_mem(task.memory)} \
         --threads ${task.cpus} \
@@ -516,9 +602,12 @@ workflow {
     // 2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (lines kept as they are)
     SORT_JSONL(STREAM_JSONL.out.jsonl, bin_digest('SORT_JSONL'))
 
-    // 3. Transform sorted JSONL → Parquet tables
-    //    DuckDB infers the input schema from the whole file (read_json_auto).
-    PARQUET_TRANSFORM(SORT_JSONL.out.sorted_jsonl, bin_digest('PARQUET_TRANSFORM'))
+    // 3. Transform sorted JSONL → Parquet tables, in three processes so that
+    //    a re-run reuses each finished phase: the columns, inferred from the
+    //    whole file (read_json_auto); the JSONL staged to Parquet; the tables.
+    INFER_SCHEMA(SORT_JSONL.out.sorted_jsonl, bin_digest('INFER_SCHEMA'))
+    STAGE_PARQUET(SORT_JSONL.out.sorted_jsonl, INFER_SCHEMA.out.schema, bin_digest('STAGE_PARQUET'))
+    PARQUET_TRANSFORM(SORT_JSONL.out.sorted_jsonl, STAGE_PARQUET.out.staged, bin_digest('PARQUET_TRANSFORM'))
 
     // 4. Validate the Parquet lake (uses sorted JSONL as ground truth —
     //    same entries, same count, just reordered — anchored to the entry

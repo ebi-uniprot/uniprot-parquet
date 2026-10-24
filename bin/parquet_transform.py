@@ -13,7 +13,14 @@ Architecture:
   - PyArrow writes each batch as a zstd-compressed Parquet file.
   - manifest.json, datapackage.json, LICENSE, SHA256SUMS.txt and
     RELEASE.metalink describe the lake.
-  - The staging Parquet is cleaned up after all tables are written.
+  - The staging Parquet is cleaned up after all tables are written, unless it
+    was given (--staged).
+
+Phases on their own (the workflow runs each as a process, so a re-run reuses
+it): --write-schema FILE infers the columns (a full scan) and writes them;
+--schema FILE --write-staged FILE stages the input through them; --staged
+FILE builds the tables from that file.  Each refuses a file made from
+another input (size and mtime).
 
 Schema:
   The input schema is never declared: DuckDB infers it from the whole file
@@ -56,7 +63,7 @@ import re
 import shutil
 import sys
 import time
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -156,8 +163,27 @@ def _as_read(t: DuckDBPyType) -> str:
     return str(t)
 
 
+# maximum_object_size=512 MB: some UniProtKB JSON entries exceed DuckDB's
+# 16 MB default (e.g. titin has >34k residues + huge annotation arrays).
+# 512 MB covers the largest known entry.
+READ_JSON_OPTIONS = "format='newline_delimited', maximum_object_size=536870912"
+
+
 def build_read_clause(con: duckdb.DuckDBPyConnection, jsonl_path: str) -> str:
-    """Build the DuckDB read_json SQL fragment for ``jsonl_path``.
+    """The DuckDB read_json SQL fragment for ``jsonl_path``, its columns
+    inferred from the whole file (infer_read_columns)."""
+    return read_json_clause(jsonl_path, infer_read_columns(con, jsonl_path))
+
+
+def read_json_clause(jsonl_path: str, columns: Sequence[tuple[str, str]]) -> str:
+    """read_json over ``jsonl_path`` with the given (name, SQL type) columns
+    declared, so reading through it infers nothing."""
+    declared = ", ".join(f"'{_sql_escape(name)}': '{_sql_escape(t)}'" for name, t in columns)
+    return f"read_json('{_sql_escape(jsonl_path)}', {READ_JSON_OPTIONS}, columns={{{declared}}})"
+
+
+def infer_read_columns(con: duckdb.DuckDBPyConnection, jsonl_path: str) -> list[tuple[str, str]]:
+    """The (name, SQL type) of every top-level column of ``jsonl_path``.
 
     DuckDB infers column names and types from the data itself.
     This is the right approach for UniProtKB: the data is a JSON dump
@@ -181,12 +207,8 @@ def build_read_clause(con: duckdb.DuckDBPyConnection, jsonl_path: str) -> str:
     struct cannot hold.
     """
     safe_path = _sql_escape(jsonl_path)
-    # maximum_object_size=512 MB: some UniProtKB JSON entries exceed
-    # DuckDB's 16 MB default (e.g. titin has >34k residues + huge
-    # annotation arrays).  512 MB covers the largest known entry.
-    options = "format='newline_delimited', maximum_object_size=536870912"
     try:
-        rel = con.sql(f"SELECT * FROM read_json_auto('{safe_path}', {options}, "
+        rel = con.sql(f"SELECT * FROM read_json_auto('{safe_path}', {READ_JSON_OPTIONS}, "
                       f"sample_size=-1, map_inference_threshold=-1, "
                       f"field_appearance_threshold=0) LIMIT 0")
     except duckdb.NotImplementedException as e:
@@ -197,9 +219,46 @@ def build_read_clause(con: duckdb.DuckDBPyConnection, jsonl_path: str) -> str:
             f"Input has sibling keys that differ only in case (one of them {name.group(1)}): "
             f"a DuckDB struct cannot hold both, so this upstream change needs a code "
             f"decision.  DuckDB: {e}") from None
-    columns = ", ".join(f"'{_sql_escape(name)}': '{_sql_escape(_as_read(t))}'"
-                        for name, t in zip(rel.columns, rel.types, strict=True))
-    return f"read_json('{safe_path}', {options}, columns={{{columns}}})"
+    return [(name, _as_read(t)) for name, t in zip(rel.columns, rel.types, strict=True)]
+
+
+# --write-schema / --schema: the inferred columns kept for the stage that
+# reads the JSONL next (STAGE_PARQUET), so that re-running it, or the
+# transform, never repeats the scan.  Tied to its input by size and mtime.
+SCHEMA_FILE_FORMAT = "uniprot-parquet-read-schema"
+SCHEMA_FILE_VERSION = 1
+
+
+def write_schema_file(path: str, jsonl_path: str, columns: Sequence[tuple[str, str]]) -> None:
+    """Write ``columns`` (infer_read_columns) for ``jsonl_path`` to ``path``."""
+    doc = {"format": SCHEMA_FILE_FORMAT, "version": SCHEMA_FILE_VERSION,
+           "source": _input_fingerprint(jsonl_path), "read_options": READ_JSON_OPTIONS,
+           "columns": [list(c) for c in columns]}
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f, indent=1)
+    os.replace(tmp, path)
+
+
+def read_schema_file(path: str, jsonl_path: str) -> list[tuple[str, str]]:
+    """The columns write_schema_file wrote for ``jsonl_path``.  Raises
+    RuntimeError if ``path`` was written for another input (size or mtime
+    differ), with other read options, or is not such a file."""
+    with open(path) as f:
+        doc = json.load(f)
+    if not isinstance(doc, dict) or doc.get("format") != SCHEMA_FILE_FORMAT:
+        raise RuntimeError(f"{path} is not a schema file written by --write-schema")
+    if doc.get("version") != SCHEMA_FILE_VERSION:
+        raise RuntimeError(f"{path}: schema file version {doc.get('version')}, "
+                           f"this script reads {SCHEMA_FILE_VERSION}")
+    source = _input_fingerprint(jsonl_path)
+    if doc.get("source") != source:
+        raise RuntimeError(f"{path} was written for another input ({doc.get('source')}), "
+                           f"not {jsonl_path} ({source})")
+    if doc.get("read_options") != READ_JSON_OPTIONS:
+        raise RuntimeError(f"{path} was inferred with read options {doc.get('read_options')!r}, "
+                           f"not {READ_JSON_OPTIONS!r}")
+    return [(str(name), str(t)) for name, t in doc["columns"]]
 
 
 def _human_size(nbytes: int | float) -> str:
@@ -214,7 +273,25 @@ def _human_size(nbytes: int | float) -> str:
     return f"{nbytes:.1f} TB"  # pragma: no cover
 
 
-def stage_to_parquet(con: duckdb.DuckDBPyConnection, read_clause: str, staging_path: str) -> tuple[str, int]:
+# Key-value metadata of a staged file: the size and mtime of the JSONL it
+# was staged from, so --staged refuses a file staged from another input.
+STAGED_SOURCE_KEYS = ("uniprot_parquet_source_size", "uniprot_parquet_source_mtime_ns")
+
+
+def check_staged_file(staged_path: str, jsonl_path: str) -> None:
+    """Raise RuntimeError unless ``staged_path`` was staged (stage_to_parquet)
+    from ``jsonl_path``: the same size and mtime recorded in its metadata."""
+    meta = pq.read_metadata(staged_path).metadata or {}
+    recorded = {k: meta.get(k.encode(), b"").decode() for k in STAGED_SOURCE_KEYS}
+    source = _input_fingerprint(jsonl_path)
+    expected = dict(zip(STAGED_SOURCE_KEYS, (str(source["size"]), str(source["mtime_ns"])), strict=True))
+    if recorded != expected:
+        raise RuntimeError(f"{staged_path} was not staged from {jsonl_path}: it records "
+                           f"{recorded}, the input is {expected}")
+
+
+def stage_to_parquet(con: duckdb.DuckDBPyConnection, read_clause: str, staging_path: str,
+                     source: dict[str, int] | None = None) -> tuple[str, int]:
     """Convert JSONL to a Parquet staging file for faster repeated reads.
 
     Parses the JSON once and writes a zstd-compressed Parquet file.
@@ -231,10 +308,14 @@ def stage_to_parquet(con: duckdb.DuckDBPyConnection, read_clause: str, staging_p
     t0 = time.time()
     # ROW_GROUP_SIZE 100k: keeps per-group memory bounded while giving
     # DuckDB enough rows for efficient predicate pushdown and min/max stats.
+    kv = ""
+    if source is not None:
+        kv = (f", KV_METADATA {{{STAGED_SOURCE_KEYS[0]}: '{source['size']}', "
+              f"{STAGED_SOURCE_KEYS[1]}: '{source['mtime_ns']}'}}")
     con.sql(f"""
         COPY (SELECT * FROM {read_clause})
         TO '{safe_path}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)
+        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000{kv})
     """)
     staged_bytes = os.path.getsize(staging_path)
     eprint(f"  Staged in {time.time()-t0:.1f}s ({_human_size(staged_bytes)})")
@@ -2248,6 +2329,29 @@ def _build_datapackage(manifest: dict[str, Any], release: str | None) -> dict[st
 
 # ─── Main ───────────────────────────────────────────────────────────────
 
+def _infer_or_stage_only(args: argparse.Namespace, jsonl_path: str) -> None:
+    """--write-schema: infer the columns and write them.  --write-staged:
+    stage the input (through --schema's columns if given, else inferring
+    them).  Either way no table is built."""
+    con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
+    try:
+        if args.write_schema:
+            eprint(f"Inferring the columns of {jsonl_path} (a full scan)...")
+            t0 = time.time()
+            columns = infer_read_columns(con, jsonl_path)
+            write_schema_file(os.path.abspath(args.write_schema), jsonl_path, columns)
+            eprint(f"  {len(columns)} columns in {time.time() - t0:.1f}s -> {args.write_schema}")
+            return
+        staged = os.path.abspath(args.write_staged)
+        os.makedirs(os.path.dirname(staged), exist_ok=True)
+        json_clause = (read_json_clause(jsonl_path, read_schema_file(args.schema, jsonl_path))
+                       if args.schema else build_read_clause(con, jsonl_path))
+        eprint("--- PARQUET STAGING ---")
+        stage_to_parquet(con, json_clause, staged, _input_fingerprint(jsonl_path))
+    finally:
+        con.close()
+
+
 def main() -> None:
     global TARGET_FILE_BYTES, ZSTD_LEVEL, ROW_GROUP_SIZE
     parser = argparse.ArgumentParser(
@@ -2295,7 +2399,30 @@ def main() -> None:
         "--zstd-level", type=int, default=None,
         help=f"zstd compression level for Parquet pages (default {ZSTD_LEVEL}).",
     )
+    # The transform's first two phases, run on their own so that a re-run
+    # reuses their results (the workflow's INFER_SCHEMA and STAGE_PARQUET).
+    parser.add_argument(
+        "--write-schema", metavar="FILE", default=None,
+        help="Only infer the input's columns (a full scan) and write them to FILE; build nothing.",
+    )
+    parser.add_argument(
+        "--schema", metavar="FILE", default=None,
+        help="Read the input through the columns in FILE (--write-schema) instead of inferring them.",
+    )
+    parser.add_argument(
+        "--write-staged", metavar="FILE", default=None,
+        help="Only stage the input to the Parquet FILE; build no tables.",
+    )
+    parser.add_argument(
+        "--staged", metavar="FILE", default=None,
+        help="Build the tables from FILE (--write-staged from this input) instead of staging; "
+             "FILE is kept.",
+    )
     args = parser.parse_args()
+    if args.write_schema and (args.schema or args.write_staged or args.staged):
+        parser.error("--write-schema infers the columns: it takes no --schema, --write-staged or --staged")
+    if args.staged and (args.schema or args.write_staged):
+        parser.error("--staged replaces staging: it takes no --schema or --write-staged")
 
     if args.target_file_bytes:
         TARGET_FILE_BYTES = args.target_file_bytes
@@ -2315,6 +2442,9 @@ def main() -> None:
     if not os.path.exists(jsonl_path):
         eprint(f"ERROR: Input file not found: {jsonl_path}")
         sys.exit(1)
+    if args.write_schema or args.write_staged:
+        _infer_or_stage_only(args, jsonl_path)
+        return
     outdir = os.path.abspath(args.outdir)
     os.makedirs(outdir, exist_ok=True)
 
@@ -2331,7 +2461,7 @@ def main() -> None:
     # ── Init DuckDB ──
     con = init_duckdb(args.memory_limit, args.threads, args.temp_dir)
     staging_dir = os.path.join(outdir, ".staging")
-    staging_path = os.path.join(staging_dir, "staged.parquet")
+    staging_path = os.path.abspath(args.staged) if args.staged else os.path.join(staging_dir, "staged.parquet")
 
     try:
         # ── Determine which tables to write ──
@@ -2354,12 +2484,19 @@ def main() -> None:
 
         # ── Stage JSONL → Parquet (parse JSON once, read Parquet 5× faster) ──
         staged_bytes: int | None
-        if tables_to_write:
+        if tables_to_write and args.staged:
+            eprint(f"\n--- PARQUET STAGING (reused: {staging_path}) ---")
+            check_staged_file(staging_path, jsonl_path)
+            read_clause = f"read_parquet('{_sql_escape(staging_path)}')"
+            staged_bytes = os.path.getsize(staging_path)
+        elif tables_to_write:
             eprint("\n--- PARQUET STAGING ---")
             os.makedirs(staging_dir, exist_ok=True)
-            # Schema inference scans the whole JSONL, so only when staging.
-            read_clause, staged_bytes = stage_to_parquet(
-                con, build_read_clause(con, jsonl_path), staging_path)
+            # Schema inference scans the whole JSONL, so only when staging
+            # (and not at all with a stored --schema).
+            json_clause = (read_json_clause(jsonl_path, read_schema_file(args.schema, jsonl_path))
+                           if args.schema else build_read_clause(con, jsonl_path))
+            read_clause, staged_bytes = stage_to_parquet(con, json_clause, staging_path, source)
         else:
             eprint("\n--- PARQUET STAGING (skipped — all tables already written) ---")
             staged_bytes = None
@@ -2534,8 +2671,9 @@ def main() -> None:
         eprint("=" * 60)
 
     finally:
-        # Clean up staging file (also on crash, to avoid leaking 160GB+ to disk)
-        if os.path.exists(staging_path):
+        # Clean up staging file (also on crash, to avoid leaking 160GB+ to
+        # disk); a --staged file is the caller's, and stays.
+        if not args.staged and os.path.exists(staging_path):
             os.remove(staging_path)
             eprint(f"\n  Removed staging file: {staging_path}")
         if os.path.isdir(staging_dir) and not os.listdir(staging_dir):

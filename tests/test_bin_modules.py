@@ -36,7 +36,8 @@ def test_bin_modules_list_every_imported_module() -> None:
     table = table[:table.index("\n}\n")]
     lists = {p: set(re.findall(r"'([^']+)'", names))
              for p, names in re.findall(r"(\w+):\s*\[([^]]*)\]", table)}
-    assert set(lists) == {"STREAM_JSONL", "SORT_JSONL", "PARQUET_TRANSFORM", "VALIDATE", "PROVENANCE"}
+    assert set(lists) == {"STREAM_JSONL", "SORT_JSONL", "INFER_SCHEMA", "STAGE_PARQUET",
+                          "PARQUET_TRANSFORM", "VALIDATE", "PROVENANCE"}
     for process, listed in lists.items():
         body = text[text.index(f"process {process} {{"):]
         body = body[:body.index("\n}\n")]

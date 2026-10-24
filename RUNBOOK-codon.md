@@ -103,7 +103,7 @@ one shell only:
 REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q
 ```
 
-**Expect**: `407 passed, 1 xfailed`. The first run downloads a fixture from
+**Expect**: `418 passed, 1 xfailed`. The first run downloads a fixture from
 `rest.uniprot.org` before any test starts and says so ("Downloading the
 default test fixture…", one line per query, a few minutes). If a test fails
 with a zlib or gzip error, `gzip -t tests/fixtures/*.json.gz` names the damaged
@@ -134,7 +134,7 @@ directory: `-resume` continues the last one):
 ```bash
 ./run_lake.sh subset --input tests/fixtures/small.json.gz \
     --outdir $SCRATCH/uplake_smoke --duckdb-tmp $SCRATCH/duckdb_tmp
-grep -o "cachedCount=[0-9]*" .nextflow.log               # cachedCount=5
+grep -o "cachedCount=[0-9]*" .nextflow.log               # cachedCount=7
 ```
 
 **5b. Out-of-memory retry** (~5 minutes):
@@ -145,7 +145,7 @@ nextflow run upjson2lake.nf -profile short --inputfile tests/fixtures/small.json
     --outdir $SCRATCH/uplake_oom --release oom --process_memory '2.5 GB' -ansi-log false
 ```
 
-**Expect**: `PARQUET_TRANSFORM ... terminated with an error exit status (75) --
+**Expect**: `STAGE_PARQUET ... terminated with an error exit status (75) --
 Execution is retried (1)`, then `RELEASE_COMPLETE written`.
 
 ```bash
@@ -157,8 +157,10 @@ exactly:
 ```
 STREAM_JSONL (stream)           COMPLETED  0   4 GB    4h
 SORT_JSONL (sort_jsonl)         COMPLETED  0   2.5 GB  4h
-PARQUET_TRANSFORM (transform)   FAILED     75  2.5 GB  4h
-PARQUET_TRANSFORM (transform)   COMPLETED  0   5 GB    4h
+INFER_SCHEMA (infer_schema)     COMPLETED  0   2.5 GB  4h
+STAGE_PARQUET (stage)           FAILED     75  2.5 GB  4h
+STAGE_PARQUET (stage)           COMPLETED  0   5 GB    4h
+PARQUET_TRANSFORM (transform)   COMPLETED  0   2.5 GB  4h
 VALIDATE (validate)             COMPLETED  0   2.5 GB  4h
 PROVENANCE (provenance)         COMPLETED  0   1 GB    4h
 ```
@@ -284,6 +286,10 @@ WD=$(wd STREAM_JSONL); tail -2 $WD/.command.log; cat $WD/entry_count.txt
 
 # SORT_JSONL (4-8 h): "N chunk(s)", then "run i/N sorted", then "N runs merged"
 WD=$(wd SORT_JSONL); grep -E "chunk\(s\)|run [0-9]+/|runs merged" $WD/.command.err | tail -3
+
+# INFER_SCHEMA (~1.5 h), then STAGE_PARQUET (~35 min): a line each when done
+WD=$(wd INFER_SCHEMA); tail -1 $WD/.command.log       # "N columns in …s -> schema.json"
+WD=$(wd STAGE_PARQUET); tail -1 $WD/.command.log      # "Staged in …s (… GB)"
 
 # PARQUET_TRANSFORM (6-12 h): one table after another
 WD=$(wd PARQUET_TRANSFORM); grep -E "^--- |rows in" $WD/.command.log | tail -4

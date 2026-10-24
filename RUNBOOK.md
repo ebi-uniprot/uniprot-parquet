@@ -65,7 +65,7 @@ reachable and copy `tests/fixtures/diverse*.json.gz` over.
 ```bash
 # 1. run_lake.sh exited 0 (it exits 1 unless RELEASE_COMPLETE was written); every process succeeded
 ls datalake/small/RELEASE_COMPLETE
-grep -o "succeededCount=[0-9]*; failedCount=[0-9]*" .nextflow.log   # succeededCount=5; failedCount=0
+grep -o "succeededCount=[0-9]*; failedCount=[0-9]*" .nextflow.log   # succeededCount=7; failedCount=0
 
 # 2. Validation, including the pre-sort entry-count anchor
 grep -E "VERDICT|expected count|reconstruction matches|shortcut values match" datalake/small/validation_report.txt
@@ -96,7 +96,7 @@ python -c "from uniprot_parquet import connect; print(connect('datalake/small/la
 **Checks**
 
 ```bash
-grep -o "cachedCount=[0-9]*" .nextflow.log   # cachedCount=5: every process cached
+grep -o "cachedCount=[0-9]*" .nextflow.log   # cachedCount=7: every process cached
 ls datalake/small/RELEASE_COMPLETE           # the marker is back
 ls -l datalake/reports/report.html           # a fresh mtime
 ```
@@ -194,7 +194,7 @@ python -c "
 import json; m=json.load(open('$OUT/lake/manifest.json'))
 for t,v in m['tables'].items(): print(f'{t:15} {v[\"row_count\"]:>12,}  files={len(v[\"files\"])}')"
 
-# 3. Resource headroom: peak_rss of SORT_JSONL, PARQUET_TRANSFORM, VALIDATE under 16 GB;
+# 3. Resource headroom: peak_rss of SORT_JSONL, STAGE_PARQUET, PARQUET_TRANSFORM, VALIDATE under 16 GB;
 #    realtime × (release entries / N_SUBSET; 150M for 2026_03) is a rough full-run estimate (README budgets)
 column -t -s $'\t' datalake/reports/trace.txt | cut -c1-200
 #    macOS without a container engine records no peak_rss (nor %cpu, I/O; realtime it does): run this
@@ -206,11 +206,11 @@ WD=$(nextflow log last -f process,status,workdir | awk '$1=="SORT_JSONL" && $2!=
 rm -rf /tmp/measure && cp -RL "$WD" /tmp/measure
 (B=$(pwd)/bin; cd /tmp/measure && PATH="$B:$PATH" /usr/bin/time -l bash .command.sh)
 
-# 4. Spill went to $TMPD: subset.{SORT_JSONL,PARQUET_TRANSFORM,VALIDATE}.<hash>/, each holding a
+# 4. Spill went to $TMPD: subset.{SORT_JSONL,INFER_SCHEMA,STAGE_PARQUET,PARQUET_TRANSFORM,VALIDATE}.<hash>/, each holding a
 #    duckdb_spill_*/ only while its task runs
 ls $TMPD
 
-# 5. Resume: the same nextflow command again -> cachedCount=5 in .nextflow.log.  -resume continues
+# 5. Resume: the same nextflow command again -> cachedCount=7 in .nextflow.log.  -resume continues
 #    the launch directory's last run: do this before 4c (or any other run from here), or name
 #    the run to continue: -resume <run name from nextflow log>
 
@@ -254,9 +254,9 @@ restore `PATH`) before running anything else, or its jobs go to the stand-in SLU
 
 ```bash
 for f in $FAKE_SLURM_DIR/*.sbatch; do echo "$(grep -o 'nf-[A-Z_]*' $f) $(grep -oE -- '(-c|-t|--mem|-p) \S+' $f | tr '\n' ' ')"; done
-#   smoke: -t 04:00:00 -p short, --mem 16384M for SORT/TRANSFORM/VALIDATE
-#   oom:   PARQUET_TRANSFORM twice: --mem 2560M, then 5120M (SORT_JSONL's chunked sort fits in 2560M)
-#   full:  the 8a table (no -p; transform -c 4 -t 48:00:00 --mem 98304M; VALIDATE -c 8)
+#   smoke: -t 04:00:00 -p short, --mem 16384M for SORT/INFER/STAGE/TRANSFORM/VALIDATE
+#   oom:   STAGE_PARQUET twice: --mem 2560M, then 5120M (the other DuckDB processes fit in 2560M)
+#   full:  the 8a table (no -p; INFER_SCHEMA --mem 16384M; transform -c 4 -t 48:00:00 --mem 98304M; VALIDATE -c 8)
 ```
 
 This proves the profiles, the headers, the retry scaling, `run_lake.sh` and
@@ -330,7 +330,7 @@ wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: /
 ```
 
 Part B writes everything under `$SCRATCH`. `NXF_WORK` holds every intermediate
-file (the JSONL twice, the transform's staging Parquet, each output before it
+file (the JSONL twice, the schema and the staged Parquet, each output before it
 is published): hundreds of GB at full scale, so not `work/` in the checkout,
 which is often under a home-directory quota. `wd PROCESS` prints the work
 directory of PROCESS's latest attempt in the latest run from this directory:
@@ -372,7 +372,7 @@ PARQUET_TRANSFORM and VALIDATE.
 
 ```bash
 # 1. Jobs went to SLURM
-squeue -u $USER                                       # during the run: five jobs, one at a time
+squeue -u $USER                                       # during the run: seven jobs, one at a time
 grep -c "executor > slurm" .nextflow.log              # >= 1
 
 # 2. Nodes see the env and tools
@@ -385,17 +385,17 @@ grep -l "command not found" $NXF_WORK/*/*/.command.err   # no output
 # 4. Resource accounting works: every row COMPLETED, exit 0, peak_rss populated
 column -t -s $'\t' $SCRATCH/uplake_smoke/reports/trace.txt | cut -c1-160
 
-# 5. Resume: the same command again -> cachedCount=5 (before 7b: -resume continues the
+# 5. Resume: the same command again -> cachedCount=7 (before 7b: -resume continues the
 #    launch directory's last run)
 ```
 
 ### 7b. Prove the OOM retry (recommended, ~5 min)
 
-With `--process_memory '2.5 GB'` DuckDB gets 1920MB: too little for the
-transform, which allocates a 1 GiB JSON buffer per thread, so it exits 75
+With `--process_memory '2.5 GB'` DuckDB gets 1920MB: too little for staging,
+which allocates a 1 GiB JSON buffer per thread, so STAGE_PARQUET exits 75
 (DuckDB's out-of-memory error) and is retried at 5 GB (DuckDB 3840MB), which
-passes. (The sort's chunks fit in 1920MB.) `run_lake.sh subset` fixes 16 GB, so
-run Nextflow directly:
+passes. (The other DuckDB processes fit in 1920MB.) `run_lake.sh subset` fixes
+16 GB, so run Nextflow directly:
 
 ```bash
 mkdir -p $SCRATCH/uplake_oom/reports
@@ -409,8 +409,8 @@ nextflow run upjson2lake.nf -profile short --inputfile tests/fixtures/small.json
 ls $SCRATCH/uplake_oom/oom/RELEASE_COMPLETE
 #   the run succeeded (exit 0, marker written) although an attempt failed
 nextflow log last -f name,status,exit,memory,time
-#   PARQUET_TRANSFORM twice: FAILED 75 2.5 GB, then COMPLETED 0 5 GB (prod: 96 -> 192 GB);
-#   SORT_JSONL once (its chunked sort fits in 2.5 GB)
+#   STAGE_PARQUET twice: FAILED 75 2.5 GB, then COMPLETED 0 5 GB (prod: 96 -> 192 GB);
+#   every other process once
 WD=$(nextflow log last -f workdir -F "status == 'FAILED'")   # the failed attempt's work dir
 grep "FATAL — DuckDB ran out of memory" $WD/.command.err
 rm -rf $SCRATCH/uplake_oom $SCRATCH/uplake_smoke
@@ -453,6 +453,8 @@ echo $NXF_WORK                            # set (stage 6), on that scratch files
 # 5. Queue limits. Requests, attempt 1 -> retry:
 #      STREAM_JSONL       4 CPUs   4 GB          48h         (not retried)
 #      SORT_JSONL         4 CPUs  96 -> 192 GB   24h -> 48h
+#      INFER_SCHEMA       4 CPUs  16 ->  32 GB   24h -> 48h
+#      STAGE_PARQUET      4 CPUs  96 -> 192 GB   24h -> 48h
 #      PARQUET_TRANSFORM  4 CPUs  96 -> 192 GB   48h -> 72h  (capped at --max_time)
 #      VALIDATE           8 CPUs  96 -> 192 GB   24h -> 48h
 #    (transform headers: -c 4 -t 48:00:00 --mem 98304M, no -p: the cluster's default
@@ -504,9 +506,17 @@ grep -E "chunks of|chunk\(s\)|run [0-9]+/|runs merged" $WD/.command.err | tail -
 du -sh $SCRATCH/duckdb_tmp         # the chunks and runs: ~1.5x the compressed JSONL at most
 ls -l $SCRATCH/uniprot_parquet/2026_03/sorted.jsonl.zst   # published when done
 
+# INFER_SCHEMA (~1.5 h): one line at the end, "N columns in …s -> schema.json"
+tail -2 $WD/.command.log
+
+# STAGE_PARQUET (~35 min): "Staged in …s (… GB)" at the end; the file (~80 GB) stays in
+# its work directory, where every re-run of PARQUET_TRANSFORM reads it
+tail -2 $WD/.command.log
+
 # PARQUET_TRANSFORM (6–12 h)
 grep -E "^--- |rows so far|rows in" $WD/.command.log | tail -5
-#   "--- ENTRIES ---", "entries: 250,000,000 rows in N files", then FEATURES, XREFS, ...
+#   "--- PARQUET STAGING (reused: …) ---", "--- ENTRIES ---", "entries: <$EXPECTED> rows in N files",
+#   then FEATURES, XREFS, ...
 grep -E "New UniProt fields|stored as JSON|shortcut sources absent" $WD/.command.log
 #   keys UniProt added (new source columns) and fields whose type varies (stored as JSON):
 #   informational, unless such a field feeds a shortcut, when the build stops (cheatsheet)
@@ -578,7 +588,8 @@ completed process and republishes every output whole.
 |---|---|
 | Head job / login session killed mid-run | Re-submit. A copy cut short mid-publish is repaired; `RELEASE_COMPLETE` is written only after `bin/verify_release.py` passes. For hash-level certainty: `bin/verify_release.py <release dir> --full`. |
 | `RELEASE_COMPLETE not written: the published copy ... does not match its metadata` | Something changed the release directory during or after publishing (full disk, another process). Re-submit. |
-| A job hit its wall time | SORT_JSONL, PARQUET_TRANSFORM and VALIDATE retry once with twice the time (capped at `--max_time`); STREAM_JSONL and PROVENANCE do not. If it still fails, raise `--max-time` within the queue's limit, or re-submit. PARQUET_TRANSFORM always restarts in a fresh work dir: the whole transform re-runs. |
+| A job hit its wall time | SORT_JSONL, INFER_SCHEMA, STAGE_PARQUET, PARQUET_TRANSFORM and VALIDATE retry once with twice the time (capped at `--max_time`); STREAM_JSONL and PROVENANCE do not. If it still fails, raise `--max-time` within the queue's limit, or re-submit. A re-run of PARQUET_TRANSFORM starts its tables afresh, but takes the schema and the staged file from INFER_SCHEMA and STAGE_PARQUET's cache. |
+| `PARQUET_TRANSFORM`: `Segmentation fault`, exit 139 (not retried) | Seen once on 2026_03, 30 min into the features sort, with the job at 91% of its 96 GB and DuckDB 1.27x over its own cap. Give it more headroom: run Nextflow directly with `--process_memory 192GB --duckdb_pct 60` (DuckDB's share of the task, default 75), and `export PYTHONFAULTHANDLER=1` first for a traceback if it recurs. A re-submit reuses the schema and the staged file. |
 | `PARQUET_TRANSFORM` OOM twice | Raise `MEMORY=` in `run_lake.sh`'s `full` mode and commit it (an uncommitted edit makes provenance record `dirty: true`), or run Nextflow directly with `--process_memory`; then re-submit. |
 | `Process requirement exceeds available memory` (local) | `--process_memory` exceeds the machine; lower it (DuckDB spills to `--duckdb_temp`). |
 | `STREAM_JSONL`: `FATAL — ijson's C backend (yajl2_c) is not available` | The env's ijson has no C extension (the pure-Python parser would take ~11x as long). `python -m pip install --force-reinstall --no-deps ijson`, check stage 0's `ijson.backend` line, and re-submit. |

@@ -211,10 +211,10 @@ shims in place, and Task 2's trap only shows without them.
 
 ```bash
 # the usual env (1.5.6)
-REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 407 passed, 1 xfailed
+REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 418 passed, 1 xfailed
 # a second env with DuckDB 2.x, no shims
 pip install "duckdb>=2.0.1,<3"
-REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 407 passed, 1 xfailed
+REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 418 passed, 1 xfailed
 ruff check . && mypy
 ```
 

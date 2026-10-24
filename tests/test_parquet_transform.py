@@ -12,6 +12,7 @@ import gzip
 import json
 import os
 import re
+import subprocess
 from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NoReturn, cast
@@ -1876,3 +1877,82 @@ def test_files_roll_over_inside_a_batch(small_jsonl: str, tmp_path: Path) -> Non
                         for c in (last.column(j) for j in range(meta.num_columns)))
             assert start < target, (path, start)
     assert counts[256_000] > counts[512_000], counts
+
+
+class TestPhases:
+    """--write-schema, --write-staged and --staged run the transform's phases
+    on their own (the workflow's INFER_SCHEMA, STAGE_PARQUET and
+    PARQUET_TRANSFORM), so a re-run reuses what is already computed."""
+
+    @staticmethod
+    def _bin(*args: object) -> subprocess.CompletedProcess[str]:
+        return run_bin("parquet_transform.py", *args, "--memory-limit", "4GB")
+
+    @staticmethod
+    def _parquet_hashes(lake: Path) -> dict[str, str]:
+        import hashlib
+        return {str(p.relative_to(lake)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(lake.rglob("*.parquet"))}
+
+    def test_phases_build_the_same_lake(self, small_lake: dict[str, str], tmp_path: Path) -> None:
+        """The same files as one run with the same options (batch size included:
+        it shapes the row groups)."""
+        jsonl = small_lake["jsonl"]
+        schema, staged = tmp_path / "schema.json", tmp_path / "stage" / "staged.parquet"
+        whole = tmp_path / "whole"
+        for args in ((jsonl, "--outdir", whole, "--release", "small_2026"),
+                     (jsonl, "--write-schema", schema),
+                     (jsonl, "--schema", schema, "--write-staged", staged),
+                     (jsonl, "--staged", staged, "--outdir", tmp_path / "phased", "--release", "small_2026")):
+            result = self._bin(*args)
+            assert result.returncode == 0, result.stderr[-2000:]
+        assert "PARQUET STAGING (reused" in result.stderr
+        assert staged.exists(), "a --staged file is the caller's: it must stay"
+        assert not (tmp_path / "phased" / ".staging").exists()
+        assert self._parquet_hashes(tmp_path / "phased") == self._parquet_hashes(whole)
+        manifests = [json.loads((d / "manifest.json").read_text()) for d in (whole, tmp_path / "phased")]
+        for m in manifests:
+            m.pop("generated_at")
+        assert manifests[0] == manifests[1]
+
+    @staticmethod
+    def _other_input(jsonl: str, tmp_path: Path) -> Path:
+        """``jsonl`` less its last line: another input of the same kind."""
+        import zstandard as zstd
+        with open(jsonl, "rb") as f:
+            lines = zstd.ZstdDecompressor().stream_reader(f).read().splitlines(keepends=True)
+        other = tmp_path / "other.jsonl"
+        other.write_bytes(b"".join(lines[:-1]))
+        return other
+
+    def test_schema_of_another_input_is_refused(self, small_lake: dict[str, str], tmp_path: Path) -> None:
+        schema = tmp_path / "schema.json"
+        assert self._bin(small_lake["jsonl"], "--write-schema", schema).returncode == 0
+        result = self._bin(self._other_input(small_lake["jsonl"], tmp_path), "--schema", schema,
+                           "--write-staged", tmp_path / "staged.parquet")
+        assert result.returncode != 0
+        assert "was written for another input" in result.stderr
+
+    def test_staged_file_of_another_input_is_refused(self, small_lake: dict[str, str], tmp_path: Path) -> None:
+        staged = tmp_path / "staged.parquet"
+        assert self._bin(small_lake["jsonl"], "--write-staged", staged).returncode == 0
+        result = self._bin(self._other_input(small_lake["jsonl"], tmp_path), "--staged", staged,
+                           "--outdir", tmp_path / "lake")
+        assert result.returncode != 0
+        assert "was not staged from" in result.stderr
+
+    def test_staged_file_without_its_source_is_refused(self, small_lake: dict[str, str], tmp_path: Path) -> None:
+        """A Parquet file not written by --write-staged records no input."""
+        import duckdb
+        staged = tmp_path / "staged.parquet"
+        duckdb.connect().execute(f"COPY (SELECT 1 AS a) TO '{staged}' (FORMAT PARQUET)")
+        result = self._bin(small_lake["jsonl"], "--staged", staged, "--outdir", tmp_path / "lake")
+        assert result.returncode != 0
+        assert "was not staged from" in result.stderr
+
+    @pytest.mark.parametrize("args", [("--write-schema", "s.json", "--staged", "x.parquet"),
+                                      ("--staged", "x.parquet", "--schema", "s.json")])
+    def test_conflicting_phase_options_are_refused(self, small_lake: dict[str, str],
+                                                   args: tuple[str, ...]) -> None:
+        result = self._bin(small_lake["jsonl"], *args)
+        assert result.returncode == 2 and "--" in result.stderr
