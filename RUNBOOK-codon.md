@@ -215,8 +215,8 @@ grep -E "^== |Elapsed \(wall clock\)|Maximum resident|VERDICT|slice_2m_lake" $SC
 - **Expect**: `VERDICT: ALL CHECKS PASSED`; for the sort and the transform, a
   peak RSS (`Maximum resident set size`, in kB) well under 12 GB.
 - **Full-run estimate**: wall time ×75 (rough: memory does not grow with the
-  input, time roughly does) against the README budgets (sort 4–8 h, transform
-  6–12 h); the lake's size ×75 against your space on `$SCRATCH`.
+  input, time roughly does) against the README budgets (2026_03: sort 1 h; the
+  old single transform 13 h); the lake's size ×75 against your space on `$SCRATCH`.
 - If the transform's estimate is over 48 h, raise the retry's time cap before
   step 8 (`--max-time`, default 72 h; `standard` allows 7 days).
 
@@ -287,10 +287,10 @@ tail -3 $SCRATCH/uplake-<id>.out
 Per step, with `WD=$(wd <STEP>)`:
 
 ```bash
-# STREAM_JSONL (2-4 h): progress every 1M entries; on completion the count == $EXPECTED
+# STREAM_JSONL (~3.5 h): progress every 1M entries; on completion the count == $EXPECTED
 WD=$(wd STREAM_JSONL); tail -2 $WD/.command.log; cat $WD/entry_count.txt
 
-# SORT_JSONL (4-8 h): "N chunk(s)", then "run i/N sorted", then "N runs merged"
+# SORT_JSONL (~1 h): "N chunk(s)", then "run i/N sorted", then "N runs merged"
 WD=$(wd SORT_JSONL); grep -E "chunk\(s\)|run [0-9]+/|runs merged" $WD/.command.err | tail -3
 
 # INFER_SCHEMA (~1.5 h), then STAGE_PARQUET (~35 min): a line each when done

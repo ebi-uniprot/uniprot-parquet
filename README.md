@@ -62,14 +62,14 @@ Checked against an 8-week sample of live UniProt REST API logs (January–August
 
 ## Tables
 
-| Table | Grain | Rows (full UniProtKB, approx.) |
-| --- | --- | --- |
-| `entries` | One row per protein | 250M |
-| `features` | One row per positional annotation | 1.3B |
-| `xrefs` | One row per cross-reference | 5B |
-| `comments` | One row per comment | 300M |
-| `publications` | One row per citation | 500M |
-| `accession_map` | One row per primary or secondary accession | 250M + secondaries |
+| Table | Grain | Rows (2026_03) | Parquet (2026_03) |
+| --- | --- | --- | --- |
+| `entries` | One row per protein | 150.0M | 47.5 GB |
+| `features` | One row per positional annotation | 637.9M | 7.0 GB |
+| `xrefs` | One row per cross-reference | 2.52B | 19.7 GB |
+| `comments` | One row per comment | 309.5M | 6.5 GB |
+| `publications` | One row per citation | 170.9M | 1.6 GB |
+| `accession_map` | One row per primary or secondary accession | 151.2M (1.18M secondaries) | 0.7 GB |
 
 ```
 lake/
@@ -396,16 +396,16 @@ nextflow run upjson2lake.nf -profile prod \
 
 | Process | Does | Publishes | Time¹ | Memory |
 | --- | --- | --- | --- | --- |
-| `STREAM_JSONL` | pigz + ijson + zstd: JSON to JSONL; records the entry count, checks it against `--expected_count` and the compressed line count | — | 2–4 h (single-threaded decompression) | 4 GB |
-| `SORT_JSONL` | External merge sort: DuckDB sorts chunks that fit in memory, then the runs are merged; ~1.5× the compressed JSONL on disk | `sorted.jsonl.zst` | ~1 h (2026_03) | 96 GB |
+| `STREAM_JSONL` | pigz + ijson + zstd: JSON to JSONL; records the entry count, checks it against `--expected_count` and the compressed line count | — | 3.5 h (2026_03; single-threaded decompression) | 4 GB |
+| `SORT_JSONL` | External merge sort: DuckDB sorts chunks that fit in memory, then the runs are merged; ~1.5× the compressed JSONL on disk | `sorted.jsonl.zst` | 1 h (2026_03; peak 36 GB) | 96 GB |
 | `INFER_SCHEMA` | Infers the input's columns from the whole JSONL (`read_json_auto`, `sample_size=-1`): `schema.json` | — | ~1.5 h (2026_03) | 16 GB |
 | `STAGE_PARQUET` | Parses the JSONL once into a staged Parquet file (~80 GB), read by every table query | — | ~35 min (2026_03) | 96 GB |
-| `BUILD_TABLE` | One task per table (six, side by side, `--table_forks` at a time): writes it from the staged file (DuckDB + PyArrow) in input order (`--presorted`: no sort, no spill; only `accession_map` is sorted, by accession) | — | about the slowest table (xrefs); 6–12 h one after another | 96 GB each |
+| `BUILD_TABLE` | One task per table (six, side by side, `--table_forks` at a time): writes it from the staged file (DuckDB + PyArrow) in input order (`--presorted`: no sort, no spill; only `accession_map` is sorted, by accession) | — | about the slowest table (xrefs); not yet timed (one sorting process for all six: 13 h, peak 190 GiB, 3.9 TB spilled, 2026_03) | 96 GB each |
 | `ASSEMBLE_LAKE` | Puts the six tables side by side (hard links) and writes `manifest.json`, `datapackage.json`, `LICENSE`, `SHA256SUMS.txt` and `RELEASE.metalink` over them | `lake/` | hashes every file once | 16 GB |
-| `VALIDATE` | The checks under [Validation](#validation); one pass over the JSONL, files hashed 8 at a time | `validation_report.{txt,json}` | not yet timed (24 h limit) | 96 GB |
-| `PROVENANCE` | Metadata only | `SCHEMA.md`, `provenance.json`, `RELEASE_COMPLETE`² | < 1 min | 1 GB |
+| `VALIDATE` | The checks under [Validation](#validation); one pass over the JSONL, files hashed 8 at a time | `validation_report.{txt,json}` | 20 min (2026_03; peak 47 GB) | 96 GB |
+| `PROVENANCE` | Metadata only | `SCHEMA.md`, `provenance.json`, `RELEASE_COMPLETE`² | ~3 min (2026_03; reads ~98 GB) | 1 GB |
 
-¹ For the full ~250M-entry dataset; estimates, not yet measured on a full build.
+¹ Measured on Codon for release 2026_03 (150M entries), except where marked as an estimate or not yet timed.
 ² Renamed into place by the workflow's `onComplete` section, after every `publishDir` copy has finished and `bin/verify_release.py` has passed on the published copy.
 
 DuckDB streams Arrow record batches to PyArrow, which writes zstd-compressed Parquet with a page index, so memory stays bounded whatever the dataset size. The transform is idempotent: a re-run rewrites the tables, and `--skip-existing` skips a table whose completion sentinel (`lake/.complete/<table>.json`) matches the files on disk and was written for the same input (size and modification time) and release.

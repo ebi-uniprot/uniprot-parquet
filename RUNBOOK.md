@@ -497,13 +497,13 @@ inside the release being built. For failure emails, run Nextflow directly with
 Set `WD=$(wd <PROCESS>)` for each (stage 7).
 
 ```bash
-# STREAM_JSONL (2–4 h)
+# STREAM_JSONL (~3.5 h)
 tail -2 $WD/.command.log           # "stream_jsonl: 123,000,000 entries (25,000/s)", every 1M entries
 squeue -j <jobid> -o "%T %M %L"    # RUNNING; time left > remaining entries / rate
 cat $WD/entry_count.txt            # on completion: == $EXPECTED (otherwise it exits 1 and the run stops)
 grep "Verified:" $WD/.command.log  # zstd line count matched the streamed count
 
-# SORT_JSONL (4–8 h)
+# SORT_JSONL (~1 h)
 grep -E "chunks of|chunk\(s\)|run [0-9]+/|runs merged" $WD/.command.err | tail -3
 #   "N chunk(s)" once the input is cut, then "run i/N sorted" per chunk, then "N runs merged"
 du -sh $SCRATCH/duckdb_tmp         # the chunks and runs: ~1.5x the compressed JSONL at most
