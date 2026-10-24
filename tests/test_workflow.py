@@ -185,6 +185,7 @@ def test_rerun_of_the_tables_reuses_schema_and_staging(launch_dir: pathlib.Path)
     for hash_prefix, table in built:
         (workdir,) = (launch_dir / "work").glob(f"{hash_prefix}*")
         assert "PARQUET STAGING (reused:" in (workdir / ".command.err").read_text(), table
+        assert "--presorted" in (workdir / ".command.sh").read_text(), table
 
 
 def test_a_table_whose_output_is_gone_is_built_alone(launch_dir: pathlib.Path) -> None:

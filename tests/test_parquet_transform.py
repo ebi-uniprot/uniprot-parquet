@@ -2005,3 +2005,57 @@ class TestPhases:
         assert "--assemble:" in result.stderr and "xrefs" in result.stderr
         assert not (lake / "manifest.json").exists()
 
+
+
+class TestPresorted:
+    """--presorted (BUILD_TABLE's): entries and the child tables written in
+    input order, no ORDER BY; every batch's order is checked."""
+
+    @staticmethod
+    def _hashes(lake: Path) -> dict[str, str]:
+        return TestPhases._parquet_hashes(lake)
+
+    def test_same_lake_as_sorting(self, small_lake: dict[str, str], tmp_path: Path) -> None:
+        """From input in sort_jsonl.py's order, the same bytes as with the sorts."""
+        ordered = tmp_path / "sorted.jsonl.zst"
+        assert run_bin("sort_jsonl.py", small_lake["jsonl"], "-o", ordered, "--memory-limit", "2GB").returncode == 0
+        for name, extra in (("sorting", ()), ("presorted", ("--presorted",))):
+            result = run_bin("parquet_transform.py", ordered, "--outdir", tmp_path / name, "--memory-limit", "4GB",
+                             "--release", "r1", *extra)
+            assert result.returncode == 0, result.stderr[-2000:]
+        assert self._hashes(tmp_path / "presorted") == self._hashes(tmp_path / "sorting")
+
+    def test_unsorted_input_is_refused(self, small_lake: dict[str, str], tmp_path: Path) -> None:
+        """The fixture's JSONL is in UniProt's order, not the tables': refused
+        at the first batch, with no table written."""
+        result = run_bin("parquet_transform.py", small_lake["jsonl"], "--presorted", "--outdir", tmp_path / "lake",
+                         "--memory-limit", "4GB")
+        assert result.returncode != 0
+        assert "rows out of order" in result.stderr and "--presorted" in result.stderr
+        assert not list((tmp_path / "lake").rglob("*.parquet"))
+
+    @pytest.mark.parametrize("rows, ok", [
+        ([(True, 9, "A"), (True, 9, "B"), (False, 1, "A")], True),     # reviewed DESC, then the rest
+        ([(True, 9, "B"), (True, 9, "A")], False),                      # accession going back
+        ([(False, 1, "A"), (True, 1, "A")], False),                     # reviewed DESC violated
+        ([(True, 5, "A"), (True, None, "A"), (True, None, "B")], True),  # NULLs last
+        ([(True, None, "A"), (True, 5, "A")], False),
+        ([(True, 9, "A"), (True, 9, "A")], True),                       # equal keys allowed
+    ])
+    def test_rows_in_order(self, rows: list[tuple[Any, ...]], ok: bool) -> None:
+        from parquet_transform import _rows_in_order
+        tbl = pa.table({"reviewed": [r[0] for r in rows], "organism_id": pa.array([r[1] for r in rows], pa.int64()),
+                        "accession": [r[2] for r in rows]})
+        assert _rows_in_order(tbl, ["reviewed DESC", "organism_id ASC", "accession ASC"]) is ok
+
+
+def test_ordered_distinct_keeps_first_occurrences() -> None:
+    """ec, go_id and xref_dbs: each value once, where it first appears
+    (shortcut_reference._distinct), NULLs dropped; not list_distinct's
+    undefined order."""
+    import duckdb
+    from parquet_transform import _ordered_distinct
+    con = duckdb.connect()
+    expr = _ordered_distinct("['3.1.2.5', NULL, '3.1.2.27', '3.1.2.5', '3.1.2.2', '3.1.2.27']")
+    assert con.sql(f"SELECT {expr}").fetchall()[0][0] == ["3.1.2.5", "3.1.2.27", "3.1.2.2"]
+    assert con.sql(f"SELECT {_ordered_distinct('[]::VARCHAR[]')}").fetchall()[0][0] == []

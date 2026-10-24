@@ -445,8 +445,9 @@ pigz -t $DUMP && echo GZIP_OK
 ls -l $DUMP                               # ~160 GB compressed for 2026 releases
 
 # 4. Disk: under --duckdb_temp, SORT_JSONL's chunks and runs (~1.5x the compressed JSONL), then
-#    the six BUILD_TABLE spills at once (xrefs alone 654 GB in 2026_03; fewer at a time with
-#    --table_forks); STAGE_PARQUET's file (~80 GB) stays in its work dir; the published release is
+#    BUILD_TABLE's: little, as the tables stream in input order (--presorted) and only
+#    accession_map is sorted (before that, xrefs alone spilled 654 GB); STAGE_PARQUET's file
+#    (~80 GB) stays in its work dir; the published release is
 #    tens to a few hundred GB. `disk` directives are not passed to SLURM, so nothing reserves this
 df -h $SCRATCH                            # >= 3 TB free if $NXF_WORK and spill share it, plus the output
 echo $NXF_WORK                            # set (stage 6), on that scratch filesystem
@@ -519,7 +520,8 @@ tail -2 $WD/.command.log
 for t in entries features xrefs comments publications accession_map; do
     echo "$t: $(tail -1 $(wd "BUILD_TABLE ($t)")/.command.log 2>/dev/null)"; done
 #   "<table>: N rows so far (…)" while writing; "<table>: N rows in M files (…s)" when done.
-#   Each sorts first (silent; xrefs the longest), then writes. The run waits for the slowest.
+#   No sort (--presorted; accession_map sorts first, briefly): they write from the start.
+#   The run waits for the slowest (xrefs).
 WD=$(wd "BUILD_TABLE (entries)")
 grep -E "New UniProt fields|stored as JSON|shortcut sources absent" $WD/.command.log
 #   keys UniProt added (new source columns) and fields whose type varies (stored as JSON):

@@ -37,9 +37,10 @@ _DIVISION_RULES = (
     ("Bacteria", "bacteria"), ("Archaea", "archaea"), ("Viruses", "viruses"),
 )
 
-# Lists built with DuckDB's list_distinct, whose element order is not
-# defined: compared as sorted lists.  Every other list compares in order.
-UNORDERED = {("entries", "ec"), ("entries", "go_id"), ("entries", "xref_dbs")}
+# Lists whose element order is not defined, compared as sorted lists: none
+# since ec, go_id and xref_dbs keep each value's first occurrence (they used
+# DuckDB's list_distinct).  Every list compares in order.
+UNORDERED: set[tuple[str, str]] = set()
 
 # Child table → (source array, *_index column), as the lake builds them.
 _CHILDREN = {

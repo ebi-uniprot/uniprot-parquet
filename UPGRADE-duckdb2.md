@@ -123,6 +123,8 @@ less Python return annotations and the comment at `bin/parquet_transform.py:106`
 - `bin/parquet_transform.py` (18 on 16 lines): 555, 557, 913, 919 (two), 929,
   967 (two), 977, 978, 1026, 1027, 1028, 1042, 1044, 1046, 1127, 1181
 - `benchmarks/bench_variant.py` (4): 102, 134, 316, 343
+- Since `f4cfd81`: `_ordered_distinct` in `bin/parquet_transform.py` (`(v, i) -> …`), used by
+  `ec`, `go_id` and `xref_dbs`
 
 `validate_lake.py`, `reconstruct.py` and `uniprot_parquet.py` have none of
 their own. VALIDATE reaches these through `parquet_transform.py`'s builders.
@@ -211,10 +213,10 @@ shims in place, and Task 2's trap only shows without them.
 
 ```bash
 # the usual env (1.5.6)
-REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 422 passed, 1 xfailed
+REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 431 passed, 1 xfailed
 # a second env with DuckDB 2.x, no shims
 pip install "duckdb>=2.0.1,<3"
-REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 422 passed, 1 xfailed
+REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 431 passed, 1 xfailed
 ruff check . && mypy
 ```
 

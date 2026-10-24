@@ -364,10 +364,12 @@ process STAGE_PARQUET {
 /* ── PROCESS: Build one table from the staged Parquet ───────────── */
 // One task per table (table_names()), each cached, retried and re-run on its
 // own: a re-run after one table fails builds that table alone, and the
-// tables can run side by side (--table_forks at a time).  Every table has
-// its own ORDER BY; the pre-sorted input gives them locality (child tables
-// add the element's array position as the last key).  Each task spills into
-// a directory of its own (spill_setup with the table's name).
+// tables can run side by side (--table_forks at a time).  --presorted: the
+// input is SORT_JSONL's, so entries and the child tables are written in input
+// order without a sort (the transform checks every batch's order, and
+// VALIDATE every table's); accession_map, ordered by accession, is sorted.
+// Each task spills into a directory of its own (spill_setup with the table's
+// name).
 process BUILD_TABLE {
     tag "${table}"
     cpus 4
@@ -376,10 +378,8 @@ process BUILD_TABLE {
     maxRetries 1
     maxForks params.table_forks
     time { scaled_time('48h', task.attempt) }
-    disk '1 TB'          // DuckDB ORDER BY spill + the table.  A table is sorted in full (DuckDB
-                         // does not reuse the input's order): child tables by (reviewed DESC,
-                         // organism_id, accession, <x>_index).  xrefs (~2.5B rows in 2026_03)
-                         // and features spill the most (654 GB for xrefs).
+    disk '1 TB'          // the table, and accession_map's sort spill.  Before --presorted every
+                         // table was sorted in full: xrefs (~2.5B rows in 2026_03) spilled 654 GB.
 
     input:
     path sorted_jsonl    // for the completion sentinel's input fingerprint
@@ -401,6 +401,7 @@ process BUILD_TABLE {
     parquet_transform.py ${sorted_jsonl} \
         --staged ${staged} \
         --only ${table} \
+        --presorted \
         --outdir ./table_${table}/lake \
         --memory-limit ${duckdb_mem(task.memory)} \
         --threads ${task.cpus} \

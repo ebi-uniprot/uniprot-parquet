@@ -103,7 +103,7 @@ one shell only:
 REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q
 ```
 
-**Expect**: `422 passed, 1 xfailed`. The first run downloads a fixture from
+**Expect**: `431 passed, 1 xfailed`. The first run downloads a fixture from
 `rest.uniprot.org` before any test starts and says so ("Downloading the
 default test fixture…", one line per query, a few minutes). If a test fails
 with a zlib or gzip error, `gzip -t tests/fixtures/*.json.gz` names the damaged
@@ -300,7 +300,7 @@ WD=$(wd STAGE_PARQUET); tail -1 $WD/.command.log      # "Staged in …s (… GB)
 # BUILD_TABLE: six jobs side by side, one per table; the run waits for the slowest (xrefs)
 for t in entries features xrefs comments publications accession_map; do
     echo "$t: $(tail -1 $(wd "BUILD_TABLE ($t)")/.command.log 2>/dev/null)"; done
-#   "N rows so far (…)" while writing, "N rows in M files (…s)" when done; silent while sorting
+#   "N rows so far (…)" while writing, "N rows in M files (…s)" when done (no sort but accession_map's)
 
 # ASSEMBLE_LAKE: the manifest and checksums over the six tables
 WD=$(wd ASSEMBLE_LAKE); tail -3 $WD/.command.log

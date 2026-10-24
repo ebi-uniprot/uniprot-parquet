@@ -37,9 +37,11 @@ Schema:
   alone, which the validator checks on every release.
 
 Memory model:
-  At any moment we hold at most --batch-size rows in Arrow memory.  DuckDB
-  may spill to disk during the ORDER BY, but the Arrow → Parquet path stays
-  bounded regardless of dataset size.
+  At any moment we hold at most --batch-size rows in Arrow memory.  Without
+  --presorted DuckDB sorts every table (spilling to disk), which at full
+  scale needs memory past its own cap; with --presorted (input from
+  sort_jsonl.py) entries and the child tables stream in input order without a
+  sort, and only accession_map's small rows are sorted.
 
 Output layout:
   <outdir>/
@@ -948,22 +950,48 @@ def _child_source(field: str, schema_paths: Collection[str]) -> str:
     return _EMPTY_CHILD_SOURCE[field]
 
 
+def _ordered_distinct(list_expr: str) -> str:
+    """SQL for ``list_expr``'s non-NULL elements, each kept at its first
+    occurrence (shortcut_reference._distinct).  Not list_distinct, whose
+    order is undefined: a rebuild of the same input could reorder ec, go_id
+    and xref_dbs."""
+    return f"list_filter({list_expr}, (v, i) -> v IS NOT NULL AND list_position({list_expr}, v) = i)"
+
+
+# --presorted: the input comes from SORT_JSONL (and STAGE_PARQUET keeps its
+# order), so entries and the child tables are already in their table order and
+# stream without a sort; stream_to_parquet checks the order of every batch.
+# accession_map, ordered by accession, is sorted in every mode.
+PRESORTED = False
+
+
+def _order_by(keys: str) -> str:
+    """The ORDER BY a table in input order (entries, the child tables) needs:
+    none with --presorted."""
+    return "" if PRESORTED else f"ORDER BY {keys}"
+
+
 def _child_from(table: str, schema_paths: Collection[str], extra: dict[str, str] | None = None) -> str:
     """FROM and ORDER BY of a child table's SQL: one row per element
     (``unnest``, 1-based ``ordinality``) of the entry's source array, beside
-    ``sub``'s key columns and ``extra`` {column: source expression}."""
+    ``sub``'s key columns and ``extra`` {column: source expression}.  Unnested
+    in the select list, which keeps the entries' order (a LATERAL unnest does
+    not, run in parallel): with --presorted, the rows need no sort."""
     array, index, _ = CHILD_TABLES[table]
     src = _child_source(array, schema_paths)
     keys = {"accession": "e.primaryAccession", "reviewed": REVIEWED_EXPR,
             "organism_id": "e.organism.taxonId", **(extra or {})}
     key_sql = "".join(f"        {_cast(table, col, expr)} AS {col},\n" for col, expr in keys.items())
     return f"""FROM (
-    SELECT
+    SELECT sub.*, unnest(sub.elements) AS "unnest", generate_subscripts(sub.elements, 1) AS ordinality
+    FROM (
+        SELECT
 {key_sql}        {src} AS elements
-    FROM {{read_clause}} e
-    WHERE {src} IS NOT NULL AND len({src}) > 0
-) sub, LATERAL unnest(sub.elements) WITH ORDINALITY AS u("unnest", ordinality)
-ORDER BY sub.reviewed DESC, sub.organism_id, sub.accession, {index}"""
+        FROM {{read_clause}} e
+        WHERE {src} IS NOT NULL AND len({src}) > 0
+    ) sub
+) sub
+{_order_by(f"sub.reviewed DESC, sub.organism_id, sub.accession, {index}")}"""
 
 
 def _build_entries_sql(schema_paths: Collection[str], json_paths: set[str]) -> str:
@@ -1013,7 +1041,7 @@ def _build_entries_sql(schema_paths: Collection[str], json_paths: set[str]) -> s
         ))""")
 
     if ec_parts:
-        ec_numbers_expr = "list_distinct(flatten([\n        " + ",\n        ".join(ec_parts) + "\n    ]))"
+        ec_numbers_expr = _ordered_distinct("flatten([\n        " + ",\n        ".join(ec_parts) + "\n    ])")
     else:
         ec_numbers_expr = "[]"
 
@@ -1082,15 +1110,15 @@ def _build_entries_sql(schema_paths: Collection[str], json_paths: set[str]) -> s
     # Cross-reference shortcuts and per-array counts: [] / 0 when the array is
     # absent, matching what an entry without the array gets when it is present.
     xrefs_present = has("uniProtKBCrossReferences")
-    go_ids_expr = ("""list_distinct([
+    go_ids_expr = (_ordered_distinct("""[
         x.id
         FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
         IF x.database = 'GO'
-    ])""" if xrefs_present else "[]")
-    xref_dbs_expr = ("""list_distinct([
+    ]""") if xrefs_present else "[]")
+    xref_dbs_expr = (_ordered_distinct("""[
         x.database
         FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
-    ])""" if xrefs_present else "[]")
+    ]""") if xrefs_present else "[]")
     proteome_ids_expr = ("""list_sort(list_distinct([
         x.id
         FOR x IN COALESCE(e.uniProtKBCrossReferences, [])
@@ -1188,7 +1216,7 @@ SELECT
     {rest}
 
 FROM {{read_clause}} e
-ORDER BY reviewed DESC, e.organism.taxonId, e.primaryAccession
+{_order_by("reviewed DESC, e.organism.taxonId, e.primaryAccession")}
 """
 
 
@@ -1600,6 +1628,25 @@ def _as_json_columns(tbl: pa.Table, names: Collection[str]) -> pa.Table:
     return pa.Table.from_arrays(cols, schema=_json_schema(tbl.schema, names))
 
 
+def _rows_in_order(tbl: pa.Table, sort_order: Sequence[str]) -> bool:
+    """True if ``tbl``'s rows follow ``sort_order`` (["reviewed DESC",
+    "organism_id ASC", ...], NULLs last as DuckDB sorts them), equal keys
+    allowed.  Vectorised: each row against the next."""
+    if tbl.num_rows < 2:
+        return True
+    ok: Any = None
+    for key in reversed(sort_order):
+        name, _, direction = key.partition(" ")
+        col = tbl.column(name)
+        a, b = col.slice(0, len(col) - 1), col.slice(1)
+        a_null, b_null = pc.is_null(a), pc.is_null(b)
+        ahead = pc.less(b, a) if direction.upper() == "DESC" else pc.greater(b, a)
+        advance = pc.or_kleene(pc.and_kleene(pc.invert(a_null), b_null), pc.fill_null(ahead, False))
+        same = pc.or_kleene(pc.and_kleene(a_null, b_null), pc.fill_null(pc.equal(b, a), False))
+        ok = pc.or_(advance, same) if ok is None else pc.or_(advance, pc.and_(same, ok))
+    return bool(pc.all(ok).as_py())
+
+
 def stream_to_parquet(con: duckdb.DuckDBPyConnection, sql: str, table_dir: str, batch_size: int,
                       label: str = "table", sort_order: list[str] | None = None,
                       partition_column: str = "reviewed", release: str | None = None,
@@ -1620,7 +1667,8 @@ def stream_to_parquet(con: duckdb.DuckDBPyConnection, sql: str, table_dir: str, 
     is yielded — all batches share the same schema.
 
     Memory model: only one Arrow batch is held at a time (plus whatever
-    DuckDB needs for the ORDER BY spill).
+    DuckDB needs for an ORDER BY, if the query has one).  Every batch's rows
+    are checked against ``sort_order``, also across batches.
 
     Atomicity: files are written to ``<partition>/.tmp/`` and moved to their
     final location only after the whole table has been written, so nothing
@@ -1666,6 +1714,7 @@ def stream_to_parquet(con: duckdb.DuckDBPyConnection, sql: str, table_dir: str, 
 
     total_rows = 0
     arrow_schema = None
+    last_key: pa.Table | None = None   # the previous batch's last sort key
     sorting_columns: list[Any] | None = None
     pending: list[tuple[str, str, str]] = []           # (tmp_path, final_path, relative_path)
     st: dict[str, Any] = {"side": None, "writer": None, "file_num": 0, "path": None}
@@ -1718,6 +1767,19 @@ def stream_to_parquet(con: duckdb.DuckDBPyConnection, sql: str, table_dir: str, 
                 sorting_columns = build_sorting_columns(sort_order, arrow_schema) if sort_order else None
             # Re-wrap every batch so the written schema carries the field metadata.
             tbl = pa.Table.from_arrays(list(tbl.columns), schema=arrow_schema)
+            # Every row in sort_order, across batch boundaries too: a table
+            # streamed in input order (--presorted) must not be written if
+            # the order did not hold.
+            if sort_order:
+                key_cols = [k.partition(" ")[0] for k in sort_order]
+                keys = tbl.select(key_cols)
+                if last_key is not None:
+                    keys = pa.concat_tables([last_key, keys])
+                if not _rows_in_order(keys, sort_order):
+                    raise RuntimeError(f"{label}: rows out of order ({', '.join(sort_order)}) "
+                                       f"after {total_rows:,} rows" + (" (--presorted: is the input sorted "
+                                       "by sort_jsonl.py?)" if PRESORTED else ""))
+                last_key = keys.slice(keys.num_rows - 1)
             total_rows += tbl.num_rows
 
             flags = tbl.column(partition_column)
@@ -2026,14 +2088,16 @@ COLUMN_DESCRIPTIONS: dict[tuple[str, str], str] = {
                                        "proteinDescription.alternativeNames.",
     ("entries", "ec"):         "Distinct EC (Enzyme Commission) numbers from every naming block (recommended, "
                                  "alternative, submission names) of the entry and of its domains (includes) "
-                                 "and chains (contains).",
+                                 "and chains (contains), in order of first appearance.",
     ("entries", "division"):           "UniProt taxonomic division (archaea, bacteria, fungi, human, invertebrates, "
                                        "mammals, plants, rodents, vertebrates, viruses, unclassified), derived from "
                                        "lineage and organism_id.",
-    ("entries", "go_id"):             "Distinct Gene Ontology term IDs (e.g. GO:0005634) from cross-references.",
+    ("entries", "go_id"):             "Distinct Gene Ontology term IDs (e.g. GO:0005634) from cross-references, "
+                                      "in order of first appearance.",
     ("entries", "go_terms"):           "GO annotations as {id, aspect (P/F/C), term, evidence_type}; go_id is the "
                                        "flat id list.",
-    ("entries", "xref_dbs"):           "Distinct database names referenced in cross-references (e.g. PDB, Ensembl).",
+    ("entries", "xref_dbs"):           "Distinct database names referenced in cross-references (e.g. PDB, Ensembl), "
+                                       "in order of first appearance.",
     ("entries", "proteome_id"):       "Distinct UniProt proteome ids (UP…) from cross-references, sorted.",
     ("entries", "keywordid"):        "UniProt keyword IDs (e.g. KW-0418).",
     ("entries", "keyword"):      "UniProt keyword names (e.g. 'Kinase').",
@@ -2371,7 +2435,7 @@ def _infer_or_stage_only(args: argparse.Namespace, jsonl_path: str) -> None:
 
 
 def main() -> None:
-    global TARGET_FILE_BYTES, ZSTD_LEVEL, ROW_GROUP_SIZE
+    global TARGET_FILE_BYTES, ZSTD_LEVEL, ROW_GROUP_SIZE, PRESORTED
     parser = argparse.ArgumentParser(
         description="Transform UniProtKB JSONL → sorted Parquet tables "
                     "(entries, features, xrefs, comments, publications, accession_map)"
@@ -2437,6 +2501,11 @@ def main() -> None:
              "FILE is kept.",
     )
     parser.add_argument(
+        "--presorted", action="store_true",
+        help="The input is sorted as sort_jsonl.py sorts it: entries and the child tables are "
+             "written in input order without a sort (each batch's order is checked).",
+    )
+    parser.add_argument(
         "--assemble", action="store_true",
         help="Build no table: write the manifest, data package and checksums for the tables already "
              "in --outdir, each complete (its .complete/<table>.json matches its files, this input "
@@ -2450,6 +2519,7 @@ def main() -> None:
     if args.staged and (args.schema or args.write_staged):
         parser.error("--staged replaces staging: it takes no --schema or --write-staged")
 
+    PRESORTED = args.presorted
     if args.target_file_bytes:
         TARGET_FILE_BYTES = args.target_file_bytes
     if args.zstd_level is not None:
