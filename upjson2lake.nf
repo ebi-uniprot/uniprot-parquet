@@ -17,7 +17,8 @@
 //   2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (Swiss-Prot first)
 //   3. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow, in three
 //      processes so a re-run reuses each finished phase: INFER_SCHEMA (the columns),
-//      STAGE_PARQUET (one JSON parse), PARQUET_TRANSFORM (the tables)
+//      STAGE_PARQUET (one JSON parse), BUILD_TABLE (each table, side by side) and
+//      ASSEMBLE_LAKE (the lake's metadata over them)
 //   4. Production validation against the sorted JSONL (lossless reconstruction
 //      of a sample, counts, keys, sort order, checksums, partitions, ...)
 //   5. SCHEMA.md, provenance and the release marker (only if validation passes)
@@ -44,6 +45,7 @@ params.expected_count = null      // Expected entry count (from UniProt release 
 params.previous_manifest = null   // Previous release's lake/manifest.json: schema diff in the validation report
 params.max_time       = '72h'     // Wall-time cap of a retried heavy process: at most the SLURM queue's limit
 params.queue          = null      // SLURM partition (prod: the cluster's default; short: short). Read by nextflow.config
+params.table_forks    = 6         // BUILD_TABLE tasks at a time (one per table; each takes the heavy processes' memory)
 
 // Final output directory: <outdir>/<release>/.  Process directives cannot
 // call script functions, so every publishDir spells the same path out.
@@ -102,10 +104,16 @@ def bin_modules(String process) {
         SORT_JSONL:        ['duckdb_util.py'],
         INFER_SCHEMA:      ['duckdb_util.py'],
         STAGE_PARQUET:     ['duckdb_util.py'],
-        PARQUET_TRANSFORM: ['duckdb_util.py'],
+        BUILD_TABLE:       ['duckdb_util.py'],
+        ASSEMBLE_LAKE:     ['duckdb_util.py'],
         VALIDATE:          ['parquet_transform.py', 'duckdb_util.py', 'reconstruct.py', 'shortcut_reference.py'],
         PROVENANCE:        ['parquet_transform.py', 'duckdb_util.py'],
     ][process]
+}
+
+// The tables BUILD_TABLE builds, one task each (parquet_transform.py's TABLE_DEFS).
+def table_names() {
+    ['entries', 'features', 'xrefs', 'comments', 'publications', 'accession_map']
 }
 
 // MD5 of bin_modules(process): their names and contents, in list order.
@@ -273,7 +281,7 @@ process SORT_JSONL {
 
 /* ── PROCESS: Infer the input's columns (a full scan of the JSONL) ── */
 // The transform's first phase, run on its own so that a re-run or a retry of
-// STAGE_PARQUET or PARQUET_TRANSFORM reuses it instead of scanning ~1 TB of
+// STAGE_PARQUET or BUILD_TABLE reuses it instead of scanning ~1 TB of
 // JSON again (~1.5 h at full scale).  schema.json is tied to its input by
 // size and mtime (parquet_transform.py --schema refuses another input).
 // Light: ~1.6 GiB at full scale, so not the heavy processes' memory.
@@ -314,7 +322,7 @@ process INFER_SCHEMA {
 /* ── PROCESS: Stage the sorted JSONL to Parquet (one JSON parse) ─── */
 // The transform's second phase: all six table queries then read the staged
 // Parquet, roughly 2× faster than re-parsing JSON for each table.  On its own
-// so that a re-run or a retry of PARQUET_TRANSFORM reuses it (~35 min at full
+// so that a re-run or a retry of a BUILD_TABLE task reuses it (~35 min at full
 // scale; the file, ~80 GB, stays in the work directory).
 process STAGE_PARQUET {
     tag 'stage'
@@ -353,37 +361,75 @@ process STAGE_PARQUET {
 }
 
 
-/* ── PROCESS: Transform the staged Parquet → Parquet tables ──────── */
-// Builds the six tables from STAGE_PARQUET's file.  Every table has its own
-// ORDER BY; the pre-sorted input gives them locality (child tables add the
-// element's array position as the last key).
-//
-// NOTE on --skip-existing and retries:
-//   --skip-existing is useful for manual re-runs (e.g. fix root cause, then
-//   `nextflow run ... -resume`).  It does NOT help with the automatic OOM
-//   retry below because Nextflow provisions a fresh work directory per
-//   attempt — partial outputs from a failed attempt are not visible to the
-//   retry.  This is a known limitation; splitting into per-table processes
-//   would fix it but adds significant complexity for a rare failure mode.
-//   A table is only skipped when its completion sentinel matches the files on
-//   disk (see stream_to_parquet in bin/parquet_transform.py).
-process PARQUET_TRANSFORM {
-    tag 'transform'
+/* ── PROCESS: Build one table from the staged Parquet ───────────── */
+// One task per table (table_names()), each cached, retried and re-run on its
+// own: a re-run after one table fails builds that table alone, and the
+// tables can run side by side (--table_forks at a time).  Every table has
+// its own ORDER BY; the pre-sorted input gives them locality (child tables
+// add the element's array position as the last key).  Each task spills into
+// a directory of its own (spill_setup with the table's name).
+process BUILD_TABLE {
+    tag "${table}"
     cpus 4
     memory { scaled_memory(task.attempt) }
     errorStrategy { oom_retry(task.exitStatus) }
     maxRetries 1
+    maxForks params.table_forks
     time { scaled_time('48h', task.attempt) }
-    disk '2 TB'          // DuckDB ORDER BY spill + Parquet output.  Every table is sorted in
-                         // full (DuckDB does not reuse the input's order): child tables by
-                         // (reviewed DESC, organism_id, accession, <x>_index).  xrefs (~5B rows) and
-                         // features spill the most, one table at a time.
+    disk '1 TB'          // DuckDB ORDER BY spill + the table.  A table is sorted in full (DuckDB
+                         // does not reuse the input's order): child tables by (reviewed DESC,
+                         // organism_id, accession, <x>_index).  xrefs (~2.5B rows in 2026_03)
+                         // and features spill the most (654 GB for xrefs).
+
+    input:
+    path sorted_jsonl    // for the completion sentinel's input fingerprint
+    path staged
+    each table
+    val bin_code         // bin_digest: the imported bin/ modules
+
+    output:
+    path "table_${table}", emit: part
+
+    script:
+    """
+    set -euo pipefail
+    # bin/ modules: ${bin_code}
+    echo " .-- BUILD_TABLE ${table} BEGUN \$(date)"
+
+    ${spill_setup("${task.process}.${table}")}
+
+    parquet_transform.py ${sorted_jsonl} \
+        --staged ${staged} \
+        --only ${table} \
+        --outdir ./table_${table}/lake \
+        --memory-limit ${duckdb_mem(task.memory)} \
+        --threads ${task.cpus} \
+        --release ${params.release} \
+        ${spill_flag()}
+
+    echo " '-- BUILD_TABLE ${table} ENDED \$(date)"
+    """
+}
+
+
+/* ── PROCESS: Put the tables together into the lake ──────────────── */
+// The six tables side by side (hard links: no copy on one file system), then
+// the manifest, data package, LICENSE and checksums over them
+// (parquet_transform.py --assemble, which refuses a table that is not
+// complete for this input and release).
+process ASSEMBLE_LAKE {
+    tag 'assemble'
+    cpus 2
+    memory { [16.GB * task.attempt, scaled_memory(task.attempt)].min() }
+    errorStrategy { oom_retry(task.exitStatus) }
+    maxRetries 1
+    time { scaled_time('24h', task.attempt) }
 
     publishDir "${params.outdir}/${params.release}", mode: 'copy', overwrite: true, pattern: 'lake'
 
     input:
-    path sorted_jsonl    // for the completion sentinels' input fingerprint
-    path staged
+    path sorted_jsonl    // the input the tables' sentinels must name
+    path parts           // BUILD_TABLE's table_<name> directories
     val bin_code         // bin_digest: the imported bin/ modules
 
     output:
@@ -393,24 +439,26 @@ process PARQUET_TRANSFORM {
     """
     set -euo pipefail
     # bin/ modules: ${bin_code}
-    echo " .-- PARQUET_TRANSFORM BEGUN \$(date)"
+    echo " .-- ASSEMBLE_LAKE BEGUN \$(date)"
 
-    ${spill_setup(task.process)}
+    mkdir -p lake/.complete
+    for part in table_*; do
+        t=\${part#table_}
+        cp -al "\$part/lake/\$t" lake/ 2>/dev/null || cp -a "\$part/lake/\$t" lake/
+        cp "\$part/lake/.complete/\$t.json" lake/.complete/
+    done
 
     parquet_transform.py ${sorted_jsonl} \
-        --staged ${staged} \
         --outdir ./lake \
+        --assemble \
         --memory-limit ${duckdb_mem(task.memory)} \
         --threads ${task.cpus} \
-        --release ${params.release} \
-        --skip-existing \
-        ${spill_flag()}
+        --release ${params.release}
 
-    # The completion sentinels only serve a manual --skip-existing re-run of
-    # this directory (a retry gets a fresh work directory): not published.
+    # The completion sentinels only vouch for the tables to --assemble: not published.
     rm -rf lake/.complete
 
-    echo " '-- PARQUET_TRANSFORM ENDED \$(date)"
+    echo " '-- ASSEMBLE_LAKE ENDED \$(date)"
     """
 }
 
@@ -495,7 +543,7 @@ process PROVENANCE {
 
     // RELEASE_COMPLETE must not appear under its final name through
     // publishDir: publishDir copies run asynchronously, so this tiny marker
-    // would land in release_dir while PARQUET_TRANSFORM's multi-TB lake/ is
+    // would land in release_dir while ASSEMBLE_LAKE's multi-TB lake/ is
     // still being copied there.  It is published as a hidden .pending file
     // and renamed by the workflow's onComplete section, which Nextflow runs
     // only after every pending publish has finished.
@@ -572,7 +620,7 @@ workflow {
     if (params.expected_count != null && !(params.expected_count.toString() ==~ /[1-9][0-9]*/)) {
         error "--expected_count must be the release's entry count, a positive whole number, not '${params.expected_count}'"
     }
-    // PARQUET_TRANSFORM republishes into release_dir while VALIDATE reads the
+    // ASSEMBLE_LAKE republishes into release_dir while VALIDATE reads the
     // previous manifest, so one from inside it would be diffed against itself
     // (and its new mtime would re-run VALIDATE on every -resume).
     def this_release = file(release_dir())
@@ -607,13 +655,14 @@ workflow {
     //    whole file (read_json_auto); the JSONL staged to Parquet; the tables.
     INFER_SCHEMA(SORT_JSONL.out.sorted_jsonl, bin_digest('INFER_SCHEMA'))
     STAGE_PARQUET(SORT_JSONL.out.sorted_jsonl, INFER_SCHEMA.out.schema, bin_digest('STAGE_PARQUET'))
-    PARQUET_TRANSFORM(SORT_JSONL.out.sorted_jsonl, STAGE_PARQUET.out.staged, bin_digest('PARQUET_TRANSFORM'))
+    BUILD_TABLE(SORT_JSONL.out.sorted_jsonl, STAGE_PARQUET.out.staged, table_names(), bin_digest('BUILD_TABLE'))
+    ASSEMBLE_LAKE(SORT_JSONL.out.sorted_jsonl, BUILD_TABLE.out.part.collect(), bin_digest('ASSEMBLE_LAKE'))
 
     // 4. Validate the Parquet lake (uses sorted JSONL as ground truth —
     //    same entries, same count, just reordered — anchored to the entry
     //    count taken before the sort)
     VALIDATE(
-        PARQUET_TRANSFORM.out.lake,
+        ASSEMBLE_LAKE.out.lake,
         SORT_JSONL.out.sorted_jsonl,
         STREAM_JSONL.out.count_file,
         params.previous_manifest ? file(params.previous_manifest) : [],
@@ -622,7 +671,7 @@ workflow {
 
     // 5. SCHEMA.md and provenance record (only after validation passes)
     PROVENANCE(
-        PARQUET_TRANSFORM.out.lake,
+        ASSEMBLE_LAKE.out.lake,
         SORT_JSONL.out.sorted_jsonl,
         VALIDATE.out.report.concat(VALIDATE.out.report_json).collect(),
         STREAM_JSONL.out.input_manifest,

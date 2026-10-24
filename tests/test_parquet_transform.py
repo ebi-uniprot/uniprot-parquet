@@ -1880,9 +1880,10 @@ def test_files_roll_over_inside_a_batch(small_jsonl: str, tmp_path: Path) -> Non
 
 
 class TestPhases:
-    """--write-schema, --write-staged and --staged run the transform's phases
-    on their own (the workflow's INFER_SCHEMA, STAGE_PARQUET and
-    PARQUET_TRANSFORM), so a re-run reuses what is already computed."""
+    """--write-schema, --write-staged, --staged --only and --assemble run the
+    transform's phases on their own (the workflow's INFER_SCHEMA,
+    STAGE_PARQUET, BUILD_TABLE and ASSEMBLE_LAKE), so a re-run reuses what
+    is already computed."""
 
     @staticmethod
     def _bin(*args: object) -> subprocess.CompletedProcess[str]:
@@ -1956,3 +1957,51 @@ class TestPhases:
                                                    args: tuple[str, ...]) -> None:
         result = self._bin(small_lake["jsonl"], *args)
         assert result.returncode == 2 and "--" in result.stderr
+
+    @staticmethod
+    def _metadata(lake: Path, name: str) -> dict[str, Any]:
+        doc = json.loads((lake / name).read_text())
+        doc.pop("generated_at", None)
+        doc.pop("created", None)
+        return cast(dict[str, Any], doc)
+
+    def _build_tables_apart(self, jsonl: str, tmp_path: Path, tables: Collection[str]) -> Path:
+        """Each table built on its own from one staged file, then put side by
+        side in one directory with its sentinel, as ASSEMBLE_LAKE does."""
+        import shutil
+        staged = tmp_path / "staged.parquet"
+        assert self._bin(jsonl, "--write-staged", staged).returncode == 0
+        lake = tmp_path / "assembled"
+        (lake / ".complete").mkdir(parents=True)
+        for table in tables:
+            part = tmp_path / f"table_{table}"
+            result = self._bin(jsonl, "--staged", staged, "--only", table, "--outdir", part, "--release", "r1")
+            assert result.returncode == 0, result.stderr[-2000:]
+            shutil.copytree(part / table, lake / table)
+            shutil.copy(part / ".complete" / f"{table}.json", lake / ".complete")
+        return lake
+
+    def test_tables_built_apart_assemble_into_the_same_lake(self, small_lake: dict[str, str],
+                                                           tmp_path: Path) -> None:
+        """The same Parquet files, manifest and data package as one run (the
+        manifest's types included: a list read back from Parquet names its item
+        "element", and the manifest keeps the "l" of a table written now)."""
+        from parquet_transform import TABLE_DEFS
+        jsonl = small_lake["jsonl"]
+        whole = tmp_path / "whole"
+        assert self._bin(jsonl, "--outdir", whole, "--release", "r1").returncode == 0
+        lake = self._build_tables_apart(jsonl, tmp_path, [d[0] for d in TABLE_DEFS])
+        result = self._bin(jsonl, "--outdir", lake, "--assemble", "--release", "r1")
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert "PARQUET STAGING (skipped" in result.stderr
+        assert self._parquet_hashes(lake) == self._parquet_hashes(whole)
+        for name in ("manifest.json", "datapackage.json"):
+            assert self._metadata(lake, name) == self._metadata(whole, name), name
+
+    def test_assemble_refuses_a_missing_table(self, small_lake: dict[str, str], tmp_path: Path) -> None:
+        lake = self._build_tables_apart(small_lake["jsonl"], tmp_path, ["entries", "features"])
+        result = self._bin(small_lake["jsonl"], "--outdir", lake, "--assemble", "--release", "r1")
+        assert result.returncode != 0
+        assert "--assemble:" in result.stderr and "xrefs" in result.stderr
+        assert not (lake / "manifest.json").exists()
+

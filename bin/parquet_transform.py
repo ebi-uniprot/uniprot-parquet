@@ -19,8 +19,10 @@ Architecture:
 Phases on their own (the workflow runs each as a process, so a re-run reuses
 it): --write-schema FILE infers the columns (a full scan) and writes them;
 --schema FILE --write-staged FILE stages the input through them; --staged
-FILE builds the tables from that file.  Each refuses a file made from
-another input (size and mtime).
+FILE --only TABLE builds one table from that file; --assemble writes the
+manifest, data package and checksums for tables built that way and put
+side by side.  Each refuses a file made from another input (size and
+mtime), and --assemble a table that is not complete.
 
 Schema:
   The input schema is never declared: DuckDB infers it from the whole file
@@ -1949,6 +1951,22 @@ def _partitioning_block(name: str, files: Collection[str], table_dir: str,
     }
 
 
+def _as_streamed(t: pa.DataType) -> pa.DataType:
+    """``t`` with every list's item field named "l", as in the Arrow batches the
+    manifest describes for a table it writes.  A Parquet file read back names
+    them "element"; the manifest of a table already on disk (--skip-existing,
+    --assemble) must read the same as if the table were written now."""
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        item = t.value_field
+        field = pa.field("l", _as_streamed(item.type), item.nullable, item.metadata)
+        return pa.list_(field) if pa.types.is_list(t) else pa.large_list(field)
+    if pa.types.is_struct(t):
+        return pa.struct([f.with_type(_as_streamed(f.type)) for f in t])
+    if pa.types.is_map(t):
+        return pa.map_(_as_streamed(t.key_type), _as_streamed(t.item_type), t.keys_sorted)
+    return t
+
+
 def _schema_to_dict(arrow_schema: pa.Schema) -> list[dict[str, Any]]:
     """Convert Arrow schema to a JSON-serializable dict for the manifest."""
     columns = []
@@ -2418,7 +2436,15 @@ def main() -> None:
         help="Build the tables from FILE (--write-staged from this input) instead of staging; "
              "FILE is kept.",
     )
+    parser.add_argument(
+        "--assemble", action="store_true",
+        help="Build no table: write the manifest, data package and checksums for the tables already "
+             "in --outdir, each complete (its .complete/<table>.json matches its files, this input "
+             "and --release); refuse otherwise.",
+    )
     args = parser.parse_args()
+    if args.assemble and (args.schema or args.staged or args.write_schema or args.write_staged):
+        parser.error("--assemble builds no table: it takes no --schema, --staged, --write-schema or --write-staged")
     if args.write_schema and (args.schema or args.write_staged or args.staged):
         parser.error("--write-schema infers the columns: it takes no --schema, --write-staged or --staged")
     if args.staged and (args.schema or args.write_staged):
@@ -2467,7 +2493,7 @@ def main() -> None:
         # ── Determine which tables to write ──
         skip_set: set[str] = set()
         source = _input_fingerprint(jsonl_path)
-        if args.skip_existing:
+        if args.skip_existing or args.assemble:
             for name, _, _ in table_defs:
                 table_dir = os.path.join(outdir, name)
                 if not os.path.isdir(table_dir):
@@ -2481,6 +2507,9 @@ def main() -> None:
                     eprint(f"  REBUILD {name}: {len(existing)} Parquet files on disk, {reason}")
 
         tables_to_write = {name for name, _, _ in table_defs} - skip_set
+        if args.assemble and tables_to_write:
+            raise RuntimeError(f"--assemble: {sorted(tables_to_write)} not complete in {outdir} "
+                               "(see the REBUILD lines above, or the table is missing)")
 
         # ── Stage JSONL → Parquet (parse JSON once, read Parquet 5× faster) ──
         staged_bytes: int | None
@@ -2538,15 +2567,15 @@ def main() -> None:
                            f"description): {new}")
         else:
             schema_paths, json_paths = set(), set()
-        if ("proteinDescription.submittedNames" not in schema_paths
-                and "proteinDescription.submissionNames" not in schema_paths):
+        if tables_to_write and ("proteinDescription.submittedNames" not in schema_paths
+                                and "proteinDescription.submissionNames" not in schema_paths):
             eprint("  Note: proteinDescription.submittedNames/submissionNames absent "
                    "(normal for Swiss-Prot-only data)")
         ec_sources = [s for s in ["recommendedName", "alternativeNames", "submittedNames", "submissionNames"]
                       if f"proteinDescription.{s}.ecNumbers" in schema_paths]
         if ec_sources:
             eprint(f"  EC numbers found in: {', '.join(ec_sources)}")
-        else:
+        elif tables_to_write:
             eprint("  Note: no ecNumbers in any naming block (ec column will be empty)")
 
         # ── Write tables ──
@@ -2569,6 +2598,7 @@ def main() -> None:
                 eprint(f"  Skipped ({row_count:,} rows in {len(existing)} existing files)")
                 # Read schema from first file
                 schema = pq.read_schema(os.path.join(table_dir, existing[0]))
+                schema = pa.schema([f.with_type(_as_streamed(f.type)) for f in schema], metadata=schema.metadata)
                 manifest_tables[name] = {
                     "description": meta.get("description", ""),
                     "primary_key": meta.get("primary_key", []),

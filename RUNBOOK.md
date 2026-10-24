@@ -65,7 +65,7 @@ reachable and copy `tests/fixtures/diverse*.json.gz` over.
 ```bash
 # 1. run_lake.sh exited 0 (it exits 1 unless RELEASE_COMPLETE was written); every process succeeded
 ls datalake/small/RELEASE_COMPLETE
-grep -o "succeededCount=[0-9]*; failedCount=[0-9]*" .nextflow.log   # succeededCount=7; failedCount=0
+grep -o "succeededCount=[0-9]*; failedCount=[0-9]*" .nextflow.log   # succeededCount=13; failedCount=0
 
 # 2. Validation, including the pre-sort entry-count anchor
 grep -E "VERDICT|expected count|reconstruction matches|shortcut values match" datalake/small/validation_report.txt
@@ -96,7 +96,7 @@ python -c "from uniprot_parquet import connect; print(connect('datalake/small/la
 **Checks**
 
 ```bash
-grep -o "cachedCount=[0-9]*" .nextflow.log   # cachedCount=7: every process cached
+grep -o "cachedCount=[0-9]*" .nextflow.log   # cachedCount=13: every task cached (BUILD_TABLE is six)
 ls datalake/small/RELEASE_COMPLETE           # the marker is back
 ls -l datalake/reports/report.html           # a fresh mtime
 ```
@@ -194,23 +194,23 @@ python -c "
 import json; m=json.load(open('$OUT/lake/manifest.json'))
 for t,v in m['tables'].items(): print(f'{t:15} {v[\"row_count\"]:>12,}  files={len(v[\"files\"])}')"
 
-# 3. Resource headroom: peak_rss of SORT_JSONL, STAGE_PARQUET, PARQUET_TRANSFORM, VALIDATE under 16 GB;
+# 3. Resource headroom: peak_rss of SORT_JSONL, STAGE_PARQUET, each BUILD_TABLE, VALIDATE under 16 GB;
 #    realtime × (release entries / N_SUBSET; 150M for 2026_03) is a rough full-run estimate (README budgets)
 column -t -s $'\t' datalake/reports/trace.txt | cut -c1-200
 #    macOS without a container engine records no peak_rss (nor %cpu, I/O; realtime it does): run this
 #    stage on Linux, or time a task by hand in a copy of its work dir (a copy, so the cached task's
 #    outputs keep their mtimes and -resume still reuses them); "maximum resident set size" is peak RSS, in bytes
-#    (repeat for PARQUET_TRANSFORM and VALIDATE; bin/ goes on PATH as Nextflow puts it there).
+#    (repeat for STAGE_PARQUET, BUILD_TABLE and VALIDATE; bin/ goes on PATH as Nextflow puts it there).
 #    Only with no run of this release in progress: the task clears its spill dir under $TMPD
 WD=$(nextflow log last -f process,status,workdir | awk '$1=="SORT_JSONL" && $2!="FAILED" {print $3}' | tail -1)
 rm -rf /tmp/measure && cp -RL "$WD" /tmp/measure
 (B=$(pwd)/bin; cd /tmp/measure && PATH="$B:$PATH" /usr/bin/time -l bash .command.sh)
 
-# 4. Spill went to $TMPD: subset.{SORT_JSONL,INFER_SCHEMA,STAGE_PARQUET,PARQUET_TRANSFORM,VALIDATE}.<hash>/, each holding a
+# 4. Spill went to $TMPD: subset.{SORT_JSONL,INFER_SCHEMA,STAGE_PARQUET,BUILD_TABLE.<table>,VALIDATE}.<hash>/, each holding a
 #    duckdb_spill_*/ only while its task runs
 ls $TMPD
 
-# 5. Resume: the same nextflow command again -> cachedCount=7 in .nextflow.log.  -resume continues
+# 5. Resume: the same nextflow command again -> cachedCount=13 in .nextflow.log.  -resume continues
 #    the launch directory's last run: do this before 4c (or any other run from here), or name
 #    the run to continue: -resume <run name from nextflow log>
 
@@ -253,10 +253,11 @@ restore `PATH`) before running anything else, or its jobs go to the stand-in SLU
 2–4, 7b, and stage 9 checks 1 and 4); then the requests each job was submitted with:
 
 ```bash
-for f in $FAKE_SLURM_DIR/*.sbatch; do echo "$(grep -o 'nf-[A-Z_]*' $f) $(grep -oE -- '(-c|-t|--mem|-p) \S+' $f | tr '\n' ' ')"; done
-#   smoke: -t 04:00:00 -p short, --mem 16384M for SORT/INFER/STAGE/TRANSFORM/VALIDATE
+for f in $FAKE_SLURM_DIR/*.sbatch; do echo "$(grep -o 'nf-[A-Z_]*' $f) $(grep -oE -- '(-c|-t|--mem|-p) \S+' $f | tr '\n' ' ')"; done | uniq -c
+#   smoke: -t 04:00:00 -p short, --mem 16384M for SORT/INFER/STAGE/BUILD_TABLE (x6)/ASSEMBLE/VALIDATE
 #   oom:   STAGE_PARQUET twice: --mem 2560M, then 5120M (the other DuckDB processes fit in 2560M)
-#   full:  the 8a table (no -p; INFER_SCHEMA --mem 16384M; transform -c 4 -t 48:00:00 --mem 98304M; VALIDATE -c 8)
+#   full:  the 8a table (no -p; INFER_SCHEMA and ASSEMBLE_LAKE --mem 16384M; BUILD_TABLE x6 -c 4 -t 48:00:00
+#          --mem 98304M; VALIDATE -c 8)
 ```
 
 This proves the profiles, the headers, the retry scaling, `run_lake.sh` and
@@ -326,7 +327,7 @@ micromamba activate uniprot-parquet      # carried to the compute nodes (no cont
 export SCRATCH=/scratch/$USER            # your scratch filesystem, seen by every compute node
 export NXF_WORK=$SCRATCH/nf_work         # Nextflow's work dir; the same on every re-submit (-resume looks there)
 wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //' | grep . \
-       || nextflow log last -f process,workdir | awk -v p="$1" '$1 == p {d = $2} END {print d}'; }
+       || nextflow log last -f name,workdir | awk -F'\t' -v p="$1" '$1 == p || index($1, p " (") == 1 {d = $2} END {print d}'; }
 ```
 
 Part B writes everything under `$SCRATCH`. `NXF_WORK` holds every intermediate
@@ -361,7 +362,7 @@ every-shell block.
 
 Proves the plumbing, not the data. `subset` mode uses the `short` profile:
 4 h wall time for every process (retries included), 16 GB for SORT_JSONL,
-PARQUET_TRANSFORM and VALIDATE.
+INFER_SCHEMA, STAGE_PARQUET, each BUILD_TABLE, ASSEMBLE_LAKE and VALIDATE.
 
 ```bash
 ./run_lake.sh subset --input tests/fixtures/small.json.gz \
@@ -372,7 +373,7 @@ PARQUET_TRANSFORM and VALIDATE.
 
 ```bash
 # 1. Jobs went to SLURM
-squeue -u $USER                                       # during the run: seven jobs, one at a time
+squeue -u $USER                                       # during the run: 13 jobs, the six BUILD_TABLE together
 grep -c "executor > slurm" .nextflow.log              # >= 1
 
 # 2. Nodes see the env and tools
@@ -385,7 +386,7 @@ grep -l "command not found" $NXF_WORK/*/*/.command.err   # no output
 # 4. Resource accounting works: every row COMPLETED, exit 0, peak_rss populated
 column -t -s $'\t' $SCRATCH/uplake_smoke/reports/trace.txt | cut -c1-160
 
-# 5. Resume: the same command again -> cachedCount=7 (before 7b: -resume continues the
+# 5. Resume: the same command again -> cachedCount=13 (before 7b: -resume continues the
 #    launch directory's last run)
 ```
 
@@ -444,8 +445,8 @@ pigz -t $DUMP && echo GZIP_OK
 ls -l $DUMP                               # ~160 GB compressed for 2026 releases
 
 # 4. Disk: under --duckdb_temp, SORT_JSONL's chunks and runs (~1.5x the compressed JSONL), then
-#    PARQUET_TRANSFORM's spill (~1-2 TB);
-#    the transform also stages the JSONL as Parquet in its work dir; the published release is
+#    the six BUILD_TABLE spills at once (xrefs alone 654 GB in 2026_03; fewer at a time with
+#    --table_forks); STAGE_PARQUET's file (~80 GB) stays in its work dir; the published release is
 #    tens to a few hundred GB. `disk` directives are not passed to SLURM, so nothing reserves this
 df -h $SCRATCH                            # >= 3 TB free if $NXF_WORK and spill share it, plus the output
 echo $NXF_WORK                            # set (stage 6), on that scratch filesystem
@@ -455,7 +456,8 @@ echo $NXF_WORK                            # set (stage 6), on that scratch files
 #      SORT_JSONL         4 CPUs  96 -> 192 GB   24h -> 48h
 #      INFER_SCHEMA       4 CPUs  16 ->  32 GB   24h -> 48h
 #      STAGE_PARQUET      4 CPUs  96 -> 192 GB   24h -> 48h
-#      PARQUET_TRANSFORM  4 CPUs  96 -> 192 GB   48h -> 72h  (capped at --max_time)
+#      BUILD_TABLE (x6)   4 CPUs  96 -> 192 GB   48h -> 72h  (capped at --max_time; each table on its own)
+#      ASSEMBLE_LAKE      2 CPUs  16 ->  32 GB   24h -> 48h
 #      VALIDATE           8 CPUs  96 -> 192 GB   24h -> 48h
 #    (transform headers: -c 4 -t 48:00:00 --mem 98304M, no -p: the cluster's default
 #    partition, or run_lake.sh --queue <partition>). If that partition's MaxWall is under
@@ -510,25 +512,29 @@ ls -l $SCRATCH/uniprot_parquet/2026_03/sorted.jsonl.zst   # published when done
 tail -2 $WD/.command.log
 
 # STAGE_PARQUET (~35 min): "Staged in …s (… GB)" at the end; the file (~80 GB) stays in
-# its work directory, where every re-run of PARQUET_TRANSFORM reads it
+# its work directory, where every BUILD_TABLE task (and any re-run of one) reads it
 tail -2 $WD/.command.log
 
-# PARQUET_TRANSFORM (6–12 h)
-grep -E "^--- |rows so far|rows in" $WD/.command.log | tail -5
-#   "--- PARQUET STAGING (reused: …) ---", "--- ENTRIES ---", "entries: <$EXPECTED> rows in N files",
-#   then FEATURES, XREFS, ...
+# BUILD_TABLE: six tasks side by side, one per table; WD=$(wd "BUILD_TABLE (<table>)")
+for t in entries features xrefs comments publications accession_map; do
+    echo "$t: $(tail -1 $(wd "BUILD_TABLE ($t)")/.command.log 2>/dev/null)"; done
+#   "<table>: N rows so far (…)" while writing; "<table>: N rows in M files (…s)" when done.
+#   Each sorts first (silent; xrefs the longest), then writes. The run waits for the slowest.
+WD=$(wd "BUILD_TABLE (entries)")
 grep -E "New UniProt fields|stored as JSON|shortcut sources absent" $WD/.command.log
 #   keys UniProt added (new source columns) and fields whose type varies (stored as JSON):
 #   informational, unless such a field feeds a shortcut, when the build stops (cheatsheet)
-ls $WD/lake/.complete/             # a <table>.json per finished table, for a manual
-                                   # --skip-existing re-run; removed on success, not published
+
+# ASSEMBLE_LAKE: the manifest, data package and checksums over the six tables
+WD=$(wd ASSEMBLE_LAKE); tail -3 $WD/.command.log   # "DONE in …s", one line per table
 ```
 
 - **STREAM_JSONL** `FATAL — interrupted` or `BrokenPipeError`: nothing
   downstream ran and no count was written; fix the cause and re-submit.
-- **PARQUET_TRANSFORM** OOM (exit 75, 137, 140 or 143): a second attempt follows
-  at 192 GB (a retry is capped at 256 GB). If that fails too, see the
-  cheatsheet; a re-submit restarts at the transform.
+- **BUILD_TABLE** OOM (exit 75, 137, 140 or 143): a second attempt of that
+  table follows at 192 GB (a retry is capped at 256 GB); the other tables are
+  unaffected. If it fails too, see the cheatsheet; a re-submit builds only the
+  tables that did not finish.
 - **VALIDATE** (not yet timed at full scale): `[PASS]` lines in
   `$WD/.command.log`. Any `[FAIL]` exits 1, so PROVENANCE does not run and no
   `RELEASE_COMPLETE` appears (cheatsheet).
@@ -588,9 +594,9 @@ completed process and republishes every output whole.
 |---|---|
 | Head job / login session killed mid-run | Re-submit. A copy cut short mid-publish is repaired; `RELEASE_COMPLETE` is written only after `bin/verify_release.py` passes. For hash-level certainty: `bin/verify_release.py <release dir> --full`. |
 | `RELEASE_COMPLETE not written: the published copy ... does not match its metadata` | Something changed the release directory during or after publishing (full disk, another process). Re-submit. |
-| A job hit its wall time | SORT_JSONL, INFER_SCHEMA, STAGE_PARQUET, PARQUET_TRANSFORM and VALIDATE retry once with twice the time (capped at `--max_time`); STREAM_JSONL and PROVENANCE do not. If it still fails, raise `--max-time` within the queue's limit, or re-submit. A re-run of PARQUET_TRANSFORM starts its tables afresh, but takes the schema and the staged file from INFER_SCHEMA and STAGE_PARQUET's cache. |
-| `PARQUET_TRANSFORM`: `Segmentation fault`, exit 139 (not retried) | Seen once on 2026_03, 30 min into the features sort, with the job at 91% of its 96 GB and DuckDB 1.27x over its own cap. Give it more headroom: run Nextflow directly with `--process_memory 192GB --duckdb_pct 60` (DuckDB's share of the task, default 75), and `export PYTHONFAULTHANDLER=1` first for a traceback if it recurs. A re-submit reuses the schema and the staged file. |
-| `PARQUET_TRANSFORM` OOM twice | Raise `MEMORY=` in `run_lake.sh`'s `full` mode and commit it (an uncommitted edit makes provenance record `dirty: true`), or run Nextflow directly with `--process_memory`; then re-submit. |
+| A job hit its wall time | SORT_JSONL, INFER_SCHEMA, STAGE_PARQUET, BUILD_TABLE (each table), ASSEMBLE_LAKE and VALIDATE retry once with twice the time (capped at `--max_time`); STREAM_JSONL and PROVENANCE do not. If it still fails, raise `--max-time` within the queue's limit, or re-submit. A re-submit builds only the tables that did not finish, from the cached schema and staged file. |
+| `BUILD_TABLE`: `Segmentation fault`, exit 139 (not retried) | Seen once on 2026_03 (then one process for all tables), 30 min into the features sort, with the job at 91% of its 96 GB and DuckDB 1.27x over its own cap. Give it more headroom: run Nextflow directly with `--process_memory 192GB --duckdb_pct 60` (DuckDB's share of the task, default 75), and `export PYTHONFAULTHANDLER=1` first for a traceback if it recurs. A re-submit rebuilds only the tables that did not finish. |
+| A `BUILD_TABLE` OOM twice | Raise `MEMORY=` in `run_lake.sh`'s `full` mode and commit it (an uncommitted edit makes provenance record `dirty: true`), or run Nextflow directly with `--process_memory`; then re-submit. |
 | `Process requirement exceeds available memory` (local) | `--process_memory` exceeds the machine; lower it (DuckDB spills to `--duckdb_temp`). |
 | `STREAM_JSONL`: `FATAL — ijson's C backend (yajl2_c) is not available` | The env's ijson has no C extension (the pure-Python parser would take ~11x as long). `python -m pip install --force-reinstall --no-deps ijson`, check stage 0's `ijson.backend` line, and re-submit. |
 | `STREAM_JSONL`: `FATAL — count mismatch` | The dump is not the release you think, or is truncated: re-check `EXPECTED` and `pigz -t`. |
@@ -598,9 +604,9 @@ completed process and republishes every output whole.
 | `VALIDATE` fails | Read the failed task's report: `WD=$(nextflow log last -f process,status,workdir \| awk '$1=="VALIDATE" && $2=="FAILED" {print $3}' \| tail -1)`, then `$WD/validation_report.txt` (a failing report is not published: `$OUT/validation_report.txt` is missing or a previous run's). Fix and re-submit: only processes whose code or inputs changed re-run. |
 | `VALIDATE` check 20: `<table>.<column> has values` or `<table> has rows` fails | A shortcut is empty in every row (its source field is absent or renamed upstream: compare the transform's `shortcut sources absent from input` warning), or a table is empty. Update the shortcut's SQL in `bin/parquet_transform.py`. |
 | `VALIDATE` check 21: `<table> shortcut values match the JSONL` fails | A shortcut disagrees with `bin/shortcut_reference.py`; the detail names column, accession, expected and actual value. One side is wrong, often because UniProt changed a field the shortcut reads: fix it and rebuild. |
-| `PARQUET_TRANSFORM`: `Input lacks fields every UniProtKB entry carries` | UniProt removed or renamed a field a shortcut is built from (or the input is not UniProtKB). Update the SQL builder and `REQUIRED_PATHS` in `bin/parquet_transform.py` (a shortcut-schema change). New or retyped fields no shortcut reads never stop the build. |
-| `PARQUET_TRANSFORM`: `Shortcut columns whose source field has a different type in different entries` | DuckDB inferred JSON for a field a shortcut reads; the message names column and path. Decide how the shortcut reads it, update its SQL builder, and bump `schema_version` if the column's type or meaning changes. |
-| `PARQUET_TRANSFORM`: `Input has entryType value(s) [...]` | UniProt reworded or added an `entryType`. Add it to `ENTRY_TYPES` in both `bin/parquet_transform.py` and `bin/shortcut_reference.py`, mapped to reviewed or unreviewed. |
-| `PARQUET_TRANSFORM`: `input key(s) [...] have the name of a shortcut column` | UniProt added a key named like a shortcut (case-insensitive). Rename the shortcut in `bin/parquet_transform.py` (a major schema version). |
+| `BUILD_TABLE`: `Input lacks fields every UniProtKB entry carries` | UniProt removed or renamed a field a shortcut is built from (or the input is not UniProtKB). Update the SQL builder and `REQUIRED_PATHS` in `bin/parquet_transform.py` (a shortcut-schema change). New or retyped fields no shortcut reads never stop the build. |
+| `BUILD_TABLE`: `Shortcut columns whose source field has a different type in different entries` | DuckDB inferred JSON for a field a shortcut reads; the message names column and path. Decide how the shortcut reads it, update its SQL builder, and bump `schema_version` if the column's type or meaning changes. |
+| `BUILD_TABLE`: `Input has entryType value(s) [...]` | UniProt reworded or added an `entryType`. Add it to `ENTRY_TYPES` in both `bin/parquet_transform.py` and `bin/shortcut_reference.py`, mapped to reviewed or unreviewed. |
+| `BUILD_TABLE`: `input key(s) [...] have the name of a shortcut column` | UniProt added a key named like a shortcut (case-insensitive). Rename the shortcut in `bin/parquet_transform.py` (a major schema version). |
 | Manual transform re-run on an existing `lake/` (outside Nextflow) | `parquet_transform.py ... --skip-existing` skips only tables whose `.complete/<table>.json` matches the files on disk, the input (size, mtime) and release; others are rebuilt, with a `REBUILD <table>: ...` line on stderr. |
 | Reports in `<outdir>/reports/` look stale | They are overwritten every run: check the mtime, then `.nextflow.log` for `Failed to render`. |

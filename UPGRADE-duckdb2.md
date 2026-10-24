@@ -211,10 +211,10 @@ shims in place, and Task 2's trap only shows without them.
 
 ```bash
 # the usual env (1.5.6)
-REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 418 passed, 1 xfailed
+REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 422 passed, 1 xfailed
 # a second env with DuckDB 2.x, no shims
 pip install "duckdb>=2.0.1,<3"
-REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 418 passed, 1 xfailed
+REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q          # 422 passed, 1 xfailed
 ruff check . && mypy
 ```
 
@@ -260,7 +260,7 @@ one machine.
 2. Step 6, the 2M-entry slice, once with 1.5.6 and once with 2.0.x. Compare
    the transform's `Elapsed (wall clock)` and `Maximum resident set size`,
    and check that the two lakes are equal table by table (as in Appendix B).
-3. Re-check the full run's memory request: `PARQUET_TRANSFORM` asks for
+3. Re-check the full run's memory request: each `BUILD_TABLE` task asks for
    96 GB, with DuckDB at 75% (`params.duckdb_pct`). If 2.0's peak RSS on the
    slice is higher relative to its limit, the 25% headroom shrinks: watch
    the first full run's `trace.txt`.

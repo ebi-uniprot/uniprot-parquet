@@ -400,7 +400,8 @@ nextflow run upjson2lake.nf -profile prod \
 | `SORT_JSONL` | External merge sort: DuckDB sorts chunks that fit in memory, then the runs are merged; ~1.5× the compressed JSONL on disk | `sorted.jsonl.zst` | ~1 h (2026_03) | 96 GB |
 | `INFER_SCHEMA` | Infers the input's columns from the whole JSONL (`read_json_auto`, `sample_size=-1`): `schema.json` | — | ~1.5 h (2026_03) | 16 GB |
 | `STAGE_PARQUET` | Parses the JSONL once into a staged Parquet file (~80 GB), read by every table query | — | ~35 min (2026_03) | 96 GB |
-| `PARQUET_TRANSFORM` | Writes the six tables from the staged file (DuckDB + PyArrow); up to 2 TB disk | `lake/` | 6–12 h | 96 GB |
+| `BUILD_TABLE` | One task per table (six, side by side, `--table_forks` at a time): sorts and writes it from the staged file (DuckDB + PyArrow); up to ~1 TB spill each (xrefs) | — | about the slowest table (xrefs); 6–12 h one after another | 96 GB each |
+| `ASSEMBLE_LAKE` | Puts the six tables side by side (hard links) and writes `manifest.json`, `datapackage.json`, `LICENSE`, `SHA256SUMS.txt` and `RELEASE.metalink` over them | `lake/` | hashes every file once | 16 GB |
 | `VALIDATE` | The checks under [Validation](#validation); one pass over the JSONL, files hashed 8 at a time | `validation_report.{txt,json}` | not yet timed (24 h limit) | 96 GB |
 | `PROVENANCE` | Metadata only | `SCHEMA.md`, `provenance.json`, `RELEASE_COMPLETE`² | < 1 min | 1 GB |
 
@@ -411,7 +412,7 @@ DuckDB streams Arrow record batches to PyArrow, which writes zstd-compressed Par
 
 ### Production notes (SLURM)
 
-- **OOM recovery.** `SORT_JSONL`, `INFER_SCHEMA`, `STAGE_PARQUET`, `PARQUET_TRANSFORM` and `VALIDATE` retry once with doubled memory (at most 256 GB) after DuckDB's out-of-memory error (exit 75), the OOM killer (137/140) or SLURM's pre-kill SIGTERM (143). A 143 may be a wall-time kill, so the retry also doubles the time limit, capped at `--max_time`. Other failures are terminal.
+- **OOM recovery.** `SORT_JSONL`, `INFER_SCHEMA`, `STAGE_PARQUET`, `BUILD_TABLE` (each table on its own), `ASSEMBLE_LAKE` and `VALIDATE` retry once with doubled memory (at most 256 GB) after DuckDB's out-of-memory error (exit 75), the OOM killer (137/140) or SLURM's pre-kill SIGTERM (143). A 143 may be a wall-time kill, so the retry also doubles the time limit, capped at `--max_time`. Other failures are terminal.
 - **Work directory.** Nextflow's `work/` (every intermediate file: hundreds of GB at full scale) defaults to the launch directory, the checkout. On a cluster, `export NXF_WORK=/scratch/...` on a filesystem every compute node sees, and keep it for re-submits (`-resume` looks there).
 - **Spill directory.** Point `--duckdb_temp` at a scratch filesystem with 1–2 TB free (node-local NVMe is best); the `disk` directives are not passed to SLURM, so check the space yourself. Each process spills into `<duckdb_temp>/<release>.<process>.<hash>/` (hash of the absolute release directory, so runs into different outdirs never share one), emptied at process start, so a retry reclaims the spill of an attempt killed by OOM.
 - **Resume.** Resubmit with `-resume` after a wall-time kill or preemption. Every `publishDir` overwrites, so a resumed run republishes cached outputs whole, repairing a damaged copy.

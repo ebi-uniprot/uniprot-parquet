@@ -37,7 +37,7 @@ def test_bin_modules_list_every_imported_module() -> None:
     lists = {p: set(re.findall(r"'([^']+)'", names))
              for p, names in re.findall(r"(\w+):\s*\[([^]]*)\]", table)}
     assert set(lists) == {"STREAM_JSONL", "SORT_JSONL", "INFER_SCHEMA", "STAGE_PARQUET",
-                          "PARQUET_TRANSFORM", "VALIDATE", "PROVENANCE"}
+                          "BUILD_TABLE", "ASSEMBLE_LAKE", "VALIDATE", "PROVENANCE"}
     for process, listed in lists.items():
         body = text[text.index(f"process {process} {{"):]
         body = body[:body.index("\n}\n")]
@@ -46,3 +46,18 @@ def test_bin_modules_list_every_imported_module() -> None:
         assert listed == imported, f"{process}: bin_modules lists {sorted(listed)}, scripts import {sorted(imported)}"
         if listed:
             assert f"bin_digest('{process}')" in text, process
+
+
+def test_table_names_are_the_transforms_tables() -> None:
+    """upjson2lake.nf's table_names() (a BUILD_TABLE task each) lists exactly
+    parquet_transform.py's tables: a table missing from it would be missing
+    from the lake, and ASSEMBLE_LAKE would not notice."""
+    import re
+    import sys
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, "bin"))
+    from parquet_transform import TABLE_DEFS
+    with open(WORKFLOW) as f:
+        text = f.read()
+    body = text[text.index("def table_names()"):]
+    body = body[:body.index("\n}\n")]
+    assert re.findall(r"'([a-z_]+)'", body) == [d[0] for d in TABLE_DEFS]

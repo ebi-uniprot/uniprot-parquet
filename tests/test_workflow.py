@@ -21,6 +21,7 @@ import pytest
 from conftest import PROJECT_ROOT, SMALL_JSON_GZ
 
 WORKFLOW = os.path.join(PROJECT_ROOT, "upjson2lake.nf")
+TABLES = ("entries", "features", "xrefs", "comments", "publications", "accession_map")
 
 pytestmark = pytest.mark.skipif(shutil.which("nextflow") is None and not os.environ.get("REQUIRE_NEXTFLOW"),
                                 reason="nextflow not on PATH")
@@ -98,7 +99,7 @@ class TestPreviousManifest:
         assert "previous: release prev-edited" in text
 
     def test_manifest_of_the_release_being_built_is_refused(self, launch_dir: pathlib.Path) -> None:
-        """PARQUET_TRANSFORM republishes that file while VALIDATE reads it,
+        """ASSEMBLE_LAKE republishes that file while VALIDATE reads it,
         so the schema diff would compare the release with itself."""
         result = _launch(launch_dir, "prev", "--previous_manifest", "out/prev/lake/manifest.json")
         assert result.returncode != 0
@@ -136,7 +137,7 @@ def test_stale_spill_of_a_killed_attempt_is_reclaimed(launch_dir: pathlib.Path, 
     not even the live spill of a run of the same release label into another
     outdir, which shares --duckdb_temp."""
     temp = tmp_path / "duckdb tmp"
-    processes = ("SORT_JSONL", "PARQUET_TRANSFORM", "VALIDATE")
+    processes = ("SORT_JSONL", "INFER_SCHEMA", "STAGE_PARQUET", "BUILD_TABLE.entries", "BUILD_TABLE.xrefs", "VALIDATE")
     stale = [temp / _spill_dir_name(launch_dir / "out" / "spill", p) / "duckdb_spill_old" / "junk"
              for p in processes]
     other = [temp / "other" / "keep"] + [
@@ -169,19 +170,40 @@ def test_validate_duckdb_is_sized_to_its_task(launch_dir: pathlib.Path) -> None:
         assert "DuckDB: memory_limit 3072MB, threads " in f.read()   # 75% of 4 GB, in MB
 
 
-def test_rerun_of_the_transform_reuses_schema_and_staging(launch_dir: pathlib.Path) -> None:
+def test_rerun_of_the_tables_reuses_schema_and_staging(launch_dir: pathlib.Path) -> None:
     """The input's columns and its staged Parquet come from the cache when
-    only the transform runs again: here a new release label, which only
-    PARQUET_TRANSFORM's command names, as a re-run after its failure does."""
+    only the tables are built again: here a new release label, which only
+    BUILD_TABLE's and ASSEMBLE_LAKE's commands name."""
     _run(launch_dir, "relabel")
     with open(launch_dir / ".nextflow.log") as f:
         log = f.read()
     for process in ("STREAM_JSONL", "SORT_JSONL", "INFER_SCHEMA", "STAGE_PARQUET"):
         assert f"Cached process > {process} (" in log, process
-    # and the transform read the staged file it was handed
-    hash_prefix = _group(r"\[(\w\w/\w+)\] Submitted process > PARQUET_TRANSFORM \(", log)
-    (workdir,) = (launch_dir / "work").glob(f"{hash_prefix}*")
-    assert "PARQUET STAGING (reused:" in (workdir / ".command.err").read_text()
+    built = re.findall(r"\[(\w\w/\w+)\] Submitted process > BUILD_TABLE \((\w+)\)", log)
+    assert sorted(t for _, t in built) == sorted(TABLES)
+    # and each read the staged file it was handed
+    for hash_prefix, table in built:
+        (workdir,) = (launch_dir / "work").glob(f"{hash_prefix}*")
+        assert "PARQUET STAGING (reused:" in (workdir / ".command.err").read_text(), table
+
+
+def test_a_table_whose_output_is_gone_is_built_alone(launch_dir: pathlib.Path) -> None:
+    """Each table is cached on its own: when one task's result is missing (as
+    after its failure), -resume builds that table again and takes the other
+    five from the cache.  The release is re-assembled and validated."""
+    _run(launch_dir, "onetable")
+    with open(launch_dir / ".nextflow.log") as f:
+        first = f.read()
+    built = dict((t, h) for h, t in re.findall(r"\[(\w\w/\w+)\] Submitted process > BUILD_TABLE \((\w+)\)", first))
+    (xrefs_dir,) = (launch_dir / "work").glob(f"{built['xrefs']}*")
+    shutil.rmtree(xrefs_dir / "table_xrefs")
+    report = _run(launch_dir, "onetable")
+    assert "VERDICT: ALL CHECKS PASSED" in report
+    with open(launch_dir / ".nextflow.log") as f:
+        log = f.read()
+    assert re.findall(r"Submitted process > BUILD_TABLE \((\w+)\)", log) == ["xrefs"]
+    assert sorted(re.findall(r"Cached process > BUILD_TABLE \((\w+)\)", log)) == sorted(set(TABLES) - {"xrefs"})
+    assert "Submitted process > ASSEMBLE_LAKE (" in log
 
 
 def test_duckdb_pct_from_the_command_line(launch_dir: pathlib.Path) -> None:
@@ -191,7 +213,7 @@ def test_duckdb_pct_from_the_command_line(launch_dir: pathlib.Path) -> None:
     assert "DuckDB: memory_limit 2048MB, threads " in report               # 50% of 4 GB
     with open(launch_dir / ".nextflow.log") as f:
         log = f.read()
-    for process in ("SORT_JSONL", "PARQUET_TRANSFORM", "VALIDATE"):
+    for process in ("SORT_JSONL", "BUILD_TABLE", "VALIDATE"):
         workdir = re.findall(rf"submitted process {process}.*workDir: (\S+)", log)
         if workdir:            # not cached: its command must carry the 50% limit
             assert "--memory-limit 2048MB" in (pathlib.Path(workdir[-1]) / ".command.sh").read_text(), process
@@ -288,14 +310,14 @@ def test_changed_bin_module_reruns_validate(launch_dir: pathlib.Path, project_co
     finally:
         module.write_text(original)
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
-    # STREAM_JSONL, SORT_JSONL, INFER_SCHEMA, STAGE_PARQUET and PARQUET_TRANSFORM cached;
-    # VALIDATE and PROVENANCE run.
+    # Everything to the lake cached (each BUILD_TABLE task); VALIDATE and PROVENANCE run.
     # From .nextflow.log, not the console: which lines the console shows depends
     # on where Nextflow runs (under an AI agent it prints only a summary).
     with open(launch_dir / ".nextflow.log") as f:
         log = f.read()
-    for process in ("STREAM_JSONL", "SORT_JSONL", "INFER_SCHEMA", "STAGE_PARQUET", "PARQUET_TRANSFORM"):
+    for process in ("STREAM_JSONL", "SORT_JSONL", "INFER_SCHEMA", "STAGE_PARQUET", "ASSEMBLE_LAKE"):
         assert f"Cached process > {process} (" in log, process
+    assert sorted(re.findall(r"Cached process > BUILD_TABLE \((\w+)\)", log)) == sorted(TABLES)
     for process in ("VALIDATE", "PROVENANCE"):
         assert f"Submitted process > {process} (" in log, process
 
@@ -381,7 +403,8 @@ def test_prod_profile_on_stand_in_slurm(tmp_path: pathlib.Path) -> None:
         ("INFER_SCHEMA", "4", "24:00:00", "2560M", None),       # 16 GB, but at most --process_memory
         ("STAGE_PARQUET", "4", "24:00:00", "2560M", None),      # DuckDB out of memory: exit 75
         ("STAGE_PARQUET", "4", "30:00:00", "5120M", None),      # retry: twice memory; 48h capped at --max_time
-        ("PARQUET_TRANSFORM", "4", "30:00:00", "2560M", None),  # 48h capped at --max_time
+        *[("BUILD_TABLE", "4", "30:00:00", "2560M", None)] * 6,  # one per table; 48h capped at --max_time
+        ("ASSEMBLE_LAKE", "2", "24:00:00", "2560M", None),
         ("VALIDATE", "8", "24:00:00", "2560M", None),
         ("PROVENANCE", None, "24:00:00", "1024M", None),
     ], jobs

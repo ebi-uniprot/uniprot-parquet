@@ -34,7 +34,7 @@ micromamba activate uniprot-parquet
 export SCRATCH=/hps/nobackup/martin/uniprot/users/$USER
 export NXF_WORK=$SCRATCH/nf_work       # the same on every re-submit: -resume looks for its cache here
 wd() { grep "submitted process $1" .nextflow.log | tail -1 | sed 's/.*workDir: //' | grep . \
-       || nextflow log last -f process,workdir | awk -v p="$1" '$1 == p {d = $2} END {print d}'; }
+       || nextflow log last -f name,workdir | awk -F'\t' -v p="$1" '$1 == p || index($1, p " (") == 1 {d = $2} END {print d}'; }
 # The release to build (steps 6-10; step 7 checks them)
 DUMP=$SCRATCH/uniprotkb.json.gz        # the full UniProtKB JSON dump
 RELEASE=2026_03                        # the dump's UniProt release
@@ -103,7 +103,7 @@ one shell only:
 REQUIRE_NEXTFLOW=1 python -m pytest tests/ -q
 ```
 
-**Expect**: `418 passed, 1 xfailed`. The first run downloads a fixture from
+**Expect**: `422 passed, 1 xfailed`. The first run downloads a fixture from
 `rest.uniprot.org` before any test starts and says so ("Downloading the
 default test fixture…", one line per query, a few minutes). If a test fails
 with a zlib or gzip error, `gzip -t tests/fixtures/*.json.gz` names the damaged
@@ -134,7 +134,7 @@ directory: `-resume` continues the last one):
 ```bash
 ./run_lake.sh subset --input tests/fixtures/small.json.gz \
     --outdir $SCRATCH/uplake_smoke --duckdb-tmp $SCRATCH/duckdb_tmp
-grep -o "cachedCount=[0-9]*" .nextflow.log               # cachedCount=7
+grep -o "cachedCount=[0-9]*" .nextflow.log               # cachedCount=13
 ```
 
 **5b. Out-of-memory retry** (~5 minutes):
@@ -152,7 +152,7 @@ Execution is retried (1)`, then `RELEASE_COMPLETE written`.
 nextflow log last -f name,status,exit,memory,time
 ```
 
-exactly:
+exactly (the BUILD_TABLE lines in any order):
 
 ```
 STREAM_JSONL (stream)           COMPLETED  0   4 GB    4h
@@ -160,7 +160,13 @@ SORT_JSONL (sort_jsonl)         COMPLETED  0   2.5 GB  4h
 INFER_SCHEMA (infer_schema)     COMPLETED  0   2.5 GB  4h
 STAGE_PARQUET (stage)           FAILED     75  2.5 GB  4h
 STAGE_PARQUET (stage)           COMPLETED  0   5 GB    4h
-PARQUET_TRANSFORM (transform)   COMPLETED  0   2.5 GB  4h
+BUILD_TABLE (entries)           COMPLETED  0   2.5 GB  4h
+BUILD_TABLE (features)          COMPLETED  0   2.5 GB  4h
+BUILD_TABLE (xrefs)             COMPLETED  0   2.5 GB  4h
+BUILD_TABLE (comments)          COMPLETED  0   2.5 GB  4h
+BUILD_TABLE (publications)      COMPLETED  0   2.5 GB  4h
+BUILD_TABLE (accession_map)     COMPLETED  0   2.5 GB  4h
+ASSEMBLE_LAKE (assemble)        COMPLETED  0   2.5 GB  4h
 VALIDATE (validate)             COMPLETED  0   2.5 GB  4h
 PROVENANCE (provenance)         COMPLETED  0   1 GB    4h
 ```
@@ -291,8 +297,13 @@ WD=$(wd SORT_JSONL); grep -E "chunk\(s\)|run [0-9]+/|runs merged" $WD/.command.e
 WD=$(wd INFER_SCHEMA); tail -1 $WD/.command.log       # "N columns in …s -> schema.json"
 WD=$(wd STAGE_PARQUET); tail -1 $WD/.command.log      # "Staged in …s (… GB)"
 
-# PARQUET_TRANSFORM (6-12 h): one table after another
-WD=$(wd PARQUET_TRANSFORM); grep -E "^--- |rows in" $WD/.command.log | tail -4
+# BUILD_TABLE: six jobs side by side, one per table; the run waits for the slowest (xrefs)
+for t in entries features xrefs comments publications accession_map; do
+    echo "$t: $(tail -1 $(wd "BUILD_TABLE ($t)")/.command.log 2>/dev/null)"; done
+#   "N rows so far (…)" while writing, "N rows in M files (…s)" when done; silent while sorting
+
+# ASSEMBLE_LAKE: the manifest and checksums over the six tables
+WD=$(wd ASSEMBLE_LAKE); tail -3 $WD/.command.log
 
 # VALIDATE: [PASS] lines accumulate; any [FAIL] stops the run before the release is marked
 WD=$(wd VALIDATE); grep -c "\[PASS\]" $WD/.command.log; grep "\[FAIL\]" $WD/.command.log
