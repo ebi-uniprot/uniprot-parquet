@@ -140,9 +140,10 @@ def scaled_time(String base, attempt) {
 
 // DuckDB's memory_limit: params.duckdb_pct of the task's memory, in MB (whole
 // GB would truncate a small allocation to 0GB).  Evaluated per attempt, so
-// DuckDB's buffer pool doubles with the retry's memory.
+// DuckDB's buffer pool doubles with the retry's memory.  The percentage is
+// converted: given on the command line (--duckdb_pct 60) it is a string.
 def duckdb_mem(MemoryUnit memory) {
-    "${(memory.toBytes() * params.duckdb_pct / 100 / 1048576).longValue()}MB"
+    "${(memory.toBytes() * (params.duckdb_pct as BigDecimal) / 100 / 1048576).longValue()}MB"
 }
 
 // Shell lines giving a DuckDB process its spill directory under
@@ -478,6 +479,10 @@ workflow {
         error "Previous manifest not found: ${params.previous_manifest}"
     }
     // A flag given no value (an unset shell variable: --expected_count $N) arrives as true.
+    if (!(params.duckdb_pct.toString() ==~ /[0-9]+(\.[0-9]+)?/)
+            || !((params.duckdb_pct as BigDecimal) > 0 && (params.duckdb_pct as BigDecimal) <= 100)) {
+        error "--duckdb_pct must be DuckDB's share of a task's memory, a percentage above 0 and at most 100, not '${params.duckdb_pct}'"
+    }
     if (params.expected_count != null && !(params.expected_count.toString() ==~ /[1-9][0-9]*/)) {
         error "--expected_count must be the release's entry count, a positive whole number, not '${params.expected_count}'"
     }

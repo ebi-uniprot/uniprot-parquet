@@ -169,6 +169,28 @@ def test_validate_duckdb_is_sized_to_its_task(launch_dir: pathlib.Path) -> None:
         assert "DuckDB: memory_limit 3072MB, threads " in f.read()   # 75% of 4 GB, in MB
 
 
+def test_duckdb_pct_from_the_command_line(launch_dir: pathlib.Path) -> None:
+    """--duckdb_pct arrives as a string: every DuckDB process still gets that
+    share of its task's memory (it once failed: Long.multiply(String))."""
+    report = _run(launch_dir, "pct", "--duckdb_pct", "50")
+    assert "DuckDB: memory_limit 2048MB, threads " in report               # 50% of 4 GB
+    with open(launch_dir / ".nextflow.log") as f:
+        log = f.read()
+    for process in ("SORT_JSONL", "PARQUET_TRANSFORM", "VALIDATE"):
+        workdir = re.findall(rf"submitted process {process}.*workDir: (\S+)", log)
+        if workdir:            # not cached: its command must carry the 50% limit
+            assert "--memory-limit 2048MB" in (pathlib.Path(workdir[-1]) / ".command.sh").read_text(), process
+
+
+@pytest.mark.parametrize("pct", ["abc", "0", "150"])
+def test_duckdb_pct_must_be_a_percentage(launch_dir: pathlib.Path, pct: str) -> None:
+    marker = launch_dir / "out" / "prev" / "RELEASE_COMPLETE"
+    result = _launch(launch_dir, "prev", "--duckdb_pct", pct)
+    assert result.returncode != 0
+    assert "--duckdb_pct must be" in result.stdout + result.stderr
+    assert marker.exists()
+
+
 # ─── Release marker and the published copy ───────────────────────────
 
 
