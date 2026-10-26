@@ -128,6 +128,19 @@ def keyed_sql(table: str, columns: str, keys: Sequence[tuple[Any, ...]], order: 
     return f"SELECT {columns} FROM {table} WHERE {preds or 'false'}{order}"
 
 
+def grouped_sql(table: str, columns: str, keys: Sequence[tuple[Any, ...]]) -> str:
+    """Step 2 for a batch: one UNION ALL branch per (reviewed, organism_id),
+    each with an accession IN list.  DuckDB pushes a conjunction into the scan
+    whole, but from an OR of conjunctions only the accession part, which
+    prunes nothing for a batch."""
+    groups: dict[tuple[bool, int], list[str]] = {}
+    for reviewed, organism_id, accession in keys:
+        groups.setdefault((reviewed, organism_id), []).append(accession)
+    branches = [f"SELECT {columns} FROM {table} WHERE reviewed = {str(r).lower()} AND organism_id = {o} "
+                f"AND accession IN ({', '.join(q(a) for a in accs)})" for (r, o), accs in sorted(groups.items())]
+    return " UNION ALL ".join(branches) or f"SELECT {columns} FROM {table} WHERE false"
+
+
 # ── The queries ─────────────────────────────────────────────────────────────
 
 Run = Callable[["duckdb.DuckDBPyConnection", Params], "pa.Table"]
@@ -152,11 +165,11 @@ def sql(template: str) -> Run:
         **{k: q(v) if isinstance(v, str) else v for k, v in asdict(p).items()}))
 
 
-def two_step(table: str, columns: str, which: str = "accession", order: str = "") -> Run:
+def two_step(table: str, columns: str, which: str = "accession", order: str = "", grouped: bool = False) -> Run:
     def run(con: duckdb.DuckDBPyConnection, p: Params) -> pa.Table:
         value = getattr(p, which)
         keys = resolve(con, value if isinstance(value, list) else [value])
-        return fetch(con, keyed_sql(table, columns, keys, order))
+        return fetch(con, grouped_sql(table, columns, keys) if grouped else keyed_sql(table, columns, keys, order))
     return run
 
 
@@ -183,8 +196,10 @@ QUERIES: list[Query] = [
     Query("batch_single_step", "lookup", "A random batch of entries, WHERE accession IN (...)",
           lambda con, p: fetch(con, f"SELECT {HOT} FROM entries WHERE accession IN "
                                     f"({', '.join(q(a) for a in p.batch)})"), needs="batch"),
-    Query("batch_two_step", "lookup", "The same batch, two-step",
+    Query("batch_two_step", "lookup", "The same batch, two-step (one OR of the keys)",
           two_step("entries", HOT, "batch"), needs="batch"),
+    Query("batch_two_step_grouped", "lookup", "The same batch, two-step (a UNION ALL per organism)",
+          two_step("entries", HOT, "batch", grouped=True), needs="batch"),
     Query("isoforms", "lookup", "unnest_isoforms() macro",
           sql("SELECT * FROM unnest_isoforms({accession})")),
     # ── organism ──

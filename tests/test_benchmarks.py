@@ -65,7 +65,7 @@ def test_every_query_runs(small_lake: dict[str, str], tmp_path: Any) -> None:
     assert problems == {}
     assert all(r["runs"] == 2 and "warm_median_s" in r for r in rows.values())
     for single, two in (("entry_single_step", "entry_two_step"), ("features_single_step", "features_two_step"),
-                        ("batch_single_step", "batch_two_step")):
+                        ("batch_single_step", "batch_two_step"), ("batch_single_step", "batch_two_step_grouped")):
         assert rows[single]["rows"] == rows[two]["rows"] > 0, single
         assert rows[single]["result_bytes"] == rows[two]["result_bytes"], single
     assert len(results["meta"]["params"]["batch"]) == min(100, _manifest(small_lake["lake_dir"])

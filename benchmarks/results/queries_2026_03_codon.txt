@@ -1,0 +1,75 @@
+Choosing values from the lake ...
+{"organism": 9606, "accession": "P04637", "trembl_accession": "A0A023HJ61", "secondary_accession": "A0A017SEE6", "gene": "TP53", "pdb_id": "1A1U", "pubmed_id": "1303181", "keyword": "Kinase", "go_id": "GO:0005524", "ec": "2.7.11.1"}
+  lookup     entry_single_step            848.1 ms   685.3 ms            1
+  lookup     entry_two_step                73.9 ms    67.6 ms            1
+  lookup     protein_card                 636.9 ms   572.6 ms            1
+  lookup     features_single_step           1.29 s   393.9 ms        1,523
+  lookup     features_two_step             21.9 ms    19.4 ms        1,523
+  lookup     xrefs_two_step                25.5 ms    23.7 ms        1,120
+  lookup     trembl_entry_two_step        228.5 ms   229.5 ms            1
+  lookup     secondary_accession           28.4 ms    26.5 ms            2
+  lookup     batch_single_step             12.64 s    11.22 s          100
+  lookup     batch_two_step                12.36 s    12.75 s          100
+  lookup     isoforms                       2.46 s     1.69 s            9
+  organism   proteome                     313.0 ms   322.6 ms      210,706
+  organism   swissprot_sequences           59.0 ms    59.6 ms       20,431
+  organism   organism_features            253.5 ms   241.5 ms      125,404
+  organism   organism_xrefs               359.7 ms   362.7 ms      263,736
+  organism   organism_comments            160.1 ms   186.6 ms       65,472
+  organism   entries_with_features        416.5 ms   421.6 ms       24,026
+  organism   entries_with_xrefs           655.2 ms   615.0 ms      246,700
+  search     keyword_swissprot            112.0 ms   108.3 ms       21,273
+  search     go_term                        9.83 s     9.57 s    9,231,915
+  search     ec_number                      2.32 s     2.20 s    1,426,146
+  search     gene_name                    596.4 ms   511.5 ms          405
+  search     pdb_id_to_accession            7.82 s     5.70 s            1
+  search     pubmed_id                    505.6 ms   365.1 ms            1
+  aggregate  count_entries                616.6 ms   585.4 ms            1
+  aggregate  entries_by_division          374.9 ms   354.5 ms           21
+  aggregate  top_organisms_swissprot       18.2 ms    14.3 ms           20
+  aggregate  length_by_status               1.62 s     1.51 s            2
+  aggregate  feature_types_swissprot       24.0 ms    15.2 ms           36
+  aggregate  xref_databases                 3.91 s     3.67 s          173
+wrote /hps/nobackup/martin/uniprot/users/dlrice/uniprot-parquet-bench/benchmarks/results/queries_2026_03_codon_20261026_213736.json
+Query benchmark — 2026_03_codon
+
+Lake /hps/nobackup/martin/uniprot/users/dlrice/uniprot_parquet/2026_03/lake (release 2026_03), DuckDB 1.5.6, 8 threads, memory limit 24576MB, 3 runs, host hl-codon-cn-058.ebi.ac.uk
+
+Values: organism=9606, accession=P04637, trembl_accession=A0A023HJ61, secondary_accession=A0A017SEE6, gene=TP53, pdb_id=1A1U, pubmed_id=1303181, keyword=Kinase, go_id=GO:0005524, ec=2.7.11.1, batch of 100
+
+first: the first run; warm: the median of the others (fresh connection each run, OS cache warm).
+read: bytes read by the process during the first run (Linux rchar, page-cache hits included).
+
+group      query                           first       warm         rows      result        read
+------------------------------------------------------------------------------------------------
+lookup     entry_single_step            848.1 ms   685.3 ms            1   577 bytes   238.28 MB
+lookup     entry_two_step                73.9 ms    67.6 ms            1   577 bytes    25.02 MB
+lookup     protein_card                 636.9 ms   572.6 ms            1     2.39 KB   219.11 MB
+lookup     features_single_step           1.29 s   393.9 ms        1,523   123.93 KB   124.04 MB
+lookup     features_two_step             21.9 ms    19.4 ms        1,523   123.93 KB     2.37 MB
+lookup     xrefs_two_step                25.5 ms    23.7 ms        1,120    80.11 KB     2.34 MB
+lookup     trembl_entry_two_step        228.5 ms   229.5 ms            1   310 bytes    91.47 MB
+lookup     secondary_accession           28.4 ms    26.5 ms            2   260 bytes     2.69 MB
+lookup     batch_single_step             12.64 s    11.22 s          100    56.60 KB    33.77 GB
+lookup     batch_two_step                12.36 s    12.75 s          100    56.60 KB    33.88 GB
+lookup     isoforms                       2.46 s     1.69 s            9   773 bytes   659.26 MB
+organism   proteome                     313.0 ms   322.6 ms      210,706    20.86 MB    80.86 MB
+organism   swissprot_sequences           59.0 ms    59.6 ms       20,431    12.19 MB    24.14 MB
+organism   organism_features            253.5 ms   241.5 ms      125,404    27.47 MB    50.72 MB
+organism   organism_xrefs               359.7 ms   362.7 ms      263,736    21.90 MB    83.58 MB
+organism   organism_comments            160.1 ms   186.6 ms       65,472    27.31 MB    75.57 MB
+organism   entries_with_features        416.5 ms   421.6 ms       24,026     5.29 MB   129.42 MB
+organism   entries_with_xrefs           655.2 ms   615.0 ms      246,700    41.26 MB   172.60 MB
+search     keyword_swissprot            112.0 ms   108.3 ms       21,273     2.12 MB     8.68 MB
+search     go_term                        9.83 s     9.57 s    9,231,915   192.53 MB   956.06 MB
+search     ec_number                      2.32 s     2.20 s    1,426,146    72.45 MB  1013.86 MB
+search     gene_name                    596.4 ms   511.5 ms          405    16.52 KB   219.91 MB
+search     pdb_id_to_accession            7.82 s     5.70 s            1    22 bytes     6.80 GB
+search     pubmed_id                    505.6 ms   365.1 ms            1    20 bytes    82.84 MB
+aggregate  count_entries                616.6 ms   585.4 ms            1     9 bytes    74.74 MB
+aggregate  entries_by_division          374.9 ms   354.5 ms           21   428 bytes    75.96 MB
+aggregate  top_organisms_swissprot       18.2 ms    14.3 ms           20   922 bytes   319.46 KB
+aggregate  length_by_status               1.62 s     1.51 s            2    62 bytes   281.53 MB
+aggregate  feature_types_swissprot       24.0 ms    15.2 ms           36   877 bytes     2.12 MB
+aggregate  xref_databases                 3.91 s     3.67 s          173     3.31 KB   790.30 MB
+
