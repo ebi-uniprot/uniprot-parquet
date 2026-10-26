@@ -48,3 +48,25 @@ def test_extrapolated_file_count_follows_the_target(small_lake: dict[str, str]) 
     partitions = {os.path.dirname(f) for f in files}
     assert total * scale / target <= n <= total * scale / target + len(partitions)
     assert extrapolate_files(files, target * 4, full_rows=rows * scale) < n
+
+
+def test_every_query_runs(small_lake: dict[str, str], tmp_path: Any) -> None:
+    """Every query in bench_queries.py runs on the fixture lake (which has no
+    human entry, so the values are chosen from the lake), and the two-step
+    lookups return what their single-step forms return."""
+    from bench_queries import QUERIES, main
+    main(["--lake", small_lake["lake_dir"], "--label", "test", "--out", str(tmp_path), "--runs", "2"])
+    with open(tmp_path / "queries_test_latest.json") as f:
+        results = json.load(f)
+    rows = {r["name"]: r for r in results["queries"]}
+    assert set(rows) == {qy.name for qy in QUERIES}
+    problems = {n: r.get("error") or r.get("timeout") or r.get("skipped")
+                for n, r in rows.items() if "first_s" not in r}
+    assert problems == {}
+    assert all(r["runs"] == 2 and "warm_median_s" in r for r in rows.values())
+    for single, two in (("entry_single_step", "entry_two_step"), ("features_single_step", "features_two_step"),
+                        ("batch_single_step", "batch_two_step")):
+        assert rows[single]["rows"] == rows[two]["rows"] > 0, single
+        assert rows[single]["result_bytes"] == rows[two]["result_bytes"], single
+    assert len(results["meta"]["params"]["batch"]) == min(100, _manifest(small_lake["lake_dir"])
+                                                          ["tables"]["entries"]["row_count"])
