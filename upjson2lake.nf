@@ -45,7 +45,7 @@ params.expected_count = null      // Expected entry count (from UniProt release 
 params.previous_manifest = null   // Previous release's lake/manifest.json: schema diff in the validation report
 params.max_time       = '72h'     // Wall-time cap of a retried heavy process: at most the SLURM queue's limit
 params.queue          = null      // SLURM partition (prod: the cluster's default; short: short). Read by nextflow.config
-params.table_forks    = 6         // BUILD_TABLE tasks at a time (one per table; each takes the heavy processes' memory)
+params.table_forks    = 6         // BUILD_TABLE tasks at a time (one per table; 32 GB each, accession_map --process_memory)
 
 // Final output directory: <outdir>/<release>/.  Process directives cannot
 // call script functions, so every publishDir spells the same path out.
@@ -369,11 +369,14 @@ process STAGE_PARQUET {
 // order without a sort (the transform checks every batch's order, and
 // VALIDATE every table's); accession_map, ordered by accession, is sorted.
 // Each task spills into a directory of its own (spill_setup with the table's
-// name).
+// name).  Memory: 32 GB (at most --process_memory), doubled on a retry; 2026_03's
+// tables peaked at 2.7-22 GB (entries the most).  accession_map, the one table
+// sorted, gets --process_memory (its peak: 53 GB of 96).
 process BUILD_TABLE {
     tag "${table}"
     cpus 4
-    memory { scaled_memory(task.attempt) }
+    memory { table == 'accession_map' ? scaled_memory(task.attempt)
+                                      : [32.GB * task.attempt, scaled_memory(task.attempt)].min() }
     errorStrategy { oom_retry(task.exitStatus) }
     maxRetries 1
     maxForks params.table_forks

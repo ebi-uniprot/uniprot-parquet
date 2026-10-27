@@ -256,8 +256,8 @@ restore `PATH`) before running anything else, or its jobs go to the stand-in SLU
 for f in $FAKE_SLURM_DIR/*.sbatch; do echo "$(grep -o 'nf-[A-Z_]*' $f) $(grep -oE -- '(-c|-t|--mem|-p) \S+' $f | tr '\n' ' ')"; done | uniq -c
 #   smoke: -t 04:00:00 -p short, --mem 16384M for SORT/INFER/STAGE/BUILD_TABLE (x6)/ASSEMBLE/VALIDATE
 #   oom:   STAGE_PARQUET twice: --mem 2560M, then 5120M (the other DuckDB processes fit in 2560M)
-#   full:  the 8a table (no -p; INFER_SCHEMA and ASSEMBLE_LAKE --mem 16384M; BUILD_TABLE x6 -c 4 -t 48:00:00
-#          --mem 98304M; VALIDATE -c 8)
+#   full:  the 8a table (no -p; INFER_SCHEMA and ASSEMBLE_LAKE --mem 16384M; BUILD_TABLE x6 -c 4 -t 48:00:00,
+#          five --mem 32768M and accession_map's 98304M, in any order; VALIDATE -c 8)
 ```
 
 This proves the profiles, the headers, the retry scaling, `run_lake.sh` and
@@ -457,10 +457,11 @@ echo $NXF_WORK                            # set (stage 6), on that scratch files
 #      SORT_JSONL         4 CPUs  96 -> 192 GB   24h -> 48h
 #      INFER_SCHEMA       4 CPUs  16 ->  32 GB   24h -> 48h
 #      STAGE_PARQUET      4 CPUs  96 -> 192 GB   24h -> 48h
-#      BUILD_TABLE (x6)   4 CPUs  96 -> 192 GB   48h -> 72h  (capped at --max_time; each table on its own)
+#      BUILD_TABLE (x5)   4 CPUs  32 ->  64 GB   48h -> 72h  (capped at --max_time; each table on its own)
+#      BUILD_TABLE (accession_map)  96 -> 192 GB   48h -> 72h  (the one table sorted)
 #      ASSEMBLE_LAKE      2 CPUs  16 ->  32 GB   24h -> 48h
 #      VALIDATE           8 CPUs  96 -> 192 GB   24h -> 48h
-#    (transform headers: -c 4 -t 48:00:00 --mem 98304M, no -p: the cluster's default
+#    (table headers: -c 4 -t 48:00:00 --mem 32768M, accession_map's --mem 98304M, no -p: the cluster's default
 #    partition, or run_lake.sh --queue <partition>). If that partition's MaxWall is under
 #    72h, pass --max-time <limit> to run_lake.sh, or SLURM rejects the retry.
 sinfo -o "%P %l %m %c"                    # the default partition is marked *
@@ -509,7 +510,7 @@ grep -E "chunks of|chunk\(s\)|run [0-9]+/|runs merged" $WD/.command.err | tail -
 du -sh $SCRATCH/duckdb_tmp         # the chunks and runs: ~1.5x the compressed JSONL at most
 ls -l $SCRATCH/uniprot_parquet/2026_03/sorted.jsonl.zst   # published when done
 
-# INFER_SCHEMA (~1.5 h): one line at the end, "N columns in …s -> schema.json"
+# INFER_SCHEMA (~1 h 40 min): one line at the end, "N columns in …s -> schema.json"
 tail -2 $WD/.command.log
 
 # STAGE_PARQUET (~35 min): "Staged in …s (… GB)" at the end; the file (~80 GB) stays in

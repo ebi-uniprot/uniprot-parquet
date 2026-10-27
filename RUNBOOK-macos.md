@@ -224,7 +224,9 @@ nextflow run upjson2lake.nf -profile short --inputfile $R/oom.json.gz --outdir $
 for f in $FAKE_SLURM_DIR/*.sbatch; do echo "$(grep -o 'nf-[A-Z_]*' $f) $(grep -oE -- '(-c|-t|--mem|-p) \S+' $f | tr '\n' ' ')"; done | uniq -c
 ```
 
-These 25 lines, exactly (the first number counts identical jobs in a row):
+These lines, exactly (the first number counts identical jobs in a row), except
+the last run's BUILD_TABLE jobs: five ask for 32768M and accession_map's for
+98304M, in submission order, so `uniq -c` may group them differently:
 
 ```
       1 nf-STREAM_JSONL_ -c 4 -t 04:00:00 --mem 4096M -p short
@@ -248,7 +250,8 @@ These 25 lines, exactly (the first number counts identical jobs in a row):
       1 nf-SORT_JSONL_ -c 4 -t 24:00:00 --mem 98304M
       1 nf-INFER_SCHEMA_ -c 4 -t 24:00:00 --mem 16384M
       1 nf-STAGE_PARQUET_ -c 4 -t 24:00:00 --mem 98304M
-      6 nf-BUILD_TABLE_ -c 4 -t 48:00:00 --mem 98304M
+      5 nf-BUILD_TABLE_ -c 4 -t 48:00:00 --mem 32768M
+      1 nf-BUILD_TABLE_ -c 4 -t 48:00:00 --mem 98304M
       1 nf-ASSEMBLE_LAKE_ -c 2 -t 24:00:00 --mem 16384M
       1 nf-VALIDATE_ -c 8 -t 24:00:00 --mem 98304M
       1 nf-PROVENANCE_ -t 24:00:00 --mem 1024M

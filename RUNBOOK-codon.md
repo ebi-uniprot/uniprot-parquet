@@ -215,8 +215,8 @@ grep -E "^== |Elapsed \(wall clock\)|Maximum resident|VERDICT|slice_2m_lake" $SC
 - **Expect**: `VERDICT: ALL CHECKS PASSED`; for the sort and the transform, a
   peak RSS (`Maximum resident set size`, in kB) well under 12 GB.
 - **Full-run estimate**: wall time ×75 (rough: memory does not grow with the
-  input, time roughly does) against the README budgets (2026_03: sort 1 h; the
-  old single transform 13 h); the lake's size ×75 against your space on `$SCRATCH`.
+  input, time roughly does) against the README budgets (2026_03: sort 1 h; schema to
+  assembled lake 5 h 13 min); the lake's size ×75 against your space on `$SCRATCH`.
 - If the transform's estimate is over 48 h, raise the retry's time cap before
   step 8 (`--max-time`, default 72 h; `standard` allows 7 days).
 
@@ -293,11 +293,11 @@ WD=$(wd STREAM_JSONL); tail -2 $WD/.command.log; cat $WD/entry_count.txt
 # SORT_JSONL (~1 h): "N chunk(s)", then "run i/N sorted", then "N runs merged"
 WD=$(wd SORT_JSONL); grep -E "chunk\(s\)|run [0-9]+/|runs merged" $WD/.command.err | tail -3
 
-# INFER_SCHEMA (~1.5 h), then STAGE_PARQUET (~35 min): a line each when done
+# INFER_SCHEMA (~1 h 40 min), then STAGE_PARQUET (~35 min): a line each when done
 WD=$(wd INFER_SCHEMA); tail -1 $WD/.command.log       # "N columns in …s -> schema.json"
 WD=$(wd STAGE_PARQUET); tail -1 $WD/.command.log      # "Staged in …s (… GB)"
 
-# BUILD_TABLE: six jobs side by side, one per table; the run waits for the slowest (xrefs)
+# BUILD_TABLE: six jobs side by side, one per table; the run waits for the slowest (entries, ~3 h)
 for t in entries features xrefs comments publications accession_map; do
     echo "$t: $(tail -1 $(wd "BUILD_TABLE ($t)")/.command.log 2>/dev/null)"; done
 #   "N rows so far (…)" while writing, "N rows in M files (…s)" when done (no sort but accession_map's)

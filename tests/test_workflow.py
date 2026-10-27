@@ -414,3 +414,30 @@ def test_prod_profile_on_stand_in_slurm(tmp_path: pathlib.Path) -> None:
     log = (launch / ".nextflow.log").read_text()
     workdir = re.findall(r"submitted process VALIDATE.*workDir: (\S+)", log)[-1]
     assert "SLURM Job ID: " in (pathlib.Path(workdir) / ".command.log").read_text()
+
+
+def test_build_table_memory_requests(tmp_path: pathlib.Path) -> None:
+    """BUILD_TABLE asks for 32 GB per table (2026_03's peaked at 2.7-22 GB),
+    except accession_map, the one table sorted, which gets --process_memory."""
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    (launch / "no_reports.config").write_text(
+        "trace.enabled = false\nreport.enabled = false\n"
+        "timeline.enabled = false\ndag.enabled = false\n")
+    state = tmp_path / "slurm"
+    fake = os.path.join(PROJECT_ROOT, "tests", "fake_slurm")
+    env = {**_environ(), "FAKE_SLURM_DIR": str(state), "NXF_OFFLINE": "true",
+           "PATH": os.pathsep.join([fake, os.path.dirname(sys.executable), os.environ["PATH"]])}
+    result = subprocess.run(
+        ["nextflow", "run", WORKFLOW, "-c", "no_reports.config", "-profile", "prod", "-ansi-log", "false",
+         "--inputfile", SMALL_JSON_GZ, "--outdir", "out", "--release", "slurm",
+         "--process_memory", "40 GB", "--expected_count", "52"],
+        cwd=launch, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
+    memory = {}
+    for job in state.glob("*.sbatch"):
+        text = job.read_text()
+        name = _group(r"#SBATCH -J (\S+)", text)
+        if name.startswith("nf-BUILD_TABLE"):
+            memory[next(t for t in TABLES if t in name)] = _group(r"#SBATCH --mem (\S+)", text)
+    assert memory == {**dict.fromkeys(TABLES, "32768M"), "accession_map": "40960M"}, memory
