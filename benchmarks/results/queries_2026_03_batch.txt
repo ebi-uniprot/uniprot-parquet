@@ -1,0 +1,21 @@
+Choosing values from the lake ...
+{"organism": 9606, "accession": "P04637", "trembl_accession": "A0A023HJ61", "secondary_accession": "A0A017SEE6", "gene": "TP53", "pdb_id": "1A1U", "pubmed_id": "1303181", "keyword": "Kinase", "go_id": "GO:0005524", "ec": "2.7.11.1"}
+  lookup     batch_single_step             11.75 s    10.63 s          100
+  lookup     batch_two_step                11.34 s    11.40 s          100
+  lookup     batch_two_step_grouped        23.57 s    24.04 s          100
+wrote /hps/nobackup/martin/uniprot/users/dlrice/uniprot-parquet-bench/benchmarks/results/queries_2026_03_batch_20261026_222614.json
+Query benchmark — 2026_03_batch
+
+Lake /hps/nobackup/martin/uniprot/users/dlrice/uniprot_parquet/2026_03/lake (release 2026_03), DuckDB 1.5.6, 8 threads, memory limit 24576MB, 3 runs, host hl-codon-cn-064.ebi.ac.uk
+
+Values: organism=9606, accession=P04637, trembl_accession=A0A023HJ61, secondary_accession=A0A017SEE6, gene=TP53, pdb_id=1A1U, pubmed_id=1303181, keyword=Kinase, go_id=GO:0005524, ec=2.7.11.1, batch of 100
+
+first: the first run; warm: the median of the others (fresh connection each run, OS cache warm).
+read: bytes read by the process during the first run (Linux rchar, page-cache hits included).
+
+group      query                           first       warm         rows      result        read
+------------------------------------------------------------------------------------------------
+lookup     batch_single_step             11.75 s    10.63 s          100    56.60 KB    33.77 GB
+lookup     batch_two_step                11.34 s    11.40 s          100    56.60 KB    33.88 GB
+lookup     batch_two_step_grouped        23.57 s    24.04 s          100    56.60 KB     1.46 GB
+

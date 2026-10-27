@@ -45,6 +45,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -69,6 +70,7 @@ def q(s: object) -> str:
 @dataclass
 class Params:
     """The values the queries ask about: defaults, checked against the lake."""
+    lake: str = ""
     organism: int = 9606
     accession: str = "P04637"
     trembl_accession: str | None = None
@@ -109,6 +111,7 @@ def discover(con: duckdb.DuckDBPyConnection, p: Params, batch_size: int, seed: i
     p.gene, p.pubmed_id = row[0] if row else (None, None)
     row = con.sql(f"SELECT min(id) FROM xrefs WHERE accession = {q(p.accession)} AND database = 'PDB'").fetchall()
     p.pdb_id = row[0][0]
+    organism_ranges(p.lake, "entries")      # read now, not inside a timed run
     return p
 
 
@@ -128,17 +131,39 @@ def keyed_sql(table: str, columns: str, keys: Sequence[tuple[Any, ...]], order: 
     return f"SELECT {columns} FROM {table} WHERE {preds or 'false'}{order}"
 
 
-def grouped_sql(table: str, columns: str, keys: Sequence[tuple[Any, ...]]) -> str:
+def grouped_sql(table: str, columns: str, keys: Sequence[tuple[Any, ...]],
+                source: Callable[[bool, int], str] | None = None) -> str:
     """Step 2 for a batch: one UNION ALL branch per (reviewed, organism_id),
     each with an accession IN list.  DuckDB pushes a conjunction into the scan
     whole, but from an OR of conjunctions only the accession part, which
-    prunes nothing for a batch."""
+    prunes nothing for a batch.  `source(reviewed, organism_id)` is a branch's
+    FROM (default: the table's view)."""
     groups: dict[tuple[bool, int], list[str]] = {}
     for reviewed, organism_id, accession in keys:
         groups.setdefault((reviewed, organism_id), []).append(accession)
-    branches = [f"SELECT {columns} FROM {table} WHERE reviewed = {str(r).lower()} AND organism_id = {o} "
+    branches = [f"SELECT {columns} FROM {source(r, o) if source else table} "
+                f"WHERE reviewed = {str(r).lower()} AND organism_id = {o} "
                 f"AND accession IN ({', '.join(q(a) for a in accs)})" for (r, o), accs in sorted(groups.items())]
     return " UNION ALL ".join(branches) or f"SELECT {columns} FROM {table} WHERE false"
+
+
+@cache
+def organism_ranges(lake: str, table: str) -> tuple[tuple[str, bool, int, int], ...]:
+    """(relative path, reviewed, organism_id min, max) of the table's files, from manifest.json."""
+    from uniprot_parquet import manifest
+    details = manifest(lake)["tables"][table]["file_details"]
+    return tuple((rel, rel.startswith("review_status=swissprot/"), d["organism_id_min"], d["organism_id_max"])
+                 for rel, d in details.items() if d.get("organism_id_min") is not None)
+
+
+def files_source(lake: str, table: str) -> Callable[[bool, int], str]:
+    """A branch's FROM: only the files whose organism_id range holds the
+    organism, as the manifest records them (files_for_organism_id's rule)."""
+    def source(reviewed: bool, organism_id: int) -> str:
+        files = [f"{lake.rstrip('/')}/{table}/{rel}" for rel, rv, lo, hi in organism_ranges(lake, table)
+                 if rv == reviewed and lo <= organism_id <= hi]
+        return f"read_parquet([{', '.join(q(f) for f in files)}], hive_partitioning = false)"
+    return source
 
 
 # ── The queries ─────────────────────────────────────────────────────────────
@@ -165,11 +190,17 @@ def sql(template: str) -> Run:
         **{k: q(v) if isinstance(v, str) else v for k, v in asdict(p).items()}))
 
 
-def two_step(table: str, columns: str, which: str = "accession", order: str = "", grouped: bool = False) -> Run:
+def two_step(table: str, columns: str, which: str = "accession", order: str = "", grouped: bool = False,
+             metadata_cache: bool = False, manifest_files: bool = False) -> Run:
     def run(con: duckdb.DuckDBPyConnection, p: Params) -> pa.Table:
+        if metadata_cache:
+            con.sql("SET parquet_metadata_cache = true")
         value = getattr(p, which)
         keys = resolve(con, value if isinstance(value, list) else [value])
-        return fetch(con, grouped_sql(table, columns, keys) if grouped else keyed_sql(table, columns, keys, order))
+        if grouped:
+            return fetch(con, grouped_sql(table, columns, keys,
+                                          files_source(p.lake, table) if manifest_files else None))
+        return fetch(con, keyed_sql(table, columns, keys, order))
     return run
 
 
@@ -200,6 +231,11 @@ QUERIES: list[Query] = [
           two_step("entries", HOT, "batch"), needs="batch"),
     Query("batch_two_step_grouped", "lookup", "The same batch, two-step (a UNION ALL per organism)",
           two_step("entries", HOT, "batch", grouped=True), needs="batch"),
+    Query("batch_two_step_grouped_cached", "lookup",
+          "The same, each file's footer parsed once (parquet_metadata_cache)",
+          two_step("entries", HOT, "batch", grouped=True, metadata_cache=True), needs="batch"),
+    Query("batch_two_step_files", "lookup", "The same, each branch reading only its organism's files (manifest)",
+          two_step("entries", HOT, "batch", grouped=True, manifest_files=True), needs="batch"),
     Query("isoforms", "lookup", "unnest_isoforms() macro",
           sql("SELECT * FROM unnest_isoforms({accession})")),
     # ── organism ──
@@ -328,18 +364,18 @@ def report(meta: dict[str, Any], rows: Sequence[dict[str, Any]]) -> str:
              f"Lake {meta['lake']} (release {meta['release']}), DuckDB {meta['duckdb']}, "
              f"{meta['threads']} threads, memory limit {meta['memory_limit'] or 'DuckDB default'}, "
              f"{meta['runs']} runs, host {meta['host']}", "",
-             "Values: " + ", ".join(f"{k}={v}" for k, v in meta["params"].items() if k != "batch")
+             "Values: " + ", ".join(f"{k}={v}" for k, v in meta["params"].items() if k not in ("batch", "lake"))
              + f", batch of {len(meta['params']['batch'])}", "",
              "first: the first run; warm: the median of the others (fresh connection each run, OS cache warm).",
              "read: bytes read by the process during the first run (Linux rchar, page-cache hits included).", ""]
-    header = f"{'group':<10} {'query':<26} {'first':>10} {'warm':>10} {'rows':>12} {'result':>11} {'read':>11}"
+    header = f"{'group':<10} {'query':<30} {'first':>10} {'warm':>10} {'rows':>12} {'result':>11} {'read':>11}"
     lines += [header, "-" * len(header)]
     for r in rows:
         status = r.get("skipped") or r.get("timeout") or r.get("error")
         if status:
-            lines.append(f"{r['group']:<10} {r['name']:<26} {status}")
+            lines.append(f"{r['group']:<10} {r['name']:<30} {status}")
             continue
-        lines.append(f"{r['group']:<10} {r['name']:<26} {secs(r['first_s']):>10} {secs(r.get('warm_median_s')):>10} "
+        lines.append(f"{r['group']:<10} {r['name']:<30} {secs(r['first_s']):>10} {secs(r.get('warm_median_s')):>10} "
                      f"{r['rows']:>12,} {human_size(r['result_bytes']):>11} "
                      f"{human_size(r['read_bytes']) if 'read_bytes' in r else '':>11}")
     return "\n".join(lines) + "\n"
@@ -400,7 +436,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     queries = select(args.query, args.group)
     if args.list:
         for qy in queries:
-            print(f"{qy.group:<10} {qy.name:<26} {qy.description}")
+            print(f"{qy.group:<10} {qy.name:<30} {qy.description}")
         return
     if not args.lake:
         ap.error("--lake is required")
@@ -417,7 +453,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     eprint("Choosing values from the lake ...")
     con = open_con()
-    p = discover(con, Params(organism=args.organism, accession=args.accession, keyword=args.keyword,
+    p = discover(con, Params(lake=args.lake, organism=args.organism, accession=args.accession, keyword=args.keyword,
                              go_id=args.go_id, ec=args.ec), args.batch_size, args.seed)
     con.close()
     meta: dict[str, Any] = {
@@ -426,14 +462,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         "runs": args.runs, "timeout_s": args.timeout, "host": platform.node(), "cpus": os.cpu_count(),
         "python": platform.python_version(), "commit": git_commit(),
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "params": asdict(p)}
-    eprint(json.dumps({k: v for k, v in asdict(p).items() if k != "batch"}))
+    eprint(json.dumps({k: v for k, v in asdict(p).items() if k not in ("batch", "lake")}))
 
     rows: list[dict[str, Any]] = []
     for qy in queries:
         row = bench(open_con, qy, p, args.runs, args.timeout)
         rows.append(row)
         status = row.get("skipped") or row.get("timeout") or row.get("error")
-        eprint(f"  {qy.group:<10} {qy.name:<26} "
+        eprint(f"  {qy.group:<10} {qy.name:<30} "
                + (status or f"{secs(row['first_s']):>10} {secs(row.get('warm_median_s')):>10} {row['rows']:>12,}"))
     text = report(meta, rows)
     print(text)
