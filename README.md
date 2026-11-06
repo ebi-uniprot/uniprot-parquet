@@ -111,7 +111,7 @@ Shortcut columns first, then the **source** columns (the JSON element's top-leve
 from uniprot_parquet import connect
 
 con = connect("/data/uniprot/2026_03/lake")                          # local
-con = connect("https://<host>/<release>/lake")                       # remote (auto-installs httpfs; s3:// works too)
+con = connect("hf://datasets/uniprot/uniprotkb-parquet@2026_03/2026_03/lake")   # remote (auto-installs httpfs; https:// and s3:// work too)
 
 con.sql("SELECT accession, gene_primary, protein_name_primary FROM entries WHERE organism_id = 9606 LIMIT 5").show()
 con.sql("SELECT * FROM protein_card('P04637')").show()
@@ -133,7 +133,7 @@ with open('setup_views.sql') as f:
     con.sql(f.read().replace('${BASE}', base))
 ```
 
-Its views are globs, so it needs all six tables and a listable file system (local or `s3://`, not HTTP(S)). For a partial or HTTP(S) lake, use `connect()`.
+Its views are globs, so it needs all six tables and a listable file system (local, `s3://` or `hf://`, not HTTP(S)). For a partial or HTTP(S) lake, use `connect()`.
 
 ### Helper macros
 
@@ -258,29 +258,30 @@ zstd -dc sorted.jsonl.zst | head -10 | jq '.primaryAccession, .organism.scientif
 
 ## Download
 
-Hosting and sizes are not settled yet (see [Open decisions](#open-decisions-and-pending-work)); `<host>` and `<release>` are placeholders.
+The beta is on Hugging Face as [`uniprot/uniprotkb-parquet`](https://huggingface.co/datasets/uniprot/uniprotkb-parquet); its schema may change between releases (see [Schema versioning](#schema-versioning)). Each release is a directory of the repo (`2026_03/`, laid out as [below](#what-a-release-contains)) and a git tag of the same name: pin the tag. `sorted.jsonl.zst` is not on the Hub (at ~100 GB it is over the per-file limit). The canonical download host is not settled yet (see [Open decisions](#open-decisions-and-pending-work)).
 
-Tiers: the **`entries` tier**, the recommended start (`entries/` + `accession_map/` + metadata files: accession, organism, gene, names, sequence, GO, keywords, PubMed ids, proteomes); **Swiss-Prot only** (`review_status=swissprot/` of every table); the **full lake**; and **`sorted.jsonl.zst`** (the same data as JSON lines).
+Tiers: the **`entries` tier**, the recommended start (`entries/` + `accession_map/` + metadata files: accession, organism, gene, names, sequence, GO, keywords, PubMed ids, proteomes); **Swiss-Prot only** (`review_status=swissprot/` of every table); and the **full lake**.
 
 ```bash
+pip install -U huggingface_hub     # the hf CLI
+R=2026_03
+META=(--include "$R/lake/*.json" --include "$R/lake/SHA256SUMS.txt" --include "$R/lake/RELEASE.metalink" --include "$R/lake/LICENSE")
 # entries tier
-rsync -av --include='entries/***' --include='accession_map/***' --include='*.json' \
-      --include='SHA256SUMS.txt' --include='RELEASE.metalink' --include='LICENSE' --exclude='*' \
-      rsync://<host>/<release>/lake/ ./lake/
-grep -E '  (entries|accession_map)/' lake/SHA256SUMS.txt | (cd lake && sha256sum -c --quiet)
+hf download uniprot/uniprotkb-parquet --repo-type dataset --revision $R --local-dir . \
+    --include "$R/lake/entries/*" --include "$R/lake/accession_map/*" "${META[@]}"
+grep -E '  (entries|accession_map)/' $R/lake/SHA256SUMS.txt | (cd $R/lake && sha256sum -c --quiet)
 # Swiss-Prot only, all tables
-rsync -avm --include='*/' --include='review_status=swissprot/***' --include='*.json' \
-      --include='SHA256SUMS.txt' --include='RELEASE.metalink' --include='LICENSE' --exclude='*' \
-      rsync://<host>/<release>/lake/ ./lake/
-# full lake
-rsync -av rsync://<host>/<release>/lake/ ./lake/
+hf download uniprot/uniprotkb-parquet --repo-type dataset --revision $R --local-dir . \
+    --include "$R/lake/*/review_status=swissprot/*" "${META[@]}"
+# full release: lake/, SCHEMA.md, the validation report, provenance.json
+hf download uniprot/uniprotkb-parquet --repo-type dataset --revision $R --local-dir . --include "$R/*"
 ```
 
+- Each `--include` takes one pattern; `*` also matches `/`.
 - Mirrors should check for `RELEASE_COMPLETE` next to `lake/` first: it means the release is complete.
 - **Check a downloaded `lake/`:** `(cd lake && sha256sum -c --quiet SHA256SUMS.txt)`, or the `grep` form above for a tier (`'review_status=swissprot/'` for Swiss-Prot only).
-- **Check a full mirror of the release directory** (`lake/` plus `provenance.json` and the files beside it): `python bin/verify_release.py <release-dir> --full` checks every file is listed and matches its SHA-256 in `SHA256SUMS.txt` or `provenance.json`, with no stray Parquet file. It fails on `lake/` alone or a tier.
-- **Over HTTP(S):** `aria2c -M RELEASE.metalink --metalink-base-uri=https://<host>/<release>/lake/` checks every file's size and checksums (the `<url>` entries are relative to the lake directory; curl dropped Metalink support in 7.78).
-- **Without downloading:** `connect("https://<host>/<release>/lake")` reads only the byte ranges a query needs; use the two-step accession lookup for point queries.
+- **Check a full mirror of the release directory** (`lake/` plus `provenance.json` and the files beside it): `python bin/verify_release.py <release-dir> --full` checks every file is listed and matches its SHA-256 in `SHA256SUMS.txt` or `provenance.json`, with no stray Parquet file. It fails on `lake/` alone or a tier, and on a copy from the Hub, which has no `sorted.jsonl.zst`.
+- **Without downloading:** `connect("hf://datasets/uniprot/uniprotkb-parquet@2026_03/2026_03/lake")` reads only the byte ranges a query needs (`@2026_03` pins the tag; the path after it is the release directory); use the two-step accession lookup for point queries.
 
 ---
 
@@ -471,7 +472,7 @@ The suites cover the tables, sort order and array positions, manifests, checksum
 **Decisions to take.**
 
 - **Retention.** UniProt's FTP keeps at least two years of releases and each `YYYY_01` indefinitely. Options: the latest release only (the FTP archives the source data), or latest + previous + each `YYYY_01`.
-- **Hosting.** The canonical download host is undecided. A cloud copy could sit next to UniProt's AWS Open Data bucket (`s3://aws-open-data-uniprot-rdf`, RDF only today).
+- **Hosting.** The beta is on Hugging Face (`uniprot/uniprotkb-parquet`); the canonical download host is undecided. A cloud copy could sit next to UniProt's AWS Open Data bucket (`s3://aws-open-data-uniprot-rdf`, RDF only today).
 - **Publishing step.** Atomic swap of `latest` / `previous`, a `releases.json` index, and `RELEASE_COMPLETE` written after the swap.
 - **The sorted JSONL.** `SORT_JSONL` costs about an hour per release (2026_03: 89 chunks, 150,006,383 lines in 3,600 s) and publishes a 100 GB `sorted.jsonl.zst`. Its benefit to the pipeline is unmeasured: every table is sorted again on its full key, so the lake does not depend on the input's order, and the validator samples rather than relying on it. For readers, Swiss-Prot is a prefix of the file (its first 575,748 lines in 2026_03), but an organism's block cannot be reached without decompressing everything before it. Options: keep it as is (the current choice, while the format is in beta); measure the transform from sorted and from dump-order input and drop the sort if the lake is byte-identical and no slower; or publish the JSONL split to match the lake (`swissprot`/`trembl`, or ~1 GB pieces by taxon range with an index).
 - **DuckDB's share of a task's memory (`--duckdb_pct`, default 75).** DuckDB overshot its own cap while sorting whole tables: 1.27x when 2026_03's first transform crashed (96 GB, DuckDB at 75%; a segfault at 91% of the job's memory), 1.51x in its second attempt (192 GB at 60%, peak 165.6 GiB, during xrefs); the slice (2M entries) showed at most 1.43x. With the tables streamed (`--presorted`), 2026_03's second build at 75% stayed far below every cap: peaks of 30 GB (`STAGE_PARQUET`, 96 GB), 53 GB (`accession_map`'s sort, 96 GB) and 2.7–22 GB for the other tables, now requested at 32 GB. Keep 75 unless a sort-heavy step (`SORT_JSONL`, `accession_map`) overshoots again.

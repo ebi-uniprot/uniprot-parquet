@@ -17,6 +17,10 @@ Usage (remote — EBI FTP):
 
     con = connect("https://ftp.ebi.ac.uk/.../2026_01/lake")
 
+Usage (remote — Hugging Face, pinned to a release tag):
+
+    con = connect("hf://datasets/uniprot/uniprotkb-parquet@2026_03/2026_03/lake")
+
 That's it. The returned object is a standard duckdb.DuckDBPyConnection
 with six views (entries, features, xrefs, comments, publications, accession_map)
 and seven macros ready to use.
@@ -253,6 +257,7 @@ def connect(
         - A local filesystem path:  "/data/uniprot/2026_01/lake"
         - An HTTP(S) URL:           "https://ftp.ebi.ac.uk/.../lake"
         - An S3 URI:                "s3://bucket/uniprot/2026_01/lake"
+        - A Hugging Face path:      "hf://datasets/<org>/<repo>@<revision>/<release>/lake"
     memory_limit : str, optional
         DuckDB memory limit (e.g. "4GB").  Defaults to DuckDB's own default.
     threads : int, optional
@@ -277,7 +282,7 @@ def connect(
     base = lake_path.rstrip("/")
 
     # Auto-install httpfs for remote paths
-    if base.startswith("http://") or base.startswith("https://") or base.startswith("s3://"):
+    if _is_remote(base):
         con.sql("INSTALL httpfs; LOAD httpfs;")
 
     # Views: over the manifest's explicit file lists when the manifest is
@@ -304,11 +309,11 @@ def connect(
 
 
 def _is_remote(base: str) -> bool:
-    return base.startswith(("http://", "https://", "s3://"))
+    return base.startswith(("http://", "https://", "s3://", "hf://"))
 
 
 def _read_manifest(base: str) -> dict[str, Any] | None:
-    """manifest.json from a local dir, http(s) URL or s3 URI; None if unreachable."""
+    """manifest.json from a local dir, http(s) URL, s3 URI or hf path; None if unreachable."""
     return _read_json(base, "manifest.json")
 
 
@@ -367,7 +372,7 @@ def _present_files(con: duckdb.DuckDBPyConnection, base: str, table: str, rels: 
 
 def _read_json(base: str, name: str) -> dict[str, Any] | None:
     """A JSON sidecar (manifest.json, datapackage.json) from a local dir,
-    http(s) URL or s3 URI; None if unreachable or invalid."""
+    http(s) URL, s3 URI or hf path; None if unreachable or invalid."""
     data: dict[str, Any]
     try:
         if base.startswith(("http://", "https://")):
@@ -375,7 +380,7 @@ def _read_json(base: str, name: str) -> dict[str, Any] | None:
             with urllib.request.urlopen(f"{base}/{name}", timeout=30) as r:
                 data = json.loads(r.read())
                 return data
-        if base.startswith("s3://"):
+        if base.startswith(("s3://", "hf://")):
             con = duckdb.connect()
             con.sql("INSTALL httpfs; LOAD httpfs;")
             row = con.sql(f"SELECT content FROM read_text('{_q(base)}/{name}')").fetchone()
@@ -399,7 +404,7 @@ def manifest(lake_path: str) -> dict[str, Any]:
     Parameters
     ----------
     lake_path : str
-        Path to the lake directory: local, http(s):// or s3://.
+        Path to the lake directory: local, http(s)://, s3:// or hf://.
 
     Returns
     -------
@@ -510,7 +515,7 @@ def schema(lake_path: str, table: str | None = None) -> dict[str, TableOverview]
     Parameters
     ----------
     lake_path : str
-        Path to the lake directory: local, http(s):// or s3://.
+        Path to the lake directory: local, http(s)://, s3:// or hf://.
     table : str, optional
         Table name to inspect.  If omitted, returns overview of all tables.
 
@@ -589,7 +594,7 @@ def schema(lake_path: str, table: str | None = None) -> dict[str, TableOverview]
 
 
 def _load_datapackage(lake_path: str) -> dict[str, Any] | None:
-    """Load datapackage.json (local, http(s) or s3) if it exists, else None."""
+    """Load datapackage.json (local, http(s), s3 or hf) if it exists, else None."""
     return _read_json(lake_path.rstrip("/"), "datapackage.json")
 
 
@@ -604,7 +609,7 @@ def datapackage(lake_path: str) -> dict[str, Any]:
     Parameters
     ----------
     lake_path : str
-        Path to the lake directory: local, http(s):// or s3://.
+        Path to the lake directory: local, http(s)://, s3:// or hf://.
 
     Returns
     -------

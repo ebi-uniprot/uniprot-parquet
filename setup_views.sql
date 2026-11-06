@@ -21,8 +21,8 @@
 --
 -- Remote lakes (https://): DuckDB cannot expand a glob over HTTP(S), so
 -- these views do not work there.  Use uniprot_parquet.connect(url), which
--- lists every file from the manifest.  (An s3:// copy can be globbed with
--- httpfs loaded.)
+-- lists every file from the manifest.  (An s3:// or hf:// copy can be
+-- globbed with httpfs loaded.)
 --
 -- After setup, query with plain table names:
 --   con.sql("SELECT * FROM entries WHERE organism_id = 9606 LIMIT 5")

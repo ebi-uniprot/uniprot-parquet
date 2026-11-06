@@ -251,6 +251,16 @@ def test_present_files_remote_probing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert up._present_files(no_con, base, "entries", []) == []
 
 
+@pytest.mark.parametrize(("base", "remote"), [
+    ("https://h/lake", True), ("http://h/lake", True), ("s3://b/lake", True),
+    ("hf://datasets/uniprot/uniprotkb-parquet@2026_03/2026_03/lake", True),
+    ("/data/uniprot/2026_03/lake", False), ("lake", False),
+])
+def test_is_remote(base: str, remote: bool) -> None:
+    """Remote paths get httpfs and per-partition probing; hf:// is one of them."""
+    assert up._is_remote(base) is remote
+
+
 class _FailingConnection:
     def __init__(self, error: Exception) -> None:
         self.error = error
@@ -263,6 +273,7 @@ class _FailingConnection:
     duckdb.HTTPException('HTTP Error: Unable to connect to URL "https://h/x.parquet": 404 (Not Found).'),
     duckdb.HTTPException('HTTP Error: Unable to connect to URL "s3://b/x.parquet": 403 (Forbidden).'),
     duckdb.IOException('IO Error: No files found that match the pattern "https://h/x.parquet"'),
+    duckdb.HTTPException("HTTP Error: HTTP GET error on 'hf://datasets/o/r@t/lake/x.parquet' (HTTP 404)"),
 ])
 def test_remote_probe_not_found_means_absent(error: Exception) -> None:
     """A definite not-found is a file this copy does not hold (a partial or
