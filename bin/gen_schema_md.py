@@ -40,11 +40,16 @@ The schema version (`schema_version` in `manifest.json`, `version` in `datapacka
 tables, their sort orders and partitioning, and the shortcut columns' names and types. It is independent of \
 the UniProt data release; a data release normally ships with an unchanged schema version.
 
-- **Major:** a shortcut column renamed, removed or retyped; a table renamed or removed; a partition or \
-sort-order change; a change in the NULL / empty-list convention.
-- **Minor:** a shortcut column or a table added; a new manifest key.
-- **Patch:** a bug fix that changes values without changing the schema; compression or file-size changes; \
-documentation.
+**The lake is in beta, so the version is 0.x and any release may change the schema.** A breaking change \
+bumps the minor version, anything else the patch version:
+
+- **Minor (breaking):** a shortcut column renamed, removed or retyped; a table renamed or removed; a \
+partition or sort-order change; a change in the NULL / empty-list convention.
+- **Patch:** a shortcut column or a table added; a new manifest key; a bug fix that changes values without \
+changing the schema; compression or file-size changes; documentation.
+
+1.0.0 will mark the end of the beta. From then on, a breaking change bumps the major version, an addition \
+the minor and anything else the patch.
 
 Source columns are UniProt's JSON keys, named and typed as each release ships them, so they are not \
 versioned: when UniProt adds, removes or retypes a field, the source column that holds it appears, disappears \

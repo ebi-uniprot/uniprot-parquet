@@ -84,7 +84,7 @@ from duckdb_util import init_duckdb as init_duckdb  # re-exported: validate_lake
 from frictionless import Package
 
 # ─── Release constants ──────────────────────────────────────────────────
-SCHEMA_VERSION = "1.0.0"          # semver of the shortcut columns (see README "Schema versioning")
+SCHEMA_VERSION = "0.1.0"          # semver of the shortcut columns; 0.x while in beta (see README "Schema versioning")
 MANIFEST_FORMAT_VERSION = 2       # structure of manifest.json
 DATA_LICENSE = "CC-BY-4.0"        # UniProtKB data; the pipeline code is MIT
 GENERATOR = "uniprot-parquet parquet_transform.py"

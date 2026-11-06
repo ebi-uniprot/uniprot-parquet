@@ -310,11 +310,14 @@ Each release is a full rebuild into its own directory; other releases are not to
 
 ## Schema versioning
 
-`schema_version` (in `manifest.json`, `datapackage.json` and every Parquet footer) is a semver of the **shortcut** columns and the layout, independent of the UniProt release. Current: 1.0.0; no release has been published yet.
+`schema_version` (in `manifest.json`, `datapackage.json` and every Parquet footer) is a semver of the **shortcut** columns and the layout, independent of the UniProt release. Current: 0.1.0.
 
-- **Major:** a shortcut column renamed, removed or retyped; a table renamed or removed; a partition or sort-order change; a change in the NULL / empty-list convention.
-- **Minor:** a shortcut column or a table added; a new manifest key.
-- **Patch:** a bug fix that changes values but not the schema; compression or file-size changes; documentation.
+**The lake is in beta, so the version is 0.x and any release may change the schema.** A breaking change bumps the minor version, anything else the patch version:
+
+- **Minor (breaking):** a shortcut column renamed, removed or retyped; a table renamed or removed; a partition or sort-order change; a change in the NULL / empty-list convention.
+- **Patch:** a shortcut column or a table added; a new manifest key; a bug fix that changes values but not the schema; compression or file-size changes; documentation.
+
+1.0.0 will mark the end of the beta. From then on, a breaking change bumps the major version, an addition the minor and anything else the patch.
 
 Source columns follow UniProt's JSON and never change the schema version. Each release's validation report lists every table and column added, removed or retyped since the previous release (`--previous_manifest`), marks shortcut changes, and flags a shortcut change, or a table added or removed, without a `schema_version` bump; it never fails a release. `manifest.json`'s integer `version` is the manifest *format* version.
 
