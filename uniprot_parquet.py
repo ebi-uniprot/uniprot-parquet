@@ -19,7 +19,7 @@ Usage (remote — EBI FTP):
 
 Usage (remote — Hugging Face, pinned to a release tag):
 
-    con = connect("hf://datasets/uniprot/uniprotkb-parquet@2026_03/2026_03/lake")
+    con = connect("hf://datasets/uniprot/uniprotkb-parquet@2026_04/2026_04/lake")
 
 That's it. The returned object is a standard duckdb.DuckDBPyConnection
 with six views (entries, features, xrefs, comments, publications, accession_map)

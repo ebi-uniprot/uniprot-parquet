@@ -111,7 +111,7 @@ Shortcut columns first, then the **source** columns (the JSON element's top-leve
 from uniprot_parquet import connect
 
 con = connect("/data/uniprot/2026_03/lake")                          # local
-con = connect("hf://datasets/uniprot/uniprotkb-parquet@2026_03/2026_03/lake")   # remote (auto-installs httpfs; https:// and s3:// work too)
+con = connect("hf://datasets/uniprot/uniprotkb-parquet@2026_04/2026_04/lake")   # remote (auto-installs httpfs; https:// and s3:// work too)
 
 con.sql("SELECT accession, gene_primary, protein_name_primary FROM entries WHERE organism_id = 9606 LIMIT 5").show()
 con.sql("SELECT * FROM protein_card('P04637')").show()
@@ -258,13 +258,13 @@ zstd -dc sorted.jsonl.zst | head -10 | jq '.primaryAccession, .organism.scientif
 
 ## Download
 
-The beta is on Hugging Face as [`uniprot/uniprotkb-parquet`](https://huggingface.co/datasets/uniprot/uniprotkb-parquet); its schema may change between releases (see [Schema versioning](#schema-versioning)). Each release is a directory of the repo (`2026_03/`, laid out as [below](#what-a-release-contains)) and a git tag of the same name: pin the tag. `sorted.jsonl.zst` is not on the Hub (at ~100 GB it is over the per-file limit). The canonical download host is not settled yet (see [Open decisions](#open-decisions-and-pending-work)).
+The beta is on Hugging Face as [`uniprot/uniprotkb-parquet`](https://huggingface.co/datasets/uniprot/uniprotkb-parquet); its schema may change between releases (see [Schema versioning](#schema-versioning)). Each release is a directory of the repo (`2026_04/`, laid out as [below](#what-a-release-contains)) and a git tag of the same name: pin the tag. `sorted.jsonl.zst` is not on the Hub (at ~100 GB it is over the per-file limit). The canonical download host is not settled yet (see [Open decisions](#open-decisions-and-pending-work)).
 
 Tiers: the **`entries` tier**, the recommended start (`entries/` + `accession_map/` + metadata files: accession, organism, gene, names, sequence, GO, keywords, PubMed ids, proteomes); **Swiss-Prot only** (`review_status=swissprot/` of every table); and the **full lake**.
 
 ```bash
 pip install -U huggingface_hub     # the hf CLI
-R=2026_03
+R=2026_04
 META=(--include "$R/lake/*.json" --include "$R/lake/SHA256SUMS.txt" --include "$R/lake/RELEASE.metalink" --include "$R/lake/LICENSE")
 # entries tier
 hf download uniprot/uniprotkb-parquet --repo-type dataset --revision $R --local-dir . \
@@ -281,7 +281,7 @@ hf download uniprot/uniprotkb-parquet --repo-type dataset --revision $R --local-
 - Mirrors should check for `RELEASE_COMPLETE` next to `lake/` first: it means the release is complete.
 - **Check a downloaded `lake/`:** `(cd lake && sha256sum -c --quiet SHA256SUMS.txt)`, or the `grep` form above for a tier (`'review_status=swissprot/'` for Swiss-Prot only).
 - **Check a full mirror of the release directory** (`lake/` plus `provenance.json` and the files beside it): `python bin/verify_release.py <release-dir> --full` checks every file is listed and matches its SHA-256 in `SHA256SUMS.txt` or `provenance.json`, with no stray Parquet file. It fails on `lake/` alone or a tier, and on a copy from the Hub, which has no `sorted.jsonl.zst`.
-- **Without downloading:** `connect("hf://datasets/uniprot/uniprotkb-parquet@2026_03/2026_03/lake")` reads only the byte ranges a query needs (`@2026_03` pins the tag; the path after it is the release directory); use the two-step accession lookup for point queries.
+- **Without downloading:** `connect("hf://datasets/uniprot/uniprotkb-parquet@2026_04/2026_04/lake")` reads only the byte ranges a query needs (`@2026_04` pins the tag; the path after it is the release directory); use the two-step accession lookup for point queries.
 
 ---
 

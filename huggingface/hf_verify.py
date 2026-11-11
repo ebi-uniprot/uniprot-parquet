@@ -1,7 +1,7 @@
 """Check an uploaded release against its SHA256SUMS.txt, then tag it.
 
-    OUT=$SCRATCH/uniprot_parquet/2026_03
-    python huggingface/hf_verify.py uniprot/uniprotkb-parquet 2026_03 $OUT/lake/SHA256SUMS.txt [--tag]
+    OUT=$SCRATCH/uniprot_parquet/2026_04
+    python huggingface/hf_verify.py uniprot/uniprotkb-parquet 2026_04 $OUT/lake/SHA256SUMS.txt [--tag]
 
 Compares the SHA-256 the Hub stores for each LFS file (every Parquet file)
 with the lake's checksums; nothing is downloaded.
