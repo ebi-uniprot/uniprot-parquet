@@ -8,7 +8,8 @@ Check a whole dat2jsonl release against REST without a REST dump: a random sampl
       sampled): WORKDIR/sample.jsonl and WORKDIR/accessions.txt.
 
   rest_sample.py fetch WORKDIR [--release 2026_04]
-      Fetch those accessions from REST, 1,000 a request (/uniprotkb/accessions),
+      Fetch those accessions from REST (/uniprotkb/accessions; up to 1,000 a request,
+      fewer when long TrEMBL accessions would make the URL too long),
       as served: WORKDIR/rest/batch-NNNNN.json.gz.  Every response must say
       x-uniprot-release: RELEASE, else it stops.  Resumable.
 
@@ -39,7 +40,8 @@ from multiprocessing import Pool
 from pathlib import Path
 
 API = "https://rest.uniprot.org/uniprotkb/accessions"
-BATCH = 1000  # the endpoint's limit
+BATCH = 1000  # the endpoint's limit on accessions
+MAX_URL = 7500  # the server refuses (414) a URL over about 8,200 characters
 KEY = b'"primaryAccession":"'
 
 
@@ -134,21 +136,42 @@ def get(url: str, release: str, tries: int = 6) -> bytes:
     sys.exit(f"giving up after {tries} tries: {url[:200]}...")
 
 
+def url_for(batch: list[str]) -> str:
+    # Commas unencoded: as %2C, the URI is three times as long per separator
+    return API + "?" + urllib.parse.urlencode({"accessions": ",".join(batch), "format": "json"}, safe=",")
+
+
+def batched(accs: list[str]) -> list[list[str]]:
+    """Consecutive runs of up to BATCH accessions whose URL stays within MAX_URL."""
+    batches: list[list[str]] = []
+    cur: list[str] = []
+    length = len(url_for([]))
+    for acc in accs:
+        if cur and (len(cur) == BATCH or length + 1 + len(acc) > MAX_URL):
+            batches.append(cur)
+            cur, length = [], len(url_for([]))
+        length += len(acc) + (1 if cur else 0)
+        cur.append(acc)
+    if cur:
+        batches.append(cur)
+    assert all(len(url_for(b)) <= MAX_URL for b in batches)
+    return batches
+
+
 def cmd_fetch(a: argparse.Namespace) -> int:
     work = Path(a.workdir)
     accs = (work / "accessions.txt").read_text().split()
     rest = work / "rest"
     rest.mkdir(exist_ok=True)
-    batches = [accs[i : i + BATCH] for i in range(0, len(accs), BATCH)]
-    print(f"{len(accs):,} accessions, {len(batches)} requests of up to {BATCH}", file=sys.stderr)
+    batches = batched(accs)
+    print(f"{len(accs):,} accessions, {len(batches)} requests", file=sys.stderr)
     t0 = time.time()
     done = 0
     for i, batch in enumerate(batches, 1):
         out = rest / f"batch-{i:05d}.json.gz"
         if out.exists():
             continue
-        # Commas unencoded: as %2C, 1,000 accessions make a URI the server refuses (414)
-        url = API + "?" + urllib.parse.urlencode({"accessions": ",".join(batch), "format": "json"}, safe=",")
+        url = url_for(batch)
         body = get(url, a.release)
         tmp = out.with_suffix(".tmp")
         tmp.write_bytes(body)
