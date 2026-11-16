@@ -18,7 +18,7 @@ import sys
 from typing import cast
 
 import pytest
-from conftest import PROJECT_ROOT, SMALL_JSON_GZ
+from conftest import PROJECT_ROOT, SMALL_JSON_GZ, make_parts_output
 
 WORKFLOW = os.path.join(PROJECT_ROOT, "upjson2lake.nf")
 TABLES = ("entries", "features", "xrefs", "comments", "publications", "accession_map")
@@ -362,6 +362,73 @@ def test_provenance_identifies_the_source_dump(launch_dir: pathlib.Path) -> None
     assert provenance["tools"]["nextflow"] and provenance["tools"]["duckdb"]
     assert provenance["params"]["release"] == "prev"
     assert provenance["params"]["process_memory"] == "4 GB"
+
+
+# ─── --input_parts: a dat2jsonl output instead of a REST dump ──────────
+
+
+def _decompressed(path: pathlib.Path) -> bytes:
+    import zstandard as zstd
+    with open(path, "rb") as f:
+        return zstd.ZstdDecompressor().stream_reader(f).read()
+
+
+def _parquet_tables(release_dir: pathlib.Path) -> dict[str, tuple[object, dict[bytes, bytes]]]:
+    """Each Parquet file of the lake: its data, and its schema metadata but
+    uniprot_release (the run's release label, so not comparable across runs)."""
+    import pyarrow.parquet as pq
+    lake = release_dir / "lake"
+    out = {}
+    for path in sorted(lake.glob("*/*/*.parquet")):
+        table = pq.read_table(path)
+        meta = dict(table.schema.metadata or {})
+        assert meta.pop(b"uniprot_release") == release_dir.name.encode()
+        out[str(path.relative_to(lake))] = (table.replace_schema_metadata(None), meta)
+    return out
+
+
+def test_parts_build_the_same_lake_as_the_dump(launch_dir: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    """FROM_PARTS joins a dat2jsonl output's parts in plan order; given the
+    lines STREAM_JSONL makes from the baseline's dump, the release is the
+    same: sorted JSONL byte for byte, every Parquet file's data and metadata
+    (but its release label), validation passed.  provenance.json names the
+    dat2jsonl output as the source."""
+    parts = tmp_path / "dat2jsonl"
+    make_parts_output(SMALL_JSON_GZ, str(parts), n_parts=3)
+    _run(launch_dir, "parts", "--input_parts", str(parts), "--expected_count", "52")
+    out = launch_dir / "out"
+    assert (out / "parts" / "RELEASE_COMPLETE").exists()
+    assert _decompressed(out / "parts" / "sorted.jsonl.zst") == _decompressed(out / "prev" / "sorted.jsonl.zst")
+    tables, baseline = _parquet_tables(out / "parts"), _parquet_tables(out / "prev")
+    assert tables and tables.keys() == baseline.keys()
+    for name, (table, meta) in tables.items():
+        assert table.equals(baseline[name][0]) and meta == baseline[name][1], name  # type: ignore[attr-defined]
+    with open(out / "parts" / "provenance.json") as f:
+        source = json.load(f)["inputs"]["source"]
+    assert source["kind"] == "dat2jsonl" and source["directory"] == str(parts.resolve())
+    assert source["entry_count"] == source["expected_count"] == 52 and source["parts"] == 3
+
+
+def test_parts_whose_check_has_not_passed_are_refused(launch_dir: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    """An output without COMPLETE (dat2jsonl's check failed or never ran) is
+    refused before anything runs, and no release appears."""
+    parts = tmp_path / "dat2jsonl"
+    make_parts_output(SMALL_JSON_GZ, str(parts), complete=False)
+    result = _launch(launch_dir, "unchecked", "--input_parts", str(parts))
+    assert result.returncode != 0
+    assert "COMPLETE is missing" in result.stdout + result.stderr
+    assert not (launch_dir / "out" / "unchecked" / "RELEASE_COMPLETE").exists()
+
+
+def test_parts_whose_count_is_not_the_expected_one_fail(launch_dir: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    """FROM_PARTS stops when the joined parts do not hold --expected_count
+    entries, like STREAM_JSONL."""
+    parts = tmp_path / "dat2jsonl"
+    make_parts_output(SMALL_JSON_GZ, str(parts))
+    result = _launch(launch_dir, "miscounted", "--input_parts", str(parts), "--expected_count", "53")
+    assert result.returncode != 0
+    assert "52 entries, expected 53" in result.stdout + result.stderr
+    assert not (launch_dir / "out" / "miscounted" / "RELEASE_COMPLETE").exists()
 
 
 # ─── The SLURM profiles, on the stand-in tests/fake_slurm ──────────────

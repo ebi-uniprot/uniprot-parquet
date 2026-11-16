@@ -8,6 +8,8 @@
 #                                                         # full UniProtKB, SLURM prod
 #   ./run_lake.sh full --expected-count 248799253 --first-release   # no previous release to diff against
 #   ./run_lake.sh full ... --input /path/to/UniProtKB.json.gz --outdir /scratch/results --release 2026_04
+#   ./run_lake.sh full ... --input-parts /scratch/dat2jsonl_2026_04  # a finished dat2jsonl output (dat2jsonl/)
+#                                                         # instead of a REST dump
 
 # Prerequisites:
 #   Activate your conda/mamba environment before running this script.
@@ -29,6 +31,7 @@ fi
 
 # ─── Parse optional flags ─────────────────────────────────────────
 INPUTFILE_OVERRIDE=""
+INPUT_PARTS=""
 OUTDIR_OVERRIDE=""
 DUCKDB_TEMP_OVERRIDE=""
 EXPECTED_COUNT=""
@@ -41,6 +44,7 @@ QUEUE=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --input)          INPUTFILE_OVERRIDE="$2";   shift 2 ;;
+        --input-parts)    INPUT_PARTS="$2";          shift 2 ;;
         --outdir)         OUTDIR_OVERRIDE="$2";      shift 2 ;;
         --duckdb-tmp)     DUCKDB_TEMP_OVERRIDE="$2"; shift 2 ;;
         --expected-count) EXPECTED_COUNT="$2";        shift 2 ;;
@@ -77,7 +81,7 @@ case "$MODE" in
         PROFILE="prod"
         ;;
     *)
-        echo "Usage: $0 {small|subset|full} [--input FILE] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL] [--previous-manifest FILE | --first-release] [--max-time DURATION] [--queue PARTITION]"
+        echo "Usage: $0 {small|subset|full} [--input FILE | --input-parts DIR] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL] [--previous-manifest FILE | --first-release] [--max-time DURATION] [--queue PARTITION]"
         exit 1
         ;;
 esac
@@ -108,6 +112,12 @@ if [[ "$MODE" == "full" && -z "$PREVIOUS_MANIFEST" && -z "$FIRST_RELEASE" ]]; th
     exit 1
 fi
 
+# --input-parts replaces the REST dump with a dat2jsonl output: not both.
+if [[ -n "$INPUT_PARTS" && -n "$INPUTFILE_OVERRIDE" ]]; then
+    echo "ERROR: --input and --input-parts are two inputs: give one."
+    exit 1
+fi
+
 # Apply overrides
 [[ -n "$INPUTFILE_OVERRIDE" ]] && INPUTFILE="$INPUTFILE_OVERRIDE"
 [[ -n "$OUTDIR_OVERRIDE" ]]    && OUTDIR="$OUTDIR_OVERRIDE"
@@ -116,7 +126,9 @@ fi
 # The box widens to its longest row.  Rows are padded by hand: ${#row}
 # counts characters (the arrow is one), printf's %-Ns width counts bytes.
 TITLE="UniProtKB → Parquet Data Lake"
-ROWS=("Mode:      $MODE" "Release:   $RELEASE" "Input:     $INPUTFILE"
+INPUT_ROW="$INPUTFILE"
+[[ -n "$INPUT_PARTS" ]] && INPUT_ROW="$INPUT_PARTS (dat2jsonl parts)"
+ROWS=("Mode:      $MODE" "Release:   $RELEASE" "Input:     $INPUT_ROW"
       "Output:    $OUTDIR" "Memory:    $MEMORY" "Profile:   $PROFILE")
 [[ "$PROFILE" == local ]] || ROWS+=("Queue:     ${QUEUE:-the profile's (prod: the cluster's default)}")
 W=55
@@ -132,8 +144,20 @@ for row in "${ROWS[@]}"; do box_row "$row"; done
 printf "╚%s╝\n" "$BAR"
 echo ""
 
-# Pre-flight: verify input file exists before submitting to SLURM
-if [[ ! -f "$INPUTFILE" ]]; then
+# Pre-flight: verify the input exists before submitting to SLURM.  A
+# dat2jsonl output must have passed its check (COMPLETE, written by check.sh).
+if [[ -n "$INPUT_PARTS" ]]; then
+    if [[ ! -d "$INPUT_PARTS" ]]; then
+        echo "ERROR: dat2jsonl output not found: $INPUT_PARTS" >&2
+        echo "  (resolved from working directory: $(pwd))" >&2
+        exit 1
+    fi
+    if [[ ! -f "$INPUT_PARTS/COMPLETE" ]]; then
+        echo "ERROR: $INPUT_PARTS/COMPLETE is missing: dat2jsonl's check has not passed." >&2
+        echo "  See $INPUT_PARTS/CHECK.txt." >&2
+        exit 1
+    fi
+elif [[ ! -f "$INPUTFILE" ]]; then
     echo "ERROR: Input file not found: $INPUTFILE" >&2
     echo "  (resolved from working directory: $(pwd))" >&2
     if [[ "$INPUTFILE" == demo/* ]]; then
@@ -164,7 +188,6 @@ mkdir -p "$OUTDIR/reports"
 # Build command as an array to handle paths with spaces safely
 NF_CMD=(
     nextflow run upjson2lake.nf
-    --inputfile "$INPUTFILE"
     --outdir "$OUTDIR"
     --process_memory "$MEMORY"
     --release "$RELEASE"
@@ -172,6 +195,13 @@ NF_CMD=(
     -ansi-log true
     -resume
 )
+
+# The input: a dat2jsonl output's parts, or a REST dump
+if [[ -n "$INPUT_PARTS" ]]; then
+    NF_CMD+=(--input_parts "$INPUT_PARTS")
+else
+    NF_CMD+=(--inputfile "$INPUTFILE")
+fi
 
 # Add DuckDB temp directory if specified
 if [[ -n "$DUCKDB_TEMP_OVERRIDE" ]]; then

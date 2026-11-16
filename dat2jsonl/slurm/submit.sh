@@ -94,6 +94,8 @@ else
     echo "created: $(date -Is)"
     echo "SRC: $SRC"
     echo "jar sha256: $(sha256sum "$OUT/dat2jsonl.jar" | cut -d' ' -f1)"
+    echo "uniprot-core: $(unzip -p "$OUT/dat2jsonl.jar" META-INF/maven/org.uniprot/ff-parser/pom.properties \
+        | sed -n 's/^version=//p')"
     echo "gaf-eco-mapping.txt sha256: $(sha256sum "$OUT/gaf-eco-mapping.txt" | cut -d' ' -f1)"
     echo "java: $(java -version 2>&1 | grep -v 'Picked up' | head -1)"
     for d in $DATS; do echo "dat: $d $(stat -L -c '%s bytes, modified %y' "$d")"; done

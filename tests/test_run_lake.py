@@ -62,6 +62,45 @@ def test_queue_reaches_nextflow_only_when_given(stub: Stub) -> None:
     assert args[args.index("--queue") + 1] == "research"
 
 
+class TestInputParts:
+    """--input-parts: a finished dat2jsonl output instead of a REST dump."""
+
+    def test_checked_output_reaches_nextflow_instead_of_the_dump(self, stub: Stub, tmp_path: pathlib.Path) -> None:
+        run, args_file = stub
+        parts = tmp_path / "dat2jsonl"
+        parts.mkdir()
+        (parts / "COMPLETE").touch()
+        result = run("--input-parts", str(parts), "--expected-count", "52", "--first-release", mode="full")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "(dat2jsonl parts)" in result.stdout
+        args = args_file.read_text().splitlines()
+        assert args[args.index("--input_parts") + 1] == str(parts)
+        assert "--inputfile" not in args
+
+    def test_output_without_complete_is_refused(self, stub: Stub, tmp_path: pathlib.Path) -> None:
+        run, args_file = stub
+        parts = tmp_path / "dat2jsonl"
+        parts.mkdir()
+        result = run("--input-parts", str(parts))
+        assert result.returncode != 0
+        assert "COMPLETE is missing" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+    def test_missing_directory_is_refused(self, stub: Stub, tmp_path: pathlib.Path) -> None:
+        run, args_file = stub
+        result = run("--input-parts", str(tmp_path / "nowhere"))
+        assert result.returncode != 0
+        assert "dat2jsonl output not found" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+    def test_with_input_is_refused(self, stub: Stub, tmp_path: pathlib.Path) -> None:
+        run, args_file = stub
+        result = run("--input-parts", str(tmp_path), "--input", "tests/fixtures/small.json.gz")
+        assert result.returncode != 0
+        assert "give one" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+
 class TestPreviousManifest:
     def test_missing_file_is_refused_by_name(self, stub: Stub) -> None:
         run, args_file = stub

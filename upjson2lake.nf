@@ -13,7 +13,9 @@
 //   RELEASE_COMPLETE                  (written last, only after validation passed)
 //
 // Architecture:
-//   1. Stream JSON(.gz) → single zstd-compressed JSONL
+//   1. Stream JSON(.gz) → single zstd-compressed JSONL (STREAM_JSONL); or, with
+//      --input_parts, join a finished dat2jsonl output's parts (FROM_PARTS):
+//      the same JSONL, converted from UniProt's flat files with its own code
 //   2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (Swiss-Prot first)
 //   3. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow, in three
 //      processes so a re-run reuses each finished phase: INFER_SCHEMA (the columns),
@@ -35,6 +37,7 @@
 
 /* ── PARAMS ────────────────────────────────────────────────────────── */
 params.inputfile      = "${projectDir}/tests/fixtures/small.json.gz"
+params.input_parts    = null      // A finished dat2jsonl output (dat2jsonl/slurm/submit.sh's OUTDIR, COMPLETE): used instead of inputfile
 params.outdir         = "${projectDir}/results/uniprot_parquet"   // also in nextflow.config (report paths)
 params.release        = "2026_03"
 params.process_memory = '96 GB'   // Total memory for heavy processes (Nextflow directive)
@@ -101,6 +104,7 @@ def verify_release_problems() {
 def bin_modules(String process) {
     [
         STREAM_JSONL:      [],
+        FROM_PARTS:        [],
         SORT_JSONL:        ['duckdb_util.py'],
         INFER_SCHEMA:      ['duckdb_util.py'],
         STAGE_PARQUET:     ['duckdb_util.py'],
@@ -232,6 +236,53 @@ process STREAM_JSONL {
     echo "  Verified: \$ACTUAL lines in compressed output match stream_jsonl count"
 
     echo " '-- STREAM_JSONL ENDED \$(date)"
+    """
+}
+
+
+/* ── PROCESS: Join a dat2jsonl output's parts into the JSONL (--input_parts) ── */
+// STREAM_JSONL's stand-in when the release's entries come from its flat
+// files: dat2jsonl (dat2jsonl/) converted them with UniProt's own code, one
+// part per byte range of each .dat, and its check proved every byte covered
+// once.  The parts in plan order are the entries in .dat order; zstd frames
+// concatenate, so joining them is a copy, with no decompression.  Each line
+// is the JSON REST serves for its entry (Jackson's compact form): the same
+// values STREAM_JSONL writes, and SORT_JSONL onwards treat them alike.
+// The same outputs as STREAM_JSONL: the JSONL, its line count (counted
+// after joining, checked against the parts' own counts and --expected_count)
+// and input_manifest.json, what provenance.json records the release was
+// built from (the .dat files, the jar and uniprot-core version, the check).
+process FROM_PARTS {
+    tag 'parts'
+    cpus 4
+    memory '4 GB'
+    time '12h'
+
+    input:
+    path parts_dir
+
+    output:
+    path "uniprot.jsonl.zst",   emit: jsonl
+    path "entry_count.txt",     emit: count_file
+    path "input_manifest.json", emit: input_manifest
+
+    script:
+    def expected_flag = params.expected_count ? "--expected-count ${params.expected_count}" : ''
+    """
+    set -euo pipefail
+    echo " .-- FROM_PARTS BEGUN \$(date)"
+
+    parts_input.py parts ${parts_dir} > parts.txt
+    echo "  \$(wc -l < parts.txt) parts"
+    while IFS= read -r part; do cat "\$part"; done < parts.txt > uniprot.jsonl.zst
+    # Decompressing it all checks every frame as well as counting the lines
+    COUNT=\$(zstd -dc uniprot.jsonl.zst | wc -l | tr -d ' ')
+    parts_input.py manifest ${parts_dir} --jsonl uniprot.jsonl.zst --entry-count "\$COUNT" \
+        ${expected_flag} -o input_manifest.json
+    echo "\$COUNT" > entry_count.txt
+    echo "  Verified: \$COUNT lines, the parts' own count${params.expected_count ? ' and the expected count' : ''}"
+
+    echo " '-- FROM_PARTS ENDED \$(date)"
     """
 }
 
@@ -600,7 +651,7 @@ workflow {
     ${banner_line('UniProtKB → Parquet Data Lake')}
     ${banner_line("Release: ${params.release}")}
     ╚${bar}╝
-    Input:      ${params.inputfile}
+    Input:      ${params.input_parts ? "${params.input_parts} (dat2jsonl parts)" : params.inputfile}
     Output:     ${release_dir()}
     DuckDB mem: ${params.duckdb_pct}% of task.memory (scales on retry)
     DuckDB tmp: ${params.duckdb_temp ?: '(default: \$TMPDIR or /tmp)'}
@@ -610,7 +661,16 @@ workflow {
     """.stripIndent()
 
     // Validate inputs
-    if (!file(params.inputfile).exists()) {
+    if (params.input_parts) {
+        def parts = file(params.input_parts)
+        if (!parts.isDirectory()) {
+            error "dat2jsonl output not found: ${params.input_parts}"
+        }
+        if (!file("${parts}/COMPLETE").exists()) {
+            error "${params.input_parts}/COMPLETE is missing: dat2jsonl's check has not passed (CHECK.txt)"
+        }
+    }
+    else if (!file(params.inputfile).exists()) {
         error "Input file not found: ${params.inputfile}"
     }
     if (params.previous_manifest && !file(params.previous_manifest).exists()) {
@@ -647,12 +707,14 @@ workflow {
         }
     }
 
-    // 1. Stream input → single zstd-compressed JSONL
-    def input_ch = channel.fromPath(params.inputfile)
-    STREAM_JSONL(input_ch)
+    // 1. The input as one zstd-compressed JSONL: a REST dump streamed
+    //    (STREAM_JSONL), or a dat2jsonl output's parts joined (FROM_PARTS)
+    def source = params.input_parts
+        ? FROM_PARTS(channel.fromPath(params.input_parts, type: 'dir'))
+        : STREAM_JSONL(channel.fromPath(params.inputfile))
 
     // 2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (lines kept as they are)
-    SORT_JSONL(STREAM_JSONL.out.jsonl, bin_digest('SORT_JSONL'))
+    SORT_JSONL(source.jsonl, bin_digest('SORT_JSONL'))
 
     // 3. Transform sorted JSONL → Parquet tables, in three processes so that
     //    a re-run reuses each finished phase: the columns, inferred from the
@@ -668,7 +730,7 @@ workflow {
     VALIDATE(
         ASSEMBLE_LAKE.out.lake,
         SORT_JSONL.out.sorted_jsonl,
-        STREAM_JSONL.out.count_file,
+        source.count_file,
         params.previous_manifest ? file(params.previous_manifest) : [],
         bin_digest('VALIDATE'),
     )
@@ -678,7 +740,7 @@ workflow {
         ASSEMBLE_LAKE.out.lake,
         SORT_JSONL.out.sorted_jsonl,
         VALIDATE.out.report.concat(VALIDATE.out.report_json).collect(),
-        STREAM_JSONL.out.input_manifest,
+        source.input_manifest,
         bin_digest('PROVENANCE'),
     )
 

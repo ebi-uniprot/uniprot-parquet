@@ -108,6 +108,46 @@ def _json_gz_to_jsonl_zst(src: str, dst: str) -> str:
         return write_jsonl_zst(json.load(f)["results"], dst)
 
 
+def make_parts_output(src_json_gz: str, outdir: str, n_parts: int = 2, *, complete: bool = True) -> list[bytes]:
+    """A dat2jsonl output (dat2jsonl/slurm/submit.sh's OUTDIR) holding the
+    entries of a {"results": [...]} fixture: plan.tsv, parts/part-NNNNN.jsonl.zst
+    with their .stats.tsv, CHECK.txt, inputs.txt and, if ``complete``, COMPLETE.
+    The lines are stream_jsonl.py's, so FROM_PARTS hands SORT_JSONL exactly
+    what STREAM_JSONL would; the stand-in .dat is the fixture itself.  The
+    lines, in part order."""
+    import zstandard as zstd
+
+    with open(src_json_gz, "rb") as f:
+        result = subprocess.run([sys.executable, os.path.join(BIN_DIR, "stream_jsonl.py")],
+                                input=gzip.decompress(f.read()), capture_output=True, check=True)
+    lines = result.stdout.splitlines(keepends=True)
+    dat = os.path.abspath(src_json_gz)
+    size = os.path.getsize(dat)
+    os.makedirs(os.path.join(outdir, "parts"), exist_ok=True)
+    plan = ["task\tdat\tstart\tend\tpart"]
+    per = -(-len(lines) // n_parts)
+    for t in range(1, n_parts + 1):
+        chunk = lines[(t - 1) * per: t * per]
+        start, end = (t - 1) * size // n_parts, t * size // n_parts
+        part = f"part-{t:05d}"
+        plan.append(f"{t}\t{dat}\t{start}\t{end}\t{part}")
+        with open(os.path.join(outdir, "parts", part + ".jsonl.zst"), "wb") as f:
+            f.write(zstd.ZstdCompressor(level=3).compress(b"".join(chunk)))
+        with open(os.path.join(outdir, "parts", part + ".stats.tsv"), "w") as f:
+            f.write("dat\trange_start\trange_end\tfirst_offset\tend_offset\tentries\twith_go\t"
+                    "with_uniparc\tfirst_accession\tlast_accession\tseconds\n")
+            f.write(f"{dat}\t{start}\t{end}\t{start}\t{end}\t{len(chunk)}\t0\t{len(chunk)}\t\t\t0.1\n")
+    with open(os.path.join(outdir, "plan.tsv"), "w") as f:
+        f.write("\n".join(plan) + "\n")
+    with open(os.path.join(outdir, "inputs.txt"), "w") as f:
+        f.write("created: test\nuniprot-core: 1.0.43\n")
+    with open(os.path.join(outdir, "CHECK.txt"), "w") as f:
+        f.write(f"total: {len(lines)} entries\nCHECK PASSED\n")
+    if complete:
+        open(os.path.join(outdir, "COMPLETE"), "w").close()
+    return lines
+
+
 def run_bin(script: str, *args: object) -> subprocess.CompletedProcess[str]:
     """Run bin/``script`` with ``args`` (bin/ importable); the CompletedProcess."""
     env = {**os.environ, "PYTHONPATH": BIN_DIR + ":" + os.environ.get("PYTHONPATH", "")}

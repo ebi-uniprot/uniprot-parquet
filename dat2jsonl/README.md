@@ -150,6 +150,38 @@ Open question (settled): the indexer's flat file may be `uniprot-release.dat`, w
 The entry count against `EXPECTED` would show whether the two give the same
 entries.
 
+## Into the lake
+
+A finished output (with `COMPLETE`) is an input of the lake pipeline in
+place of a REST dump:
+
+```bash
+./run_lake.sh full --input-parts $SCRATCH/dat2jsonl_2026_04 \
+    --expected-count 154222205 --release 2026_04 --previous-manifest ... \
+    --outdir $SCRATCH/uniprot_parquet --duckdb-tmp $SCRATCH/duckdb_tmp
+```
+
+(`nextflow run upjson2lake.nf --input_parts DIR` underneath.) `FROM_PARTS`
+replaces `STREAM_JSONL`, which streams a dump through Python for about 3.5
+hours: it joins the parts in plan order (zstd frames concatenate, so this
+is a copy), counts the lines, which must equal the parts' own counts and
+`--expected-count`, and records the source in `provenance.json`
+(`inputs.source`: the `.dat` files, `inputs.txt` with the jar's checksum and
+uniprot-core version, `CHECK.txt`, the joined JSONL's SHA-256). Everything
+from `SORT_JSONL` on is unchanged.
+
+Each line is the JSON REST serves for its entry, as Jackson writes it, where
+`STREAM_JSONL` writes the same values with orjson (raw UTF-8, numbers with
+their own digits, an exponent in Python's Decimal notation). Validation
+compares parsed values and the Parquet columns are typed from the values, so
+the two inputs should give the same lake. `tests/test_workflow.py` builds the
+small fixture's release both ways from the same lines (the plumbing: the
+sorted JSONL and every Parquet file's data and metadata but the release label
+are the same). On real data, 2,000 Swiss-Prot 2026_04 entries built once from
+REST's JSON and once from dat2jsonl's output gave a byte-identical sorted
+JSONL and the same Parquet files (data and metadata, but the release label);
+both validations passed, 156/156 checks.
+
 ## Results so far
 
 Swiss-Prot 2026_04, from the FTP's `uniprot_sprot.dat.gz` and the docs
