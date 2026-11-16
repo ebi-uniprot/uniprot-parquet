@@ -7,8 +7,9 @@ Check a whole dat2jsonl release against REST without a REST dump: a random sampl
       with probability N / total, independently, so every part and byte range is
       sampled): WORKDIR/sample.jsonl and WORKDIR/accessions.txt.
 
-  rest_sample.py fetch WORKDIR [--release 2026_04]
-      Fetch those accessions from REST (/uniprotkb/accessions; up to 1,000 a request,
+  rest_sample.py fetch WORKDIR [--release 2026_04] [--pause 1]
+      Fetch those accessions from REST (/uniprotkb/accessions, one request at a time,
+      --pause seconds apart, honouring Retry-After on 429; up to 1,000 a request,
       fewer when long TrEMBL accessions would make the URL too long),
       as served: WORKDIR/rest/batch-NNNNN.json.gz.  Every response must say
       x-uniprot-release: RELEASE, else it stops.  Resumable.
@@ -27,6 +28,7 @@ Python 3.14 (compression.zstd); standard library only.
 from __future__ import annotations
 
 import argparse
+import email.utils
 import gzip
 import os
 import random
@@ -107,8 +109,25 @@ def cmd_sample(a: argparse.Namespace) -> int:
     return 0
 
 
-def get(url: str, release: str, tries: int = 6) -> bytes:
-    """One response body, gzip-compressed once; checks the release it was served from."""
+def retry_after(e: urllib.error.HTTPError) -> float | None:
+    """A Retry-After header's wait, in seconds (it may also be an HTTP date)."""
+    value = e.headers.get("Retry-After") if e.headers else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            return max(0.0, email.utils.parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError):
+            return None
+
+
+def get(url: str, release: str, tries: int = 10) -> bytes:
+    """One response body, gzip-compressed once; checks the release it was served from.
+
+    On 429 (too many requests) or a server error it waits as long as Retry-After says, else
+    5, 10, 20 ... seconds (at most 10 minutes), up to `tries` attempts in all."""
     # No Accept-Encoding: asked for gzip, REST sends gzip inside Content-Encoding gzip
     headers = {"User-Agent": "uniprot-parquet rest_sample.py"}
     req = urllib.request.Request(url, headers=headers)
@@ -128,10 +147,11 @@ def get(url: str, release: str, tries: int = 6) -> bytes:
             if e.code < 500 and e.code != 429:
                 sys.exit(f"HTTP {e.code} for {url[:200]}...: {e.read()[:300]!r}")
             err: Exception = e
+            told = retry_after(e)
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            err = e
-        wait = 2 ** attempt * 5
-        print(f"  {err}; retrying in {wait} s", file=sys.stderr)
+            err, told = e, None
+        wait = min(600.0, told if told is not None else 2**attempt * 5)
+        print(f"  {err}; retrying in {wait:.0f} s{' (Retry-After)' if told is not None else ''}", file=sys.stderr)
         time.sleep(wait)
     sys.exit(f"giving up after {tries} tries: {url[:200]}...")
 
@@ -172,6 +192,8 @@ def cmd_fetch(a: argparse.Namespace) -> int:
         if out.exists():
             continue
         url = url_for(batch)
+        if done:
+            time.sleep(a.pause)
         body = get(url, a.release)
         tmp = out.with_suffix(".tmp")
         tmp.write_bytes(body)
@@ -197,6 +219,8 @@ def main() -> int:
     f = sub.add_parser("fetch", help="fetch the sampled accessions from REST")
     f.add_argument("workdir")
     f.add_argument("--release", default="2026_04", help="the release REST must serve (default: 2026_04)")
+    f.add_argument("--pause", type=float, default=1.0,
+                   help="seconds between requests, to stay under REST's rate limit (default: 1)")
     a = ap.parse_args()
     return cmd_sample(a) if a.cmd == "sample" else cmd_fetch(a)
 
