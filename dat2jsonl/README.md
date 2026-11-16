@@ -130,7 +130,22 @@ single run that matched REST. Also checked: ranges whose boundary falls on an
 entry's first byte, one byte either side of it, or inside an entry; a
 missing part and a gap fail the check; a rerun redoes only the missing part.
 
-Open question: the indexer's flat file may be `uniprot-release.dat`, which is
+On Codon, 2026_04 (Swiss-Prot and TrEMBL `.dat`, 127 tasks of 8 CPUs, 20 at
+a time): `CHECK PASSED`, 154,222,205 entries, REST's count exactly; a UniParc
+id on every entry; GO evidences on 141,033; 12,543 task-seconds in all, the
+slowest task 142 s.
+
+Without a REST dump of the release, `rest_sample.py` checks a random sample:
+it keeps each entry of the parts with probability n/total, fetches those
+accessions from REST (`/uniprotkb/accessions`, 5 s apart: faster, REST
+answers 429), and `compare_json.py` compares them. For 2026_04, 1,000,917
+entries from all 127 parts were identical: with 95% confidence fewer than 3
+in a million entries differ (at most about 460 of the release).
+
+The question below is settled by that count: `uniprot_sprot.dat` and
+`uniprot_trembl.dat` hold every entry REST serves.
+
+Open question (settled): the indexer's flat file may be `uniprot-release.dat`, which is
 0.6 GB larger than `uniprot_sprot.dat` and `uniprot_trembl.dat` together.
 The entry count against `EXPECTED` would show whether the two give the same
 entries.

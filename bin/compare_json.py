@@ -378,14 +378,23 @@ def _insert(db: sqlite3.Connection, batch: list[tuple[str, bytes]]) -> int:
     return dup
 
 
+def files_label(paths: list[str]) -> str:
+    """The files, or for more than three, how many and where (the JSON report lists them all)."""
+    if len(paths) <= 3:
+        return " ".join(paths)
+    dirs = sorted({os.path.dirname(p) or "." for p in paths})
+    where = dirs[0] if len(dirs) == 1 else f"{len(dirs)} directories"
+    return f"{len(paths):,} files in {where} ({os.path.basename(paths[0])} ... {os.path.basename(paths[-1])})"
+
+
 def print_report(rep: Report, args: argparse.Namespace) -> None:
     p = print
     n = rep.compared or 1
     p("=" * 100)
     p("UniProtKB JSON: EXPECTED vs ACTUAL")
-    p(f"  expected: {' '.join(args.expected)}  ({rep.expected_entries:,} entries, "
+    p(f"  expected: {files_label(args.expected)}  ({rep.expected_entries:,} entries, "
       f"{rep.duplicates_expected:,} repeated accessions skipped)")
-    p(f"  actual:   {' '.join(args.actual)}  ({rep.actual_entries:,} entries, "
+    p(f"  actual:   {files_label(args.actual)}  ({rep.actual_entries:,} entries, "
       f"{rep.duplicates_actual:,} repeated accessions skipped)")
     p("")
     p(f"Accessions only in expected: {len(rep.only_expected):,}  {rep.only_expected[:10]}")
