@@ -68,6 +68,7 @@ benchmarks/variant_lake/
 # Build artifacts
 dist/
 *.egg-info/
+dat2jsonl/target/
 
 # Misc
 install.sh

@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  dat2jsonl: UniProtKB flat file (.dat) to JSON lines, with UniProt's own code
+  (uniprot-core), the way uniprot-store's UniProtKBDataStoreIndexer builds the
+  entries REST serves.  Investigation, not part of the lake pipeline yet.
+
+  uniprot-core 1.0.43 is the code for release 2026_04 (1.0.42: 2026_03; 2027.1: 2027_01).
+  Build for another release with -Duniprot-core.version=...
+
+  Its jars are in UniProt's Artifactory, which needs a login: a <server> with
+  id uniprot-artifactory-release in ~/.m2/settings.xml.  Without one, build
+  uniprot-core at the matching tag from GitHub first (mvn install), and Maven
+  finds the jars in the local repository instead.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.uniprot.parquet</groupId>
+    <artifactId>dat2jsonl</artifactId>
+    <version>0.1.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <uniprot-core.version>1.0.43</uniprot-core.version>
+        <maven.compiler.release>17</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>uniprot-artifactory-release</id>
+            <url>https://unpartifactory.uniprot.org/artifactory/release</url>
+            <releases><enabled>true</enabled></releases>
+            <snapshots><enabled>false</enabled></snapshots>
+        </repository>
+    </repositories>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.uniprot</groupId>
+            <artifactId>ff-parser</artifactId>
+            <version>${uniprot-core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.uniprot</groupId>
+            <artifactId>json-parser</artifactId>
+            <version>${uniprot-core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.uniprot</groupId>
+            <artifactId>tools-entry-scorer</artifactId>
+            <version>${uniprot-core.version}</version>
+        </dependency>
+        <dependency>
+            <!-- uniprot-core's SLF4J is 1.7, which its logback 1.5 cannot bind: without this
+                 its warnings go nowhere.  Settings: src/main/resources/simplelogger.properties -->
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>1.7.36</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+            <plugin>
+                <!-- One runnable jar: target/dat2jsonl.jar -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <finalName>dat2jsonl</finalName>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>org.uniprot.parquet.Dat2Jsonl</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
