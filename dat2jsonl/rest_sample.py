@@ -7,7 +7,7 @@ Check a whole dat2jsonl release against REST without a REST dump: a random sampl
       with probability N / total, independently, so every part and byte range is
       sampled): WORKDIR/sample.jsonl and WORKDIR/accessions.txt.
 
-  rest_sample.py fetch WORKDIR [--release 2026_04] [--pause 1]
+  rest_sample.py fetch WORKDIR [--release 2026_04] [--pause 5]
       Fetch those accessions from REST (/uniprotkb/accessions, one request at a time,
       --pause seconds apart, honouring Retry-After on 429; up to 1,000 a request,
       fewer when long TrEMBL accessions would make the URL too long),
@@ -219,8 +219,8 @@ def main() -> int:
     f = sub.add_parser("fetch", help="fetch the sampled accessions from REST")
     f.add_argument("workdir")
     f.add_argument("--release", default="2026_04", help="the release REST must serve (default: 2026_04)")
-    f.add_argument("--pause", type=float, default=1.0,
-                   help="seconds between requests, to stay under REST's rate limit (default: 1)")
+    f.add_argument("--pause", type=float, default=5.0,
+                   help="seconds between requests, to stay well under REST's rate limit (default: 5)")
     a = ap.parse_args()
     return cmd_sample(a) if a.cmd == "sample" else cmd_fetch(a)
 
