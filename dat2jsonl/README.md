@@ -22,10 +22,10 @@ through the indexer's steps, in its order:
 The JSON is uniprot-core's "simple" object mapper (`--mapper simple`), the
 form REST serves. Output keeps the input's entry order.
 
-The Spark joins become in-memory maps holding only the input's accessions,
-which a first pass over the input collects. That suits Swiss-Prot and test
-sets. The whole of TrEMBL would need a different join (`uniparc_map` covers
-every UniProtKB entry).
+The Spark joins become in-memory maps holding only the accessions of the
+entries converted, which a first pass over the input collects. For a whole
+release, `--range` converts one byte range of a `.dat` at a time, so memory
+follows the range (see "A whole release on SLURM").
 
 ## uniprot-core version
 
@@ -48,7 +48,7 @@ ff-parser,json-parser,tools-entry-scorer -am`), and Maven finds its jars
 locally.
 
 ```bash
-micromamba create -y -n dat2jsonl -c conda-forge openjdk=17 maven   # once
+micromamba create -y -n dat2jsonl -c conda-forge openjdk=17 maven zstd   # once
 micromamba activate dat2jsonl
 mvn -B -q package -f dat2jsonl/pom.xml        # → dat2jsonl/target/dat2jsonl.jar
 ```
@@ -78,6 +78,63 @@ Then compare with what REST serves for the same release:
 python bin/compare_json.py -e rest_sprot.json.gz -a sprot.jsonl --report-json report.json
 ```
 
+## A whole release on SLURM
+
+`slurm/submit.sh` splits the uncompressed `.dat`s into byte ranges and
+submits three stages, chained by dependencies:
+
+1. **uniparc**: `dat2jsonl uniparc-active` writes the `uniparc_map/` lines
+   the indexer keeps (status not `Y`; about 154M of 494M for 2026_04) to
+   `OUTDIR/uniparc_active.txt`, once, so each task reads that instead of the
+   whole map;
+2. **convert**: a job array, one task per range (`CHUNK_GB`, 5 by default:
+   about 126 tasks for TrEMBL, 1 for Swiss-Prot). A task converts the
+   entries whose first byte is in its range, keeps in memory only those
+   entries' GO evidences and UniParc ids, and writes
+   `OUTDIR/parts/part-NNNNN.jsonl.zst`, then its `.stats.tsv`, which marks
+   it done;
+3. **check**: from the stats alone, every `.dat` is covered: in file order
+   the first entry starts at byte 0, each task's last entry ends where the
+   next task's first starts, and the last ends at the file's size. It sums
+   the entries, compares them with `EXPECTED` if given, and writes
+   `OUTDIR/CHECK.txt`, plus `OUTDIR/COMPLETE` if all is well.
+
+```bash
+micromamba install -y -n dat2jsonl -c conda-forge zstd     # the tasks compress with it
+micromamba activate dat2jsonl                               # sbatch hands this environment on
+SRC=/hps/software/users/martin/uniprot/uapi/source_data/2026_04/uniprot \
+GAF_ECO=$FFC/gaf-eco-mapping.txt \
+EXPECTED=154222205 \
+MAX_PARALLEL=20 \
+    dat2jsonl/slurm/submit.sh $SCRATCH/dat2jsonl_2026_04
+```
+
+`EXPECTED` is REST's `x-total-results` for `query=*` while it serves that
+release. Other settings, with defaults: `DATS` (`uniprot_sprot.dat` and
+`uniprot_trembl.dat` in `$SRC`), `CHUNK_GB` (5), `CPUS` (8), `MEM` (16G,
+three quarters of it the Java heap), `TIME` (2:00:00), `MAX_PARALLEL` (50),
+`PARTITION`, `JAR`.
+
+Running `submit.sh` again with the same `OUTDIR` resumes: finished parts are
+kept, and it refuses a different plan. `OUTDIR` keeps a copy of the jar and
+of `gaf-eco-mapping.txt`, the plan, and `inputs.txt` (sizes and dates of the
+inputs, the jar's checksum).
+
+The parts, in plan order, are the entries in `.dat` order, so
+`zstd -dc $(ls OUTDIR/parts/*.jsonl.zst)` is the whole release as one JSON
+lines stream.
+
+Checked locally on Swiss-Prot 2026_04 split into 15 ranges (with decoy `Y`
+lines in the UniParc map): the parts concatenated are byte-identical to the
+single run that matched REST. Also checked: ranges whose boundary falls on an
+entry's first byte, one byte either side of it, or inside an entry; a
+missing part and a gap fail the check; a rerun redoes only the missing part.
+
+Open question: the indexer's flat file may be `uniprot-release.dat`, which is
+0.6 GB larger than `uniprot_sprot.dat` and `uniprot_trembl.dat` together.
+The entry count against `EXPECTED` would show whether the two give the same
+entries.
+
 ## Results so far
 
 Swiss-Prot 2026_04, from the FTP's `uniprot_sprot.dat.gz` and the docs
@@ -89,4 +146,15 @@ values, JSON types and key order):
 - building the parser and converter per entry, as the indexer does, gives
   byte-identical output to one per thread (first 2,000 entries).
 
-UniParc ids were not tested: `uniparc_map/` is on Codon only.
+On Codon, from the production files in `source_data/2026_04/uniprot/`
+(the uncompressed `.dat`s, `GO.dr_extended`, `uniparc_map/`):
+
+- Swiss-Prot, all 576,073 entries: identical (123 s on 8 cores, about
+  8,000 entries/s once `uniparc_map/` is read);
+- a TrEMBL test set of 3,964 entries from 23 REST queries (viruses,
+  archaea, fragments, metagenomes, automatic annotation, GO IDA, new this
+  release, ...): identical.
+
+`uniparc_map/` holds 200 files and 493.6M lines; 154.29M have a status other
+than `Y` (REST: 154.22M entries for 2026_04), which bears out the indexer's
+inverted status filter. Every test entry found its UniParc id.

@@ -25,6 +25,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -66,8 +67,11 @@ import org.uniprot.cv.evidence.GOEvidences;
  *   <li>UniProtKBAnnotationScoreMapper: UniProtEntryScored, scaled to 1-5.
  * </ol>
  *
- * The Spark plumbing (RDDs, joins) is replaced by in-memory maps holding only the
- * accessions in the input. Output keeps the input's entry order.
+ * The Spark joins become in-memory maps holding only the accessions of the entries converted,
+ * which a first pass over the input (or its byte range) collects. Output keeps the input's entry
+ * order. {@code --range} converts the entries starting in a byte range of an uncompressed file,
+ * so a SLURM array can split a release; {@code uniparc-active} writes the uniparc_map lines the
+ * indexer keeps, once, for those runs to share.
  */
 public final class Dat2Jsonl {
 
@@ -76,9 +80,10 @@ public final class Dat2Jsonl {
                     "\n",
                     "usage: java -jar dat2jsonl.jar --dat FILE --keywords keywlist.txt "
                             + "--diseases humdisease.txt --subcell subcell.txt",
-                    "                               [--go GO.dr_extended --gaf-eco gaf-eco-mapping.txt]"
-                            + " [--uniparc FILE|DIR]",
-                    "                               [--threads N] [--mapper simple|full] > out.jsonl",
+                    "           [--go GO.dr_extended --gaf-eco gaf-eco-mapping.txt] [--uniparc FILE|DIR]",
+                    "           [--range START:END] [--stats FILE] [--threads N] [--mapper simple|full]"
+                            + " > out.jsonl",
+                    "       java -jar dat2jsonl.jar uniparc-active --uniparc FILE|DIR > uniparc_active.txt",
                     "",
                     "  --dat       UniProtKB flat file, plain or .gz",
                     "  --keywords  keywlist.txt     (keyword ids and categories)",
@@ -89,13 +94,31 @@ public final class Dat2Jsonl {
                             + " downloads it,",
                     "              and on failure silently maps every GO code to no ECO",
                     "  --uniparc   uniparc_map file, or a directory of them (plain or .gz)",
+                    "  --range     only the entries that start in bytes [START, END) of an"
+                            + " uncompressed --dat",
+                    "  --stats     write a one-row TSV: offsets covered, entries, accessions, time",
                     "  --threads   worker threads (default: the CPUs this JVM may use)",
                     "  --mapper    simple (default): the JSON REST serves; full: the store's form",
                     "",
+                    "uniparc-active writes the uniparc_map lines the indexer keeps (status not Y),",
+                    "unchanged, so that many --range runs read them once each instead of the whole map.",
+                    "",
                     "JSON lines go to stdout; progress and a summary to stderr.");
 
-    // UniProtKBEntryBuilder.UNIPARC_ID_ATTRIB, as UniParcMapper adds it
-    private static final String UNIPARC_ID_ATTRIB = UniProtKBEntryBuilder.UNIPARC_ID_ATTRIB;
+    static final String STATS_HEADER =
+            String.join(
+                    "\t",
+                    "dat",
+                    "range_start",
+                    "range_end",
+                    "first_offset",
+                    "end_offset",
+                    "entries",
+                    "with_go",
+                    "with_uniparc",
+                    "first_accession",
+                    "last_accession",
+                    "seconds");
 
     public static void main(String[] args) throws Exception {
         // Anything a library prints to System.out must not land in the JSON lines.
@@ -103,7 +126,12 @@ public final class Dat2Jsonl {
                 new BufferedOutputStream(new FileOutputStream(FileDescriptor.out), 1 << 20);
         System.setOut(System.err);
         try {
-            int status = run(parseArgs(args), jsonOut);
+            int status;
+            if (args.length > 0 && args[0].equals("uniparc-active")) {
+                status = uniparcActive(Arrays.copyOfRange(args, 1, args.length), jsonOut);
+            } else {
+                status = run(parseArgs(args), jsonOut);
+            }
             System.exit(status);
         } catch (UsageException e) {
             System.err.println(e.getMessage());
@@ -129,6 +157,10 @@ public final class Dat2Jsonl {
         Path go;
         Path gafEco;
         Path uniparc;
+        long rangeStart = 0;
+        long rangeEnd = Long.MAX_VALUE;
+        boolean ranged;
+        Path stats;
         int threads = Runtime.getRuntime().availableProcessors();
         String mapper = "simple";
     }
@@ -166,6 +198,22 @@ public final class Dat2Jsonl {
                 case "--uniparc":
                     o.uniparc = Paths.get(v);
                     break;
+                case "--range":
+                    String[] r = v.split(":", -1);
+                    try {
+                        o.rangeStart = Long.parseLong(r[0]);
+                        o.rangeEnd = Long.parseLong(r[1]);
+                    } catch (RuntimeException e) {
+                        throw new UsageException("--range is START:END, in bytes");
+                    }
+                    if (r.length != 2 || o.rangeStart < 0 || o.rangeEnd < o.rangeStart) {
+                        throw new UsageException("--range is START:END, in bytes");
+                    }
+                    o.ranged = true;
+                    break;
+                case "--stats":
+                    o.stats = Paths.get(v);
+                    break;
                 case "--threads":
                     o.threads = Integer.parseInt(v);
                     break;
@@ -184,6 +232,9 @@ public final class Dat2Jsonl {
         }
         if (!o.mapper.equals("simple") && !o.mapper.equals("full")) {
             throw new UsageException("--mapper is simple or full");
+        }
+        if (o.ranged && o.dat.getFileName().toString().endsWith(".gz")) {
+            throw new UsageException("--range needs an uncompressed --dat");
         }
         for (String f : new String[] {o.keywords, o.diseases, o.subcell}) {
             if (!Files.isRegularFile(Paths.get(f))) {
@@ -205,6 +256,7 @@ public final class Dat2Jsonl {
 
     static int run(Options o, OutputStream jsonOut) throws Exception {
         long t0 = System.nanoTime();
+        String what = o.ranged ? o.dat + " [" + o.rangeStart + ", " + o.rangeEnd + ")" : o.dat.toString();
 
         if (o.gafEco != null) {
             // Read by GOEvidences on first use (CVSystemProperties.GAF_ECO_LOCATION)
@@ -217,8 +269,8 @@ public final class Dat2Jsonl {
 
         Set<String> accessions = null;
         if (o.go != null || o.uniparc != null) {
-            accessions = primaryAccessions(o.dat);
-            log("%,d entries in %s", accessions.size(), o.dat);
+            accessions = primaryAccessions(o);
+            log("%,d entries in %s", accessions.size(), what);
         }
         Map<String, Map<String, List<Evidence>>> goEvidences =
                 o.go == null ? Map.of() : loadGoEvidences(o.go, accessions);
@@ -241,21 +293,71 @@ public final class Dat2Jsonl {
                         : UniprotKBJsonConfig.getInstance().getSimpleObjectMapper();
 
         Converter converter = new Converter(supportingData, goEvidences, uniParcIds, mapper);
-        long n = convertAll(o, converter, jsonOut);
+        Totals t = convertAll(o, converter, jsonOut);
 
         double secs = (System.nanoTime() - t0) / 1e9;
+        if (accessions != null && accessions.size() != t.entries) {
+            System.err.printf(
+                    "error: %,d entries converted, but the first pass found %,d%n",
+                    t.entries, accessions.size());
+            return 1;
+        }
         log(
-                "done: %,d entries in %.0f s (%,.0f/s); GO evidences added to %,d, UniParc id to %,d",
-                n, secs, n / secs, converter.withGo.get(), converter.withUniParc.get());
+                "done: %,d entries in %.0f s (%,.0f/s); GO evidences added to %,d, UniParc id to %,d;"
+                        + " bytes [%d, %d)",
+                t.entries,
+                secs,
+                t.entries / secs,
+                converter.withGo.get(),
+                converter.withUniParc.get(),
+                t.firstOffset,
+                t.endOffset);
+        if (o.stats != null) {
+            String row =
+                    String.join(
+                            "\t",
+                            o.dat.toString(),
+                            Long.toString(o.rangeStart),
+                            o.ranged ? Long.toString(o.rangeEnd) : "",
+                            Long.toString(t.firstOffset),
+                            Long.toString(t.endOffset),
+                            Long.toString(t.entries),
+                            Long.toString(converter.withGo.get()),
+                            Long.toString(converter.withUniParc.get()),
+                            t.firstAccession == null ? "" : t.firstAccession,
+                            t.lastAccession == null ? "" : t.lastAccession,
+                            String.format("%.1f", secs));
+            Files.writeString(o.stats, STATS_HEADER + "\n" + row + "\n");
+        }
         return 0;
     }
 
+    static final class Totals {
+        long entries;
+        long firstOffset;
+        long endOffset;
+        String firstAccession;
+        String lastAccession;
+    }
+
+    static final class Converted {
+        final String accession;
+        final byte[] json;
+
+        Converted(String accession, byte[] json) {
+            this.accession = accession;
+            this.json = json;
+        }
+    }
+
+    private static final Converted END = new Converted(null, null);
+
     /** Reads entries in order, converts them on a thread pool, writes them in input order. */
-    static long convertAll(Options o, Converter converter, OutputStream out) throws Exception {
+    static Totals convertAll(Options o, Converter converter, OutputStream out) throws Exception {
         ExecutorService pool = Executors.newFixedThreadPool(o.threads);
-        BlockingQueue<Future<byte[]>> pending = new ArrayBlockingQueue<>(o.threads * 256);
+        BlockingQueue<Future<Converted>> pending = new ArrayBlockingQueue<>(o.threads * 256);
         final Throwable[] writerError = new Throwable[1];
-        final long[] written = new long[1];
+        final Totals t = new Totals();
 
         Thread writer =
                 new Thread(
@@ -264,16 +366,19 @@ public final class Dat2Jsonl {
                                 long next = 100_000;
                                 long start = System.nanoTime();
                                 while (true) {
-                                    Future<byte[]> f = pending.take();
-                                    byte[] line = f.get();
-                                    if (line == null) {
-                                        break; // end marker
+                                    Converted c = pending.take().get();
+                                    if (c == END) {
+                                        break;
                                     }
-                                    out.write(line);
+                                    out.write(c.json);
                                     out.write('\n');
-                                    if (++written[0] == next) {
+                                    if (t.firstAccession == null) {
+                                        t.firstAccession = c.accession;
+                                    }
+                                    t.lastAccession = c.accession;
+                                    if (++t.entries == next) {
                                         double s = (System.nanoTime() - start) / 1e9;
-                                        log("%,d entries (%,.0f/s)", written[0], written[0] / s);
+                                        log("%,d entries (%,.0f/s)", t.entries, t.entries / s);
                                         next += next < 1_000_000 ? 100_000 : 1_000_000;
                                     }
                                 }
@@ -285,34 +390,28 @@ public final class Dat2Jsonl {
                         "writer");
         writer.start();
 
-        try (BufferedReader in = reader(o.dat)) {
-            StringBuilder entry = new StringBuilder(64 * 1024);
-            String line;
-            while ((line = in.readLine()) != null && writerError[0] == null) {
-                entry.append(line).append('\n');
-                if (line.equals("//")) {
-                    // UniProtKBRDDTupleReader: records split on "\n//\n", then e + "\n//\n"
-                    String text = entry.toString();
-                    entry.setLength(0);
-                    pending.put(pool.submit(() -> converter.convert(text)));
-                }
+        try (EntryReader in = new EntryReader(o.dat, o.rangeStart, o.rangeEnd)) {
+            t.firstOffset = in.firstOffset();
+            byte[] entry;
+            while (writerError[0] == null && (entry = in.next()) != null) {
+                // UTF-8, as Spark's textFile decodes it
+                String text = new String(entry, StandardCharsets.UTF_8);
+                pending.put(pool.submit(() -> converter.convert(text)));
             }
-            if (writerError[0] == null && entry.toString().trim().length() > 0) {
-                throw new IOException("input ends inside an entry (no closing //)");
-            }
+            t.endOffset = in.endOffset();
         } finally {
-            pending.put(pool.submit(() -> null));
+            pending.put(pool.submit(() -> END));
             writer.join();
             pool.shutdownNow();
         }
         if (writerError[0] != null) {
             Throwable e = writerError[0];
-            if (e instanceof java.util.concurrent.ExecutionException && e.getCause() != null) {
+            if (e instanceof ExecutionException && e.getCause() != null) {
                 e = e.getCause();
             }
             throw new RuntimeException("conversion failed: " + e.getMessage(), e);
         }
-        return written[0];
+        return t;
     }
 
     // ---- one entry -------------------------------------------------------------------------
@@ -352,7 +451,7 @@ public final class Dat2Jsonl {
                                     () -> new EntryObjectConverter(supportingData, false));
         }
 
-        byte[] convert(String text) throws Exception {
+        Converted convert(String text) throws Exception {
             UniProtKBEntry entry = parse(text);
             String accession = entry.getPrimaryAccession().getValue();
 
@@ -366,7 +465,7 @@ public final class Dat2Jsonl {
                 // UniParcMapper
                 entry =
                         UniProtKBEntryBuilder.from(entry)
-                                .extraAttributesAdd(UNIPARC_ID_ATTRIB, uniParcId)
+                                .extraAttributesAdd(UniProtKBEntryBuilder.UNIPARC_ID_ATTRIB, uniParcId)
                                 .build();
                 withUniParc.incrementAndGet();
             }
@@ -374,7 +473,7 @@ public final class Dat2Jsonl {
             int score = scaleAnnotationScore(new UniProtEntryScored(entry).score());
             entry = UniProtKBEntryBuilder.from(entry).annotationScore(score).build();
 
-            return mapper.writeValueAsBytes(entry);
+            return new Converted(accession, mapper.writeValueAsBytes(entry));
         }
 
         private UniProtKBEntry parse(String text) {
@@ -431,19 +530,18 @@ public final class Dat2Jsonl {
 
     // ---- supporting files ------------------------------------------------------------------
 
-    /** The primary accession (first AC on the first AC line) of every entry. */
-    static Set<String> primaryAccessions(Path dat) throws IOException {
+    /** The primary accession (first AC on the first AC line) of every entry to convert. */
+    static Set<String> primaryAccessions(Options o) throws IOException {
         Set<String> accs = new HashSet<>();
-        try (BufferedReader in = reader(dat)) {
-            boolean first = true;
-            String line;
-            while ((line = in.readLine()) != null) {
-                if (first && line.startsWith("AC   ")) {
-                    int end = line.indexOf(';', 5);
-                    accs.add((end < 0 ? line.substring(5) : line.substring(5, end)).trim());
-                    first = false;
-                } else if (line.equals("//")) {
-                    first = true;
+        try (EntryReader in = new EntryReader(o.dat, o.rangeStart, o.rangeEnd)) {
+            byte[] entry;
+            while ((entry = in.next()) != null) {
+                String acc = EntryReader.primaryAccession(entry);
+                if (acc == null || !accs.add(acc)) {
+                    throw new IOException(
+                            acc == null
+                                    ? "an entry without an AC line in " + o.dat
+                                    : "accession " + acc + " twice in " + o.dat);
                 }
             }
         }
@@ -508,25 +606,41 @@ public final class Dat2Jsonl {
                 .orElse(GOEvidences.INSTANCE.convertGAFToECO(gafCode).orElse(""));
     }
 
+    /** One uniparc_map line: "UPI accession status", split as uniprot-store splits it. */
+    static String[] uniParcTokens(Path file, String line) {
+        String[] tokens = line.split("\s"); // a single space, as in uniprot-store
+        if (tokens.length != 3) {
+            throw new IllegalArgumentException(
+                    "Unable to parse UniProtKBUniParcMapping line in " + file + ": " + line);
+        }
+        return tokens;
+    }
+
     /**
-     * UniProtKBUniParcMappingRDDTupleReader(active = true) + UniProtKBUniParcMapper: lines
-     * "UPI accession status"; StatusFilter keeps a line when its status is not Y ("Source data
-     * is inverted").
+     * UniProtKBUniParcMappingRDDTupleReader(active = true)'s StatusFilter: keeps a line when its
+     * status is not Y ("TODO: Source data is inverted").
      */
+    static boolean keptByIndexer(String[] tokens) {
+        boolean lineStatus = tokens[2].strip().equalsIgnoreCase("Y");
+        return !lineStatus;
+    }
+
+    static List<Path> uniParcFiles(Path path) throws IOException {
+        if (!Files.isDirectory(path)) {
+            return List.of(path);
+        }
+        try (Stream<Path> s = Files.list(path)) {
+            return s.filter(Files::isRegularFile)
+                    .filter(p -> !p.getFileName().toString().startsWith("."))
+                    .sorted()
+                    .collect(Collectors.toList());
+        }
+    }
+
+    /** The indexer's StatusFilter, then UniProtKBUniParcMapper: accession to UniParc id. */
     static Map<String, String> loadUniParcIds(Path path, Set<String> accessions)
             throws IOException {
-        List<Path> files;
-        if (Files.isDirectory(path)) {
-            try (Stream<Path> s = Files.list(path)) {
-                files =
-                        s.filter(Files::isRegularFile)
-                                .filter(p -> !p.getFileName().toString().startsWith("."))
-                                .sorted()
-                                .collect(Collectors.toList());
-            }
-        } else {
-            files = List.of(path);
-        }
+        List<Path> files = uniParcFiles(path);
         Map<String, String> out = new HashMap<>();
         long rows = 0;
         long active = 0;
@@ -536,13 +650,8 @@ public final class Dat2Jsonl {
                 String line;
                 while ((line = in.readLine()) != null) {
                     rows++;
-                    String[] tokens = line.split("\s"); // a single space, as in uniprot-store
-                    if (tokens.length != 3) {
-                        throw new IllegalArgumentException(
-                                "Unable to parse UniProtKBUniParcMapping line in " + file + ": " + line);
-                    }
-                    boolean lineStatus = tokens[2].strip().equalsIgnoreCase("Y");
-                    if (lineStatus) {
+                    String[] tokens = uniParcTokens(file, line);
+                    if (!keptByIndexer(tokens)) {
                         continue;
                     }
                     active++;
@@ -571,6 +680,36 @@ public final class Dat2Jsonl {
                                         + " would write the entry once per line)",
                                 repeated));
         return out;
+    }
+
+    /** uniparc-active: the lines loadUniParcIds keeps, unchanged, from every file. */
+    static int uniparcActive(String[] args, OutputStream out) throws Exception {
+        if (args.length != 2 || !args[0].equals("--uniparc")) {
+            throw new UsageException("uniparc-active takes --uniparc FILE|DIR");
+        }
+        Path path = Paths.get(args[1]);
+        if (!Files.exists(path)) {
+            throw new UsageException("no such file: " + path);
+        }
+        long rows = 0;
+        long kept = 0;
+        List<Path> files = uniParcFiles(path);
+        for (Path file : files) {
+            try (BufferedReader in = reader(file)) {
+                String line;
+                while ((line = in.readLine()) != null) {
+                    rows++;
+                    if (keptByIndexer(uniParcTokens(file, line))) {
+                        out.write(line.getBytes(StandardCharsets.UTF_8));
+                        out.write('\n');
+                        kept++;
+                    }
+                }
+            }
+        }
+        out.flush();
+        log("%s: %,d files, %,d rows, %,d kept by status", path, files.size(), rows, kept);
+        return 0;
     }
 
     // ---- io --------------------------------------------------------------------------------
