@@ -184,6 +184,13 @@ both validations passed, 156/156 checks.
 
 ## Results so far
 
+The whole 2026_04 lake, built on Codon from the parts (`run_lake.sh full
+--input-parts`): RELEASE_COMPLETE, validation 169/169 checks passed, and no
+table or column differences from the 2026_03 lake built from the REST dump.
+`FROM_PARTS` took 12 min where `STREAM_JSONL` takes about 3.5 h; the run took
+6 h 51 min from submission to RELEASE_COMPLETE (plus dat2jsonl's ~15 min
+conversion), and it needs no REST download.
+
 Swiss-Prot 2026_04, from the FTP's `uniprot_sprot.dat.gz` and the docs
 files, against REST's JSON for the same release (`compare_json.py`, strict:
 values, JSON types and key order):
