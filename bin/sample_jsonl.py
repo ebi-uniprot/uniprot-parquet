@@ -28,7 +28,7 @@ import argparse
 import random
 import sys
 from collections.abc import Callable, Iterable, Iterator
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 SWISSPROT_MARK = b"Swiss-Prot"
 TREMBL_MARK = b"TrEMBL"
@@ -40,7 +40,8 @@ def _open_input(path: str | None) -> BinaryIO:
         return sys.stdin.buffer
     if path.endswith(".zst"):
         import zstandard as zstd
-        return zstd.ZstdDecompressor().stream_reader(open(path, "rb"))
+        # cast: zstandard is untyped where its stubs are not installed (CI's lint job)
+        return cast(BinaryIO, zstd.ZstdDecompressor().stream_reader(open(path, "rb")))
     return open(path, "rb")
 
 

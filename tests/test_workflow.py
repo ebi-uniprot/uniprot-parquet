@@ -370,7 +370,8 @@ def test_provenance_identifies_the_source_dump(launch_dir: pathlib.Path) -> None
 def _decompressed(path: pathlib.Path) -> bytes:
     import zstandard as zstd
     with open(path, "rb") as f:
-        return zstd.ZstdDecompressor().stream_reader(f).read()
+        data: bytes = zstd.ZstdDecompressor().stream_reader(f).read()
+    return data
 
 
 def _parquet_tables(release_dir: pathlib.Path) -> dict[str, tuple[object, dict[bytes, bytes]]]:

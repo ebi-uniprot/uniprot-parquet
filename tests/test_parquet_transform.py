@@ -1617,7 +1617,8 @@ class TestSortKeepsLines:
         result = run_bin("sort_jsonl.py", src, "-o", out, "--memory-limit", "4GB")
         assert result.returncode == 0, result.stderr
         with open(out, "rb") as f:
-            return zstd.ZstdDecompressor().stream_reader(f).read().decode().splitlines()
+            data: bytes = zstd.ZstdDecompressor().stream_reader(f).read()
+        return data.decode().splitlines()
 
     def test_lines_are_unchanged(self, tmp_path: Path) -> None:
         entries = _small_entries()
