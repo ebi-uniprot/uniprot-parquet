@@ -152,8 +152,48 @@ entries.
 
 ## Into the lake
 
-A finished output (with `COMPLETE`) is an input of the lake pipeline in
-place of a REST dump:
+### As a stage of the pipeline (`--input_dat`)
+
+The pipeline converts the release's flat files itself, given UniProt's
+release directory, a local `gaf-eco-mapping.txt` and the built jar:
+
+```bash
+./run_lake.sh full --input-dat /hps/software/users/martin/uniprot/uapi/source_data/2026_04/uniprot \
+    --gaf-eco $FFC/gaf-eco-mapping.txt \
+    --expected-count 154222205 --release 2026_04 --previous-manifest ... \
+    --outdir $SCRATCH/uniprot_parquet --duckdb-tmp $SCRATCH/duckdb_tmp
+```
+
+(`--dat2jsonl-jar` if the jar is not `dat2jsonl/target/dat2jsonl.jar`;
+`nextflow run upjson2lake.nf --input_dat DIR --gaf_eco FILE` underneath.)
+Three processes replace `STREAM_JSONL`, the same steps as `slurm/` but under
+Nextflow, so `-resume` reuses every finished range:
+
+1. `UNIPARC_ACTIVE`: the `uniparc_map/` lines the indexer keeps, once;
+2. `DAT2JSONL`: one task per byte range (`--dat_chunk_gb`, 5; `--dat_cpus`
+   8, `--dat_memory` 16 GB, `--dat_forks` 20 at a time), a part and its
+   stats each;
+3. `FROM_DAT`: `parts_input.py check` proves from the stats that the ranges
+   cover every `.dat` once and add up to `--expected-count` (`check.sh`'s
+   check), then the parts are joined as `FROM_PARTS` joins them.
+
+`provenance.json` records the stage (`inputs.source.kind`: `dat2jsonl
+stage`), the release directory, the jar's checksum and uniprot-core version,
+the files' sizes and dates, and the check. `--dat_files` converts other flat
+files than `uniprot_sprot.dat` and `uniprot_trembl.dat`.
+
+Checked locally: 2,000 Swiss-Prot entries through the stage (4 ranges) give
+the lake built from REST's JSON for the same entries (sorted JSONL
+byte-identical, the same Parquet files, 156/156 checks); all of Swiss-Prot
+through the stage in 15 ranges, with decoy `Y` lines in the UniParc map,
+joins to exactly the JSONL that matched REST. `tests/test_workflow.py`
+builds a lake through the stage when `DAT2JSONL_TEST_SRC` names a small
+release directory (and `gaf-eco-mapping.txt` in it) and the jar is built.
+
+### From a finished output (`--input_parts`)
+
+A finished output of `slurm/submit.sh` (with `COMPLETE`) is an input of the
+lake pipeline in place of a REST dump:
 
 ```bash
 ./run_lake.sh full --input-parts $SCRATCH/dat2jsonl_2026_04 \

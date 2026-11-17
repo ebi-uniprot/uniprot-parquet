@@ -101,6 +101,74 @@ class TestInputParts:
         assert not args_file.exists(), "nextflow was launched"
 
 
+class TestInputDat:
+    """--input-dat: the release's flat files, converted in the pipeline."""
+
+    @pytest.fixture
+    def release(self, tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+        """(release directory, gaf-eco-mapping.txt, jar): stand-ins, enough for the checks."""
+        src = tmp_path / "uniprot"
+        src.mkdir()
+        gaf, jar = tmp_path / "gaf-eco-mapping.txt", tmp_path / "dat2jsonl.jar"
+        gaf.touch()
+        jar.touch()
+        return src, gaf, jar
+
+    def test_reaches_nextflow_with_its_files(self, stub: Stub, release: tuple[pathlib.Path, ...]) -> None:
+        run, args_file = stub
+        src, gaf, jar = release
+        result = run("--input-dat", str(src), "--gaf-eco", str(gaf), "--dat2jsonl-jar", str(jar),
+                     "--expected-count", "52", "--first-release", mode="full")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "(flat files, dat2jsonl here)" in result.stdout
+        args = args_file.read_text().splitlines()
+        assert args[args.index("--input_dat") + 1] == str(src)
+        assert args[args.index("--gaf_eco") + 1] == str(gaf)
+        assert args[args.index("--dat2jsonl_jar") + 1] == str(jar)
+        assert "--inputfile" not in args and "--input_parts" not in args
+
+    def test_without_gaf_eco_is_refused(self, stub: Stub, release: tuple[pathlib.Path, ...]) -> None:
+        run, args_file = stub
+        src, _, jar = release
+        result = run("--input-dat", str(src), "--dat2jsonl-jar", str(jar))
+        assert result.returncode != 0
+        assert "needs --gaf-eco" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+    def test_missing_jar_is_refused(self, stub: Stub, release: tuple[pathlib.Path, ...]) -> None:
+        run, args_file = stub
+        src, gaf, jar = release
+        result = run("--input-dat", str(src), "--gaf-eco", str(gaf), "--dat2jsonl-jar", str(jar.with_name("no.jar")))
+        assert result.returncode != 0
+        assert "jar not found" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+    def test_missing_directory_is_refused(self, stub: Stub, release: tuple[pathlib.Path, ...]) -> None:
+        run, args_file = stub
+        src, gaf, jar = release
+        result = run("--input-dat", str(src / "nowhere"), "--gaf-eco", str(gaf), "--dat2jsonl-jar", str(jar))
+        assert result.returncode != 0
+        assert "Release directory not found" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+    @pytest.mark.parametrize("other", [("--input", "tests/fixtures/small.json.gz"), ("--input-parts", "x")])
+    def test_with_another_input_is_refused(self, stub: Stub, release: tuple[pathlib.Path, ...],
+                                           other: tuple[str, str]) -> None:
+        run, args_file = stub
+        src, gaf, _ = release
+        result = run("--input-dat", str(src), "--gaf-eco", str(gaf), *other)
+        assert result.returncode != 0
+        assert "give one" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+    def test_gaf_eco_without_input_dat_is_refused(self, stub: Stub, release: tuple[pathlib.Path, ...]) -> None:
+        run, args_file = stub
+        result = run("--gaf-eco", str(release[1]))
+        assert result.returncode != 0
+        assert "go with --input-dat" in result.stdout + result.stderr
+        assert not args_file.exists(), "nextflow was launched"
+
+
 class TestPreviousManifest:
     def test_missing_file_is_refused_by_name(self, stub: Stub) -> None:
         run, args_file = stub

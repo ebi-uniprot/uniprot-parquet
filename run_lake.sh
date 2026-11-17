@@ -10,6 +10,9 @@
 #   ./run_lake.sh full ... --input /path/to/UniProtKB.json.gz --outdir /scratch/results --release 2026_04
 #   ./run_lake.sh full ... --input-parts /scratch/dat2jsonl_2026_04  # a finished dat2jsonl output (dat2jsonl/)
 #                                                         # instead of a REST dump
+#   ./run_lake.sh full ... --input-dat .../source_data/2026_04/uniprot --gaf-eco gaf-eco-mapping.txt
+#                                                         # the release's flat files, converted in the
+#                                                         # pipeline (dat2jsonl/target/dat2jsonl.jar)
 
 # Prerequisites:
 #   Activate your conda/mamba environment before running this script.
@@ -32,6 +35,9 @@ fi
 # ─── Parse optional flags ─────────────────────────────────────────
 INPUTFILE_OVERRIDE=""
 INPUT_PARTS=""
+INPUT_DAT=""
+GAF_ECO=""
+DAT2JSONL_JAR=""
 OUTDIR_OVERRIDE=""
 DUCKDB_TEMP_OVERRIDE=""
 EXPECTED_COUNT=""
@@ -45,6 +51,9 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --input)          INPUTFILE_OVERRIDE="$2";   shift 2 ;;
         --input-parts)    INPUT_PARTS="$2";          shift 2 ;;
+        --input-dat)      INPUT_DAT="$2";            shift 2 ;;
+        --gaf-eco)        GAF_ECO="$2";              shift 2 ;;
+        --dat2jsonl-jar)  DAT2JSONL_JAR="$2";        shift 2 ;;
         --outdir)         OUTDIR_OVERRIDE="$2";      shift 2 ;;
         --duckdb-tmp)     DUCKDB_TEMP_OVERRIDE="$2"; shift 2 ;;
         --expected-count) EXPECTED_COUNT="$2";        shift 2 ;;
@@ -81,7 +90,7 @@ case "$MODE" in
         PROFILE="prod"
         ;;
     *)
-        echo "Usage: $0 {small|subset|full} [--input FILE | --input-parts DIR] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL] [--previous-manifest FILE | --first-release] [--max-time DURATION] [--queue PARTITION]"
+        echo "Usage: $0 {small|subset|full} [--input FILE | --input-parts DIR | --input-dat DIR --gaf-eco FILE [--dat2jsonl-jar FILE]] [--outdir DIR] [--duckdb-tmp DIR] [--expected-count N] [--release LABEL] [--previous-manifest FILE | --first-release] [--max-time DURATION] [--queue PARTITION]"
         exit 1
         ;;
 esac
@@ -112,9 +121,17 @@ if [[ "$MODE" == "full" && -z "$PREVIOUS_MANIFEST" && -z "$FIRST_RELEASE" ]]; th
     exit 1
 fi
 
-# --input-parts replaces the REST dump with a dat2jsonl output: not both.
-if [[ -n "$INPUT_PARTS" && -n "$INPUTFILE_OVERRIDE" ]]; then
-    echo "ERROR: --input and --input-parts are two inputs: give one."
+# --input-parts and --input-dat replace the REST dump: one input only.
+N_INPUTS=0
+for given in "$INPUTFILE_OVERRIDE" "$INPUT_PARTS" "$INPUT_DAT"; do
+    [[ -n "$given" ]] && N_INPUTS=$(( N_INPUTS + 1 ))
+done
+if (( N_INPUTS > 1 )); then
+    echo "ERROR: --input, --input-parts and --input-dat are three inputs: give one."
+    exit 1
+fi
+if [[ -z "$INPUT_DAT" && ( -n "$GAF_ECO" || -n "$DAT2JSONL_JAR" ) ]]; then
+    echo "ERROR: --gaf-eco and --dat2jsonl-jar go with --input-dat."
     exit 1
 fi
 
@@ -128,6 +145,7 @@ fi
 TITLE="UniProtKB → Parquet Data Lake"
 INPUT_ROW="$INPUTFILE"
 [[ -n "$INPUT_PARTS" ]] && INPUT_ROW="$INPUT_PARTS (dat2jsonl parts)"
+[[ -n "$INPUT_DAT" ]] && INPUT_ROW="$INPUT_DAT (flat files, dat2jsonl here)"
 ROWS=("Mode:      $MODE" "Release:   $RELEASE" "Input:     $INPUT_ROW"
       "Output:    $OUTDIR" "Memory:    $MEMORY" "Profile:   $PROFILE")
 [[ "$PROFILE" == local ]] || ROWS+=("Queue:     ${QUEUE:-the profile's (prod: the cluster's default)}")
@@ -146,7 +164,23 @@ echo ""
 
 # Pre-flight: verify the input exists before submitting to SLURM.  A
 # dat2jsonl output must have passed its check (COMPLETE, written by check.sh).
-if [[ -n "$INPUT_PARTS" ]]; then
+if [[ -n "$INPUT_DAT" ]]; then
+    DAT2JSONL_JAR="${DAT2JSONL_JAR:-dat2jsonl/target/dat2jsonl.jar}"
+    if [[ ! -d "$INPUT_DAT" ]]; then
+        echo "ERROR: Release directory not found: $INPUT_DAT" >&2
+        exit 1
+    fi
+    if [[ -z "$GAF_ECO" || ! -f "$GAF_ECO" ]]; then
+        echo "ERROR: --input-dat needs --gaf-eco, a local gaf-eco-mapping.txt (${GAF_ECO:-not given})." >&2
+        echo "  https://raw.githubusercontent.com/evidenceontology/evidenceontology/master/gaf-eco-mapping.txt" >&2
+        exit 1
+    fi
+    if [[ ! -f "$DAT2JSONL_JAR" ]]; then
+        echo "ERROR: dat2jsonl jar not found: $DAT2JSONL_JAR" >&2
+        echo "  Build it (mvn -B -q package -f dat2jsonl/pom.xml) or pass --dat2jsonl-jar." >&2
+        exit 1
+    fi
+elif [[ -n "$INPUT_PARTS" ]]; then
     if [[ ! -d "$INPUT_PARTS" ]]; then
         echo "ERROR: dat2jsonl output not found: $INPUT_PARTS" >&2
         echo "  (resolved from working directory: $(pwd))" >&2
@@ -196,8 +230,10 @@ NF_CMD=(
     -resume
 )
 
-# The input: a dat2jsonl output's parts, or a REST dump
-if [[ -n "$INPUT_PARTS" ]]; then
+# The input: the release's flat files, a dat2jsonl output's parts, or a REST dump
+if [[ -n "$INPUT_DAT" ]]; then
+    NF_CMD+=(--input_dat "$INPUT_DAT" --gaf_eco "$GAF_ECO" --dat2jsonl_jar "$DAT2JSONL_JAR")
+elif [[ -n "$INPUT_PARTS" ]]; then
     NF_CMD+=(--input_parts "$INPUT_PARTS")
 else
     NF_CMD+=(--inputfile "$INPUTFILE")

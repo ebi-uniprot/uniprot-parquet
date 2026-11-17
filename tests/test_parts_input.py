@@ -88,3 +88,65 @@ def test_count_unlike_the_parts_or_the_expected_one_is_refused(tmp_path: pathlib
     _refused(run_bin("parts_input.py", *args, "--entry-count", n - 1), "their stats say 52")
     _refused(run_bin("parts_input.py", *args, "--entry-count", n, "--expected-count", n + 1), "expected 53")
     assert not (tmp_path / "m.json").exists()
+
+
+# ─── check: do the parts cover every .dat once? (FROM_DAT, --input_dat) ──
+
+
+def _check(outdir: pathlib.Path, *args: object) -> subprocess.CompletedProcess[str]:
+    return run_bin("parts_input.py", "check", outdir, *args)
+
+
+def test_check_passes_parts_that_tile_the_file(tmp_path: pathlib.Path) -> None:
+    out = tmp_path / "out"
+    make_parts_output(SMALL_JSON_GZ, str(out), n_parts=3, complete=False)
+    result = _check(out, "--expected-count", 52)
+    assert result.returncode == 0, result.stderr
+    report = (out / "CHECK.txt").read_text().splitlines()
+    assert report[-1] == "CHECK PASSED" and "expected 52 entries: matches" in report
+    assert any(line.endswith("52 entries, every byte covered once") for line in report)
+    assert (out / "COMPLETE").exists()
+    # and the output is then FROM_PARTS's input
+    assert run_bin("parts_input.py", "parts", out).returncode == 0
+
+
+def _edit_stats(out: pathlib.Path, part: str, column: str, value: str) -> None:
+    path = out / "parts" / f"{part}.stats.tsv"
+    header, row = path.read_text().splitlines()[:2]
+    names, values = header.split("\t"), row.split("\t")
+    values[names.index(column)] = value
+    path.write_text(header + "\n" + "\t".join(values) + "\n")
+
+
+def _failed(out: pathlib.Path, result: subprocess.CompletedProcess[str], why: str) -> None:
+    assert result.returncode == 1
+    report = (out / "CHECK.txt").read_text()
+    assert why in report and report.rstrip().endswith("CHECK FAILED"), report
+    assert not (out / "COMPLETE").exists()
+
+
+def test_check_fails_a_gap_between_parts(tmp_path: pathlib.Path) -> None:
+    out = tmp_path / "out"
+    make_parts_output(SMALL_JSON_GZ, str(out), n_parts=3)   # COMPLETE from before: removed
+    _edit_stats(out, "part-00002", "first_offset", "1")
+    _failed(out, _check(out), "GAP")
+
+
+def test_check_fails_a_last_part_short_of_the_file(tmp_path: pathlib.Path) -> None:
+    out = tmp_path / "out"
+    make_parts_output(SMALL_JSON_GZ, str(out), complete=False)
+    _edit_stats(out, "part-00002", "end_offset", "100")
+    _failed(out, _check(out), "file is")
+
+
+def test_check_fails_a_missing_part(tmp_path: pathlib.Path) -> None:
+    out = tmp_path / "out"
+    make_parts_output(SMALL_JSON_GZ, str(out), complete=False)
+    (out / "parts" / "part-00001.stats.tsv").unlink()
+    _failed(out, _check(out), "MISSING 1 parts: part-00001")
+
+
+def test_check_fails_a_count_unlike_the_expected_one(tmp_path: pathlib.Path) -> None:
+    out = tmp_path / "out"
+    make_parts_output(SMALL_JSON_GZ, str(out), complete=False)
+    _failed(out, _check(out, "--expected-count", 53), "EXPECTED 53 entries, got 52 (-1)")

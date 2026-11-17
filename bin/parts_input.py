@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-A finished dat2jsonl output as the pipeline's input (FROM_PARTS, --input_parts).
+A dat2jsonl output as the pipeline's input: a finished one (FROM_PARTS,
+--input_parts), or the one the pipeline makes itself (FROM_DAT, --input_dat).
 
 dat2jsonl (dat2jsonl/, UniProt's own code over the release's flat files)
 writes OUTDIR/parts/part-NNNNN.jsonl.zst, one per byte range of each .dat in
@@ -9,22 +10,32 @@ parts in plan order are the release's entries in .dat order, one JSON line
 each; zstd frames concatenate, so joined they are the JSONL STREAM_JSONL
 would have made from a REST dump.
 
+  parts_input.py check OUTDIR [--expected-count E]
+      dat2jsonl/slurm/check.sh's check, for the parts the pipeline makes: from
+      the stats alone, every .dat in plan.tsv is covered once (in plan order,
+      its first entry starts at byte 0, each part's last entry ends where the
+      next part's first starts, the last ends at the file's size) and the
+      entries add up to E if given.  Writes OUTDIR/CHECK.txt, and
+      OUTDIR/COMPLETE if it passes (exit 0), else exit 1.
+
   parts_input.py parts OUTDIR
       Refuse an output whose check has not passed (no COMPLETE, CHECK.txt
       not ending "CHECK PASSED", a plan row without its part or stats); print
       the parts' paths in plan order, one a line.
 
   parts_input.py manifest OUTDIR --jsonl JOINED --entry-count N
-                 [--expected-count E] -o input_manifest.json
+                 [--expected-count E] [--kind K] [--directory D] -o input_manifest.json
       N is the joined JSONL's line count; it must equal the parts' own counts
       (their stats) and E if given.  Writes what the release was built from,
-      with JOINED's SHA-256, which provenance.json records under inputs.source.
+      with JOINED's SHA-256, which provenance.json records under inputs.source
+      (kind: dat2jsonl, or K; directory: OUTDIR's absolute path, or D).
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import sys
@@ -67,6 +78,57 @@ def checked_parts(outdir: Path) -> list[tuple[dict[str, str], Path, Path]]:
     return out
 
 
+def check(outdir: Path, expected_count: int | None) -> tuple[bool, list[str]]:
+    """Whether the parts cover every .dat once, and the report's lines."""
+    rows = plan_rows(outdir)
+    report = [f"dat2jsonl check: {outdir}"]
+    missing: list[str] = []
+    by_dat: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        stats_file = outdir / "parts" / f"{row['part']}.stats.tsv"
+        part = outdir / "parts" / f"{row['part']}.jsonl.zst"
+        if not stats_file.is_file() or not part.is_file():
+            missing.append(row["part"])
+            continue
+        by_dat.setdefault(row["dat"], []).append(stats_row(stats_file))
+    ok = not missing and bool(rows)
+    if missing:
+        report.append(f"MISSING {len(missing)} parts: {' '.join(missing)}")
+    if not rows:
+        report.append("MISSING: plan.tsv lists no parts")
+    total = with_go = with_uniparc = 0
+    for dat in dict.fromkeys(r["dat"] for r in rows):   # plan order
+        dat_stats = by_dat.get(dat, [])
+        if not dat_stats:
+            continue
+        size = os.stat(dat).st_size
+        gaps = []
+        if int(dat_stats[0]["first_offset"]) != 0:
+            gaps.append(f"GAP {dat}: first entry at {dat_stats[0]['first_offset']}, not 0")
+        for a, b in itertools.pairwise(dat_stats):
+            if a["end_offset"] != b["first_offset"]:
+                gaps.append(f"GAP {dat}: a part ends at {a['end_offset']}, the next starts at {b['first_offset']}")
+        if int(dat_stats[-1]["end_offset"]) != size:
+            gaps.append(f"GAP {dat}: last entry ends at {dat_stats[-1]['end_offset']}, file is {size} bytes")
+        n = sum(int(s["entries"]) for s in dat_stats)
+        total += n
+        with_go += sum(int(s["with_go"]) for s in dat_stats)
+        with_uniparc += sum(int(s["with_uniparc"]) for s in dat_stats)
+        report += gaps
+        report.append(f"{dat}: {n} entries{'' if gaps else ', every byte covered once'}")
+        ok = ok and not gaps
+    report.append(f"total: {total} entries; GO evidences on {with_go}; UniParc id on {with_uniparc} "
+                  f"({total - with_uniparc} without)")
+    if expected_count is not None:
+        if total == expected_count:
+            report.append(f"expected {expected_count} entries: matches")
+        else:
+            report.append(f"EXPECTED {expected_count} entries, got {total} ({total - expected_count:+d})")
+            ok = False
+    report.append("CHECK PASSED" if ok else "CHECK FAILED")
+    return ok, report
+
+
 def stats_row(stats: Path) -> dict[str, str]:
     header, row = stats.read_text().splitlines()[:2]
     return dict(zip(header.split("\t"), row.split("\t"), strict=True))
@@ -80,7 +142,8 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def manifest(outdir: Path, jsonl: Path, entry_count: int, expected_count: int | None) -> dict[str, Any]:
+def manifest(outdir: Path, jsonl: Path, entry_count: int, expected_count: int | None,
+             kind: str = "dat2jsonl", directory: str | None = None) -> dict[str, Any]:
     parts = checked_parts(outdir)
     per_dat: dict[str, dict[str, Any]] = {}
     total = 0
@@ -103,8 +166,8 @@ def manifest(outdir: Path, jsonl: Path, entry_count: int, expected_count: int | 
         return p.read_text().splitlines() if p.is_file() else []
 
     return {
-        "kind": "dat2jsonl",
-        "directory": str(outdir.resolve()),
+        "kind": kind,
+        "directory": directory or str(outdir.resolve()),
         "entry_count": entry_count,
         "expected_count": expected_count,
         "jsonl_sha256": sha256_of(jsonl),   # the parts joined in plan order, as SORT_JSONL reads them
@@ -118,6 +181,9 @@ def manifest(outdir: Path, jsonl: Path, entry_count: int, expected_count: int | 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check", help="do the parts cover every .dat once? CHECK.txt, COMPLETE")
+    c.add_argument("outdir", type=Path)
+    c.add_argument("--expected-count", type=int, default=None)
     p = sub.add_parser("parts", help="the checked parts, in plan order")
     p.add_argument("outdir", type=Path)
     m = sub.add_parser("manifest", help="the input manifest, after the joined parts are counted")
@@ -125,14 +191,24 @@ def main() -> int:
     m.add_argument("--jsonl", type=Path, required=True, help="the parts joined")
     m.add_argument("--entry-count", type=int, required=True)
     m.add_argument("--expected-count", type=int, default=None)
+    m.add_argument("--kind", default="dat2jsonl")
+    m.add_argument("--directory", default=None, help="recorded instead of OUTDIR's absolute path")
     m.add_argument("-o", "--output", required=True)
     a = ap.parse_args()
     try:
-        if a.cmd == "parts":
+        if a.cmd == "check":
+            (a.outdir / "COMPLETE").unlink(missing_ok=True)
+            ok, report = check(a.outdir, a.expected_count)
+            (a.outdir / "CHECK.txt").write_text("\n".join(report) + "\n")
+            print("\n".join(report), file=sys.stderr)
+            if not ok:
+                return 1
+            (a.outdir / "COMPLETE").touch()
+        elif a.cmd == "parts":
             for _, part, _ in checked_parts(a.outdir):
                 print(os.fspath(part))
         else:
-            doc = manifest(a.outdir, a.jsonl, a.entry_count, a.expected_count)
+            doc = manifest(a.outdir, a.jsonl, a.entry_count, a.expected_count, a.kind, a.directory)
             with open(a.output, "w") as f:
                 json.dump(doc, f, indent=2)
                 f.write("\n")

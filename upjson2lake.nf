@@ -13,9 +13,11 @@
 //   RELEASE_COMPLETE                  (written last, only after validation passed)
 //
 // Architecture:
-//   1. Stream JSON(.gz) → single zstd-compressed JSONL (STREAM_JSONL); or, with
-//      --input_parts, join a finished dat2jsonl output's parts (FROM_PARTS):
-//      the same JSONL, converted from UniProt's flat files with its own code
+//   1. Stream JSON(.gz) → single zstd-compressed JSONL (STREAM_JSONL); or the
+//      same JSONL converted from UniProt's flat files with its own code
+//      (dat2jsonl/): with --input_dat, here (UNIPARC_ACTIVE, DAT2JSONL per byte
+//      range of each .dat, FROM_DAT), or with --input_parts, a finished
+//      dat2jsonl output's parts joined (FROM_PARTS)
 //   2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (Swiss-Prot first)
 //   3. Transform sorted JSONL → sorted Parquet tables via DuckDB + PyArrow, in three
 //      processes so a re-run reuses each finished phase: INFER_SCHEMA (the columns),
@@ -38,6 +40,14 @@
 /* ── PARAMS ────────────────────────────────────────────────────────── */
 params.inputfile      = "${projectDir}/tests/fixtures/small.json.gz"
 params.input_parts    = null      // A finished dat2jsonl output (dat2jsonl/slurm/submit.sh's OUTDIR, COMPLETE): used instead of inputfile
+params.input_dat      = null      // UniProt's release directory (source_data/<release>/uniprot): its .dat converted here, instead of inputfile
+params.dat_files      = null      // with input_dat: the flat files, comma-separated (null: uniprot_sprot.dat,uniprot_trembl.dat in input_dat)
+params.gaf_eco        = null      // with input_dat: a local gaf-eco-mapping.txt (compute nodes cannot download it)
+params.dat2jsonl_jar  = "${projectDir}/dat2jsonl/target/dat2jsonl.jar"   // with input_dat: built with mvn package -f dat2jsonl/pom.xml
+params.dat_chunk_gb   = 5         // with input_dat: bytes of .dat per DAT2JSONL task, in GB
+params.dat_forks      = 20        // with input_dat: DAT2JSONL tasks at a time (each reads its range of the .dat twice)
+params.dat_cpus       = 8         // with input_dat: CPUs per DAT2JSONL task
+params.dat_memory     = '16 GB'   // with input_dat: memory per DAT2JSONL task (three quarters of it the Java heap)
 params.outdir         = "${projectDir}/results/uniprot_parquet"   // also in nextflow.config (report paths)
 params.release        = "2026_03"
 params.process_memory = '96 GB'   // Total memory for heavy processes (Nextflow directive)
@@ -105,6 +115,9 @@ def bin_modules(String process) {
     [
         STREAM_JSONL:      [],
         FROM_PARTS:        [],
+        UNIPARC_ACTIVE:    [],
+        DAT2JSONL:         [],
+        FROM_DAT:          [],
         SORT_JSONL:        ['duckdb_util.py'],
         INFER_SCHEMA:      ['duckdb_util.py'],
         STAGE_PARQUET:     ['duckdb_util.py'],
@@ -189,6 +202,95 @@ def spill_flag() {
 // This allows the pipeline to run from remote URLs (e.g. GitHub).
 
 
+/* ── dat2jsonl: the release's flat files as the input (--input_dat) ── */
+
+// The flat files to convert: --dat_files, or Swiss-Prot and TrEMBL in input_dat.
+def dat_files() {
+    def names = params.dat_files ? params.dat_files.toString().tokenize(',')
+                                 : ['uniprot_sprot.dat', 'uniprot_trembl.dat'].collect { n -> "${params.input_dat}/${n}" }
+    names.collect { n -> file(n.trim()).toAbsolutePath() }
+}
+
+// One DAT2JSONL task per byte range [start, end) of each .dat, --dat_chunk_gb
+// each: [part name, .dat, start, end], in file order.  A task converts the
+// entries whose first byte is in its range, so the ranges give every entry
+// once; FROM_DAT checks that they did.
+def dat_ranges() {
+    def chunk = ((params.dat_chunk_gb as BigDecimal) * 1000000000G).longValue()
+    def rows = []
+    dat_files().each { f ->
+        def size = f.size()
+        def n = ((size + chunk - 1).intdiv(chunk)) as int
+        (0..<n).each { i ->
+            def start = i * chunk
+            rows << [f, start, [start + chunk, size].min()]
+        }
+    }
+    def i = 0
+    rows.collect { r -> i += 1; [String.format('part-%05d', i), r[0], r[1], r[2]] }
+}
+
+// plan.tsv's text, as dat2jsonl/slurm/submit.sh writes it.
+def dat_plan_text() {
+    def i = 0
+    (['task\tdat\tstart\tend\tpart'] + dat_ranges().collect { r -> i += 1; "${i}\t${r[1]}\t${r[2]}\t${r[3]}\t${r[0]}" }).join('\n')
+}
+
+def sha256_hex(path) {
+    java.security.MessageDigest.getInstance('SHA-256').digest(file(path).bytes).encodeHex().toString()
+}
+
+// The uniprot-core version the jar was built with (its ff-parser's pom.properties).
+def uniprot_core_version(jar) {
+    def zip = new java.util.zip.ZipFile(file(jar).toFile())
+    def entry = zip.getEntry('META-INF/maven/org.uniprot/ff-parser/pom.properties')
+    def props = new Properties()
+    if (entry) {
+        props.load(zip.getInputStream(entry))
+    }
+    zip.close()
+    props.getProperty('version', 'unknown')
+}
+
+def described(f) {
+    "${f.size()} bytes, modified ${java.time.Instant.ofEpochMilli(f.lastModified())}"
+}
+
+// inputs.txt's text: what made the parts, recorded in provenance.json.
+def dat_inputs_text() {
+    def lines = ["SRC: ${params.input_dat}",
+                 "jar sha256: ${sha256_hex(params.dat2jsonl_jar)}",
+                 "uniprot-core: ${uniprot_core_version(params.dat2jsonl_jar)}",
+                 "gaf-eco-mapping.txt sha256: ${sha256_hex(params.gaf_eco)}",
+                 "dat_chunk_gb: ${params.dat_chunk_gb}"]
+    dat_files().each { f -> lines << "dat: ${f} ${described(f)}" }
+    ['keywlist.txt', 'humdisease.txt', 'subcell.txt', 'go/GO.dr_extended'].each { n ->
+        lines << "${n}: ${described(file("${params.input_dat}/${n}"))}"
+    }
+    lines.join('\n')
+}
+
+// FROM_PARTS's and FROM_DAT's join of a checked dat2jsonl output (dir): the
+// parts in plan order (zstd frames concatenate, so a copy), their lines
+// counted (decompressing them all also checks every frame), and
+// input_manifest.json, which refuses a count unlike the parts' own or
+// --expected_count.
+def join_parts_script(String dir, String kind, String directory) {
+    def expected_flag = params.expected_count ? "--expected-count ${params.expected_count}" : ''
+    def directory_flag = directory ? "--directory '${directory}'" : ''
+    """
+    parts_input.py parts ${dir} > parts.txt
+    echo "  \$(wc -l < parts.txt) parts"
+    while IFS= read -r part; do cat "\$part"; done < parts.txt > uniprot.jsonl.zst
+    COUNT=\$(zstd -dc uniprot.jsonl.zst | wc -l | tr -d ' ')
+    parts_input.py manifest ${dir} --jsonl uniprot.jsonl.zst --entry-count "\$COUNT" ${expected_flag} \\
+        --kind '${kind}' ${directory_flag} -o input_manifest.json
+    echo "\$COUNT" > entry_count.txt
+    echo "  Verified: \$COUNT lines, the parts' own count${params.expected_count ? ' and the expected count' : ''}"
+    """
+}
+
+
 /* ── PROCESS: Stream input to single zstd-compressed JSONL ────────── */
 // Emits a sidecar entry_count.txt that VALIDATE checks the sorted JSONL and
 // the entries table against — the one count taken upstream of SORT_JSONL.
@@ -267,22 +369,127 @@ process FROM_PARTS {
     path "input_manifest.json", emit: input_manifest
 
     script:
-    def expected_flag = params.expected_count ? "--expected-count ${params.expected_count}" : ''
     """
     set -euo pipefail
     echo " .-- FROM_PARTS BEGUN \$(date)"
 
-    parts_input.py parts ${parts_dir} > parts.txt
-    echo "  \$(wc -l < parts.txt) parts"
-    while IFS= read -r part; do cat "\$part"; done < parts.txt > uniprot.jsonl.zst
-    # Decompressing it all checks every frame as well as counting the lines
-    COUNT=\$(zstd -dc uniprot.jsonl.zst | wc -l | tr -d ' ')
-    parts_input.py manifest ${parts_dir} --jsonl uniprot.jsonl.zst --entry-count "\$COUNT" \
-        ${expected_flag} -o input_manifest.json
-    echo "\$COUNT" > entry_count.txt
-    echo "  Verified: \$COUNT lines, the parts' own count${params.expected_count ? ' and the expected count' : ''}"
+    ${join_parts_script(parts_dir.toString(), 'dat2jsonl', null)}
 
     echo " '-- FROM_PARTS ENDED \$(date)"
+    """
+}
+
+
+/* ── PROCESS: The uniparc_map lines UniProt's indexer keeps (--input_dat) ── */
+// dat2jsonl's uniparc-active: the indexer's status filter over all of
+// uniparc_map/ (~494M lines), once, so each DAT2JSONL task reads the ~154M
+// kept lines instead of the whole map.
+process UNIPARC_ACTIVE {
+    tag 'uniparc'
+    cpus 2
+    memory '4 GB'
+    time '4h'
+
+    input:
+    path uniparc_map
+    path jar
+
+    output:
+    path "uniparc_active.txt", emit: active
+
+    script:
+    """
+    set -euo pipefail
+    java -Xmx2g -jar ${jar} uniparc-active --uniparc ${uniparc_map} > uniparc_active.txt
+    """
+}
+
+
+/* ── PROCESS: One byte range of a .dat to JSON lines (--input_dat) ─── */
+// dat2jsonl (UniProt's own code, as its indexer runs it) over the entries
+// whose first byte is in [start, end): a zstd JSONL part, and its stats, where
+// its first entry starts and its last one ends, which FROM_DAT checks.  A
+// task keeps in memory only its own entries' GO evidences and UniParc ids.
+// Up to --dat_forks at a time: each reads its range of the .dat twice.
+process DAT2JSONL {
+    tag "${part}"
+    cpus { params.dat_cpus as int }
+    memory { params.dat_memory as MemoryUnit }
+    time '4h'
+    maxForks params.dat_forks as int
+
+    input:
+    tuple val(part), path(dat), val(start), val(end)
+    path jar
+    path keywords        // keywlist.txt
+    path diseases        // humdisease.txt
+    path subcell         // subcell.txt
+    path go_evidence     // go/GO.dr_extended
+    path gaf_eco         // gaf-eco-mapping.txt
+    path uniparc_active  // UNIPARC_ACTIVE's
+
+    output:
+    path "${part}.jsonl.zst", emit: part
+    path "${part}.stats.tsv", emit: stats
+
+    script:
+    def heap = (task.memory.toMega() * 3).intdiv(4)
+    """
+    set -euo pipefail
+    java -Xmx${heap}m -jar ${jar} \\
+        --dat ${dat} --range ${start}:${end} \\
+        --keywords ${keywords} --diseases ${diseases} --subcell ${subcell} \\
+        --go ${go_evidence} --gaf-eco ${gaf_eco} --uniparc ${uniparc_active} \\
+        --threads ${task.cpus} --stats ${part}.stats.tsv \\
+      | zstd -q -T1 -o ${part}.jsonl.zst
+    """
+}
+
+
+/* ── PROCESS: Check the parts cover every .dat, then join them (--input_dat) ── */
+// The parts' stats prove each .dat converted whole and once (parts_input.py
+// check: in plan order the first entry starts at byte 0, each part ends where
+// the next starts, the last ends at the file's size; the entries add up to
+// --expected_count), without reading the .dat again; then the same join as
+// FROM_PARTS, and the same outputs as STREAM_JSONL.  The check's report and
+// inputs.txt (the jar and uniprot-core version, the files) go into
+// input_manifest.json, which provenance.json records.
+process FROM_DAT {
+    tag 'dat'
+    cpus 4
+    memory '4 GB'
+    time '12h'
+
+    input:
+    path parts           // every DAT2JSONL part and its stats
+    val plan             // plan.tsv's text: the ranges, in file order
+    val inputs           // inputs.txt's text
+
+    output:
+    path "uniprot.jsonl.zst",   emit: jsonl
+    path "entry_count.txt",     emit: count_file
+    path "input_manifest.json", emit: input_manifest
+
+    script:
+    def expected_flag = params.expected_count ? "--expected-count ${params.expected_count}" : ''
+    """
+    set -euo pipefail
+    echo " .-- FROM_DAT BEGUN \$(date)"
+
+    # The parts as a dat2jsonl output: plan.tsv, parts/, inputs.txt
+    mkdir -p dat2jsonl/parts
+    cat > dat2jsonl/plan.tsv <<'PLAN'
+${plan}
+PLAN
+    cat > dat2jsonl/inputs.txt <<'INPUTS'
+${inputs}
+INPUTS
+    for f in part-*; do ln -s "\$PWD/\$f" "dat2jsonl/parts/\$f"; done
+    parts_input.py check dat2jsonl ${expected_flag}
+
+    ${join_parts_script('dat2jsonl', 'dat2jsonl stage', params.input_dat ? file(params.input_dat).toString() : null)}
+
+    echo " '-- FROM_DAT ENDED \$(date)"
     """
 }
 
@@ -642,6 +849,33 @@ process PROVENANCE {
 }
 
 
+/* ── SUB-WORKFLOW: the release's flat files as the input (--input_dat) ── */
+// UNIPARC_ACTIVE once, DAT2JSONL per byte range, FROM_DAT over all the parts:
+// emits what STREAM_JSONL emits.
+workflow dat2jsonl_input {
+    main:
+    def src = params.input_dat
+    def jar = file(params.dat2jsonl_jar)
+    UNIPARC_ACTIVE(file("${src}/uniparc_map"), jar)
+    DAT2JSONL(
+        channel.fromList(dat_ranges()),
+        jar,
+        file("${src}/keywlist.txt"),
+        file("${src}/humdisease.txt"),
+        file("${src}/subcell.txt"),
+        file("${src}/go/GO.dr_extended"),
+        file(params.gaf_eco),
+        UNIPARC_ACTIVE.out.active,
+    )
+    FROM_DAT(DAT2JSONL.out.part.concat(DAT2JSONL.out.stats).collect(), dat_plan_text(), dat_inputs_text())
+
+    emit:
+    jsonl = FROM_DAT.out.jsonl
+    count_file = FROM_DAT.out.count_file
+    input_manifest = FROM_DAT.out.input_manifest
+}
+
+
 /* ── WORKFLOW ─────────────────────────────────────────────────────── */
 workflow {
     main:
@@ -651,7 +885,7 @@ workflow {
     ${banner_line('UniProtKB → Parquet Data Lake')}
     ${banner_line("Release: ${params.release}")}
     ╚${bar}╝
-    Input:      ${params.input_parts ? "${params.input_parts} (dat2jsonl parts)" : params.inputfile}
+    Input:      ${params.input_dat ? "${params.input_dat} (flat files, dat2jsonl here)" : params.input_parts ? "${params.input_parts} (dat2jsonl parts)" : params.inputfile}
     Output:     ${release_dir()}
     DuckDB mem: ${params.duckdb_pct}% of task.memory (scales on retry)
     DuckDB tmp: ${params.duckdb_temp ?: '(default: \$TMPDIR or /tmp)'}
@@ -661,7 +895,37 @@ workflow {
     """.stripIndent()
 
     // Validate inputs
-    if (params.input_parts) {
+    if (params.input_dat && params.input_parts) {
+        error "--input_dat and --input_parts are two inputs: give one"
+    }
+    if (params.input_dat) {
+        if (!file(params.input_dat).isDirectory()) {
+            error "Release directory not found: ${params.input_dat}"
+        }
+        dat_files().each { f ->
+            if (!f.exists()) {
+                error "Flat file not found: ${f}"
+            }
+            if (f.name.endsWith('.gz')) {
+                error "${f} is compressed: DAT2JSONL's byte ranges need an uncompressed .dat"
+            }
+        }
+        ['keywlist.txt', 'humdisease.txt', 'subcell.txt', 'go/GO.dr_extended', 'uniparc_map'].each { n ->
+            if (!file("${params.input_dat}/${n}").exists()) {
+                error "${params.input_dat}/${n} not found: dat2jsonl reads it"
+            }
+        }
+        if (!params.gaf_eco || !file(params.gaf_eco).exists()) {
+            error "--input_dat needs --gaf_eco, a local gaf-eco-mapping.txt (${params.gaf_eco ?: 'not given'})"
+        }
+        if (!file(params.dat2jsonl_jar).exists()) {
+            error "dat2jsonl jar not found: ${params.dat2jsonl_jar} (mvn -B -q package -f dat2jsonl/pom.xml, or --dat2jsonl_jar)"
+        }
+        if (!((params.dat_chunk_gb as BigDecimal) > 0)) {
+            error "--dat_chunk_gb must be above 0, not '${params.dat_chunk_gb}'"
+        }
+    }
+    else if (params.input_parts) {
         def parts = file(params.input_parts)
         if (!parts.isDirectory()) {
             error "dat2jsonl output not found: ${params.input_parts}"
@@ -707,11 +971,15 @@ workflow {
         }
     }
 
-    // 1. The input as one zstd-compressed JSONL: a REST dump streamed
-    //    (STREAM_JSONL), or a dat2jsonl output's parts joined (FROM_PARTS)
-    def source = params.input_parts
-        ? FROM_PARTS(channel.fromPath(params.input_parts, type: 'dir'))
-        : STREAM_JSONL(channel.fromPath(params.inputfile))
+    // 1. The input as one zstd-compressed JSONL: the release's flat files
+    //    converted here (FROM_DAT, after UNIPARC_ACTIVE and DAT2JSONL), a
+    //    finished dat2jsonl output's parts joined (FROM_PARTS), or a REST
+    //    dump streamed (STREAM_JSONL)
+    def source = params.input_dat
+        ? dat2jsonl_input()
+        : params.input_parts
+            ? FROM_PARTS(channel.fromPath(params.input_parts, type: 'dir'))
+            : STREAM_JSONL(channel.fromPath(params.inputfile))
 
     // 2. Sort JSONL by reviewed DESC, organism_id ASC, accession ASC (lines kept as they are)
     SORT_JSONL(source.jsonl, bin_digest('SORT_JSONL'))

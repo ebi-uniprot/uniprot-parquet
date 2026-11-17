@@ -431,6 +431,68 @@ def test_parts_whose_count_is_not_the_expected_one_fail(launch_dir: pathlib.Path
     assert not (launch_dir / "out" / "miscounted" / "RELEASE_COMPLETE").exists()
 
 
+# ─── --input_dat: the release's flat files, converted in the pipeline ──
+
+DAT2JSONL_JAR = pathlib.Path(PROJECT_ROOT) / "dat2jsonl" / "target" / "dat2jsonl.jar"
+
+
+def _release_dir(tmp_path: pathlib.Path, dat_name: str = "uniprot_sprot.dat") -> pathlib.Path:
+    """A release directory with dat2jsonl's files present (empty): enough for the checks."""
+    src = tmp_path / "uniprot"
+    (src / "go").mkdir(parents=True)
+    (src / "uniparc_map").mkdir()
+    for name in ("keywlist.txt", "humdisease.txt", "subcell.txt", "go/GO.dr_extended", dat_name):
+        (src / name).touch()
+    return src
+
+
+@pytest.mark.parametrize(("extra", "why"), [
+    ((), "--input_dat needs --gaf_eco"),
+    (("--input_parts", "x"), "two inputs: give one"),
+])
+def test_input_dat_is_refused_without_its_parts(launch_dir: pathlib.Path, tmp_path: pathlib.Path,
+                                                extra: tuple[str, ...], why: str) -> None:
+    src = _release_dir(tmp_path)
+    result = _launch(launch_dir, "datrefused", "--input_dat", str(src),
+                     "--dat_files", str(src / "uniprot_sprot.dat"), *extra)
+    assert result.returncode != 0
+    assert why in result.stdout + result.stderr
+
+
+def test_input_dat_refuses_a_compressed_dat(launch_dir: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    src = _release_dir(tmp_path, "uniprot_sprot.dat.gz")
+    result = _launch(launch_dir, "datrefused", "--input_dat", str(src),
+                     "--dat_files", str(src / "uniprot_sprot.dat.gz"))
+    assert result.returncode != 0
+    assert "byte ranges need an uncompressed .dat" in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not DAT2JSONL_JAR.exists() or not os.environ.get("DAT2JSONL_TEST_SRC"),
+                    reason="needs dat2jsonl/target/dat2jsonl.jar and DAT2JSONL_TEST_SRC: a release directory "
+                           "(keywlist.txt, humdisease.txt, subcell.txt, go/GO.dr_extended, uniparc_map/, "
+                           "uniprot_sprot.dat) holding gaf-eco-mapping.txt too")
+def test_input_dat_builds_the_lake(launch_dir: pathlib.Path) -> None:
+    """UNIPARC_ACTIVE, DAT2JSONL over several byte ranges and FROM_DAT turn a
+    release's flat file into a validated lake; provenance.json records the
+    stage, the jar and uniprot-core version, and the coverage check."""
+    src = pathlib.Path(os.environ["DAT2JSONL_TEST_SRC"])
+    dat = src / "uniprot_sprot.dat"
+    with open(dat, "rb") as f:
+        entries = sum(1 for line in f if line == b"//\n")
+    chunk_gb = dat.stat().st_size / 3 / 1e9 + 1e-9        # three ranges
+    _run(launch_dir, "dat", "--input_dat", str(src), "--dat_files", str(dat),
+         "--gaf_eco", str(src / "gaf-eco-mapping.txt"), "--dat2jsonl_jar", str(DAT2JSONL_JAR),
+         "--dat_chunk_gb", f"{chunk_gb:.12f}", "--dat_cpus", "2", "--dat_memory", "2 GB",
+         "--expected_count", str(entries))
+    out = launch_dir / "out" / "dat"
+    assert (out / "RELEASE_COMPLETE").exists()
+    with open(out / "provenance.json") as f:
+        source = json.load(f)["inputs"]["source"]
+    assert source["kind"] == "dat2jsonl stage" and source["entry_count"] == entries
+    assert source["parts"] == 3 and source["check"][-1] == "CHECK PASSED"
+    assert any(line.startswith("uniprot-core: ") for line in source["inputs"])
+
+
 # ─── The SLURM profiles, on the stand-in tests/fake_slurm ──────────────
 
 
