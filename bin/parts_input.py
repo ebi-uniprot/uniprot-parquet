@@ -28,7 +28,14 @@ would have made from a REST dump.
       N is the joined JSONL's line count; it must equal the parts' own counts
       (their stats) and E if given.  Writes what the release was built from,
       with JOINED's SHA-256, which provenance.json records under inputs.source
-      (kind: dat2jsonl, or K; directory: OUTDIR's absolute path, or D).
+      (kind: dat2jsonl, or K; directory: OUTDIR's name, or D's).  The record is
+      published with the release, so it names files, never their absolute paths
+      or dates: the build machine's layout stays out of it.
+
+  parts_input.py public PROVENANCE_JSON -o OUT
+      The same for a provenance.json written before records were public:
+      inputs.source with names in place of paths, and no file dates.  Every
+      other field is kept as it is.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -142,6 +150,30 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
+# An absolute path (a word starting with "/"), and a file's date: "<size> bytes, modified <date>"
+_ABSOLUTE_PATH = re.compile(r"(?<![\w.~])/(?:[^\s/:]+/)*([^\s/:]+)/?")
+_MODIFIED = re.compile(r",? modified .*$")
+
+
+def public_line(line: str) -> str | None:
+    """A line of inputs.txt or CHECK.txt as published: paths cut to their last
+    part, dates dropped, the source directory (SRC) left out."""
+    if line.startswith("SRC:"):
+        return None
+    return _MODIFIED.sub("", _ABSOLUTE_PATH.sub(r"\1", line))
+
+
+def public_source(source: dict[str, Any]) -> dict[str, Any]:
+    """inputs.source as published: names, not the build machine's paths."""
+    out = dict(source)
+    if out.get("directory"):
+        out["directory"] = os.path.basename(str(out["directory"]).rstrip("/"))
+    out["dat"] = [{**d, "path": os.path.basename(d["path"])} for d in out.get("dat", [])]
+    for key in ("inputs", "check"):
+        out[key] = [kept for line in out.get(key, []) if (kept := public_line(line)) is not None]
+    return out
+
+
 def manifest(outdir: Path, jsonl: Path, entry_count: int, expected_count: int | None,
              kind: str = "dat2jsonl", directory: str | None = None) -> dict[str, Any]:
     parts = checked_parts(outdir)
@@ -165,7 +197,7 @@ def manifest(outdir: Path, jsonl: Path, entry_count: int, expected_count: int | 
         p = outdir / name
         return p.read_text().splitlines() if p.is_file() else []
 
-    return {
+    return public_source({
         "kind": kind,
         "directory": directory or str(outdir.resolve()),
         "entry_count": entry_count,
@@ -175,7 +207,7 @@ def manifest(outdir: Path, jsonl: Path, entry_count: int, expected_count: int | 
         "dat": list(per_dat.values()),
         "inputs": lines("inputs.txt"),  # dat2jsonl's record: jar and uniprot-core version, files
         "check": lines("CHECK.txt"),
-    }
+    })
 
 
 def main() -> int:
@@ -194,6 +226,9 @@ def main() -> int:
     m.add_argument("--kind", default="dat2jsonl")
     m.add_argument("--directory", default=None, help="recorded instead of OUTDIR's absolute path")
     m.add_argument("-o", "--output", required=True)
+    pp = sub.add_parser("public", help="a provenance.json's inputs.source without paths or dates")
+    pp.add_argument("provenance", type=Path)
+    pp.add_argument("-o", "--output", type=Path, required=True)
     a = ap.parse_args()
     try:
         if a.cmd == "check":
@@ -204,6 +239,14 @@ def main() -> int:
             if not ok:
                 return 1
             (a.outdir / "COMPLETE").touch()
+        elif a.cmd == "public":
+            prov = json.loads(a.provenance.read_text())
+            source = prov.get("inputs", {}).get("source")
+            if not source or not str(source.get("kind", "")).startswith("dat2jsonl"):
+                raise PartsError(f"{a.provenance}: inputs.source is not a dat2jsonl record")
+            prov["inputs"]["source"] = public_source(source)
+            a.output.write_text(json.dumps(prov, indent=2) + "\n")
+            print(f"  parts_input: inputs.source without paths or dates → {a.output}", file=sys.stderr)
         elif a.cmd == "parts":
             for _, part, _ in checked_parts(a.outdir):
                 print(os.fspath(part))

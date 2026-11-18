@@ -47,8 +47,11 @@ def test_manifest_records_the_source(tmp_path: pathlib.Path) -> None:
     assert m["entry_count"] == m["expected_count"] == len(lines) == 52
     assert m["jsonl_sha256"] == hashlib.sha256(joined.read_bytes()).hexdigest()
     assert m["parts"] == 2
-    assert m["dat"] == [{"path": os.path.abspath(SMALL_JSON_GZ), "entries": 52, "parts": 2,
+    # published with the release: names, not the build machine's paths
+    assert m["directory"] == "out"
+    assert m["dat"] == [{"path": os.path.basename(SMALL_JSON_GZ), "entries": 52, "parts": 2,
                          "size_bytes": os.path.getsize(SMALL_JSON_GZ)}]
+    assert str(tmp_path) not in json.dumps(m)
     assert "uniprot-core: 1.0.43" in m["inputs"] and m["check"][-1] == "CHECK PASSED"
 
 
@@ -150,3 +153,52 @@ def test_check_fails_a_count_unlike_the_expected_one(tmp_path: pathlib.Path) -> 
     out = tmp_path / "out"
     make_parts_output(SMALL_JSON_GZ, str(out), complete=False)
     _failed(out, _check(out, "--expected-count", 53), "EXPECTED 53 entries, got 52 (-1)")
+
+
+# ─── public: what a published provenance.json may say about the build ──
+
+
+def test_public_source_keeps_names_and_drops_paths_and_dates() -> None:
+    from parts_input import public_source
+    source = {
+        "kind": "dat2jsonl", "directory": "/hps/nobackup/users/someone/dat2jsonl_2026_04", "entry_count": 2,
+        "dat": [{"path": "/hps/software/source_data/2026_04/uniprot/uniprot_sprot.dat", "entries": 2,
+                 "parts": 1, "size_bytes": 10}],
+        "inputs": ["created: 2026-11-16T14:26:33+00:00", "SRC: /hps/software/source_data/2026_04/uniprot",
+                   "uniprot-core: 1.0.43",
+                   "dat: /hps/software/source_data/2026_04/uniprot/uniprot_sprot.dat 10 bytes, modified 2026-09-07 "
+                   "09:52:19.7 +0100",
+                   "keywlist.txt: 654974 bytes, modified 2026-07-31T15:32:12Z"],
+        "check": ["dat2jsonl check: /hps/nobackup/users/someone/dat2jsonl_2026_04",
+                  "/hps/software/source_data/2026_04/uniprot/uniprot_sprot.dat: 2 entries, every byte covered once",
+                  "CHECK PASSED"],
+    }
+    out = public_source(source)
+    assert out["directory"] == "dat2jsonl_2026_04" and out["dat"][0]["path"] == "uniprot_sprot.dat"
+    assert out["inputs"] == ["created: 2026-11-16T14:26:33+00:00", "uniprot-core: 1.0.43",
+                             "dat: uniprot_sprot.dat 10 bytes", "keywlist.txt: 654974 bytes"]
+    assert out["check"] == ["dat2jsonl check: dat2jsonl_2026_04",
+                            "uniprot_sprot.dat: 2 entries, every byte covered once", "CHECK PASSED"]
+    assert out["entry_count"] == 2 and "/hps" not in json.dumps(out) and "someone" not in json.dumps(out)
+    assert public_source(out) == out
+
+
+def test_public_rewrites_only_the_source_of_a_provenance(tmp_path: pathlib.Path) -> None:
+    prov = {"pipeline": {"commit": "abc", "dirty": False}, "params": {"release": "r"},
+            "inputs": {"sorted.jsonl.zst": {"path": "sorted.jsonl.zst", "sha256": "x"},
+                       "source": {"kind": "dat2jsonl", "directory": "/data/run1", "dat": [],
+                                  "inputs": ["SRC: /data/src"], "check": []}}}
+    src = tmp_path / "provenance.json"
+    src.write_text(json.dumps(prov))
+    result = run_bin("parts_input.py", "public", src, "-o", tmp_path / "public.json")
+    assert result.returncode == 0, result.stderr
+    out = json.loads((tmp_path / "public.json").read_text())
+    assert out["inputs"]["source"] == {"kind": "dat2jsonl", "directory": "run1", "dat": [], "inputs": [], "check": []}
+    assert {k: v for k, v in out.items() if k != "inputs"} == {k: v for k, v in prov.items() if k != "inputs"}
+    assert out["inputs"]["sorted.jsonl.zst"] == prov["inputs"]["sorted.jsonl.zst"]   # type: ignore[index]
+
+
+def test_public_refuses_a_provenance_not_from_dat2jsonl(tmp_path: pathlib.Path) -> None:
+    src = tmp_path / "provenance.json"
+    src.write_text(json.dumps({"inputs": {"source": {"filename": "UniProtKB.json.gz", "sha256": "x"}}}))
+    _refused(run_bin("parts_input.py", "public", src, "-o", tmp_path / "out.json"), "not a dat2jsonl record")

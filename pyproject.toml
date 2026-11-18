@@ -44,9 +44,9 @@ known-first-party = ["uniprot_parquet"]
 [tool.mypy]
 python_version = "3.14"
 strict = true
-files = ["bin", "uniprot_parquet.py", "benchmarks", "tests"]
+files = ["bin", "uniprot_parquet.py", "benchmarks", "tests", "huggingface"]
 # bin/ scripts import each other, and tests/ and benchmarks/ import them, by bare module name
-mypy_path = ["bin", "tests", "benchmarks"]
+mypy_path = ["bin", "tests", "benchmarks", "huggingface"]
 explicit_package_bases = true
 warn_unreachable = true
 
@@ -54,6 +54,7 @@ warn_unreachable = true
 # Treated as untyped (Any) whether or not installed, so a local run and CI's
 # lint job (which installs only duckdb, orjson and pytest) agree.
 module = ["pyarrow", "pyarrow.*", "ijson", "ijson.*", "zstandard", "frictionless", "frictionless.*",
-          "polars", "polars.*", "pandas", "pandas.*", "matplotlib", "matplotlib.*"]
+          "polars", "polars.*", "pandas", "pandas.*", "matplotlib", "matplotlib.*",
+          "huggingface_hub", "huggingface_hub.*"]
 ignore_missing_imports = true
 follow_imports = "skip"

@@ -406,7 +406,8 @@ def test_parts_build_the_same_lake_as_the_dump(launch_dir: pathlib.Path, tmp_pat
         assert table.equals(baseline[name][0]) and meta == baseline[name][1], name  # type: ignore[attr-defined]
     with open(out / "parts" / "provenance.json") as f:
         source = json.load(f)["inputs"]["source"]
-    assert source["kind"] == "dat2jsonl" and source["directory"] == str(parts.resolve())
+    assert source["kind"] == "dat2jsonl" and source["directory"] == "dat2jsonl"
+    assert str(tmp_path) not in json.dumps(source)                 # names, not paths
     assert source["entry_count"] == source["expected_count"] == 52 and source["parts"] == 3
 
 
