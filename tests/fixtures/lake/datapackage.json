@@ -1,0 +1,1625 @@
+{
+  "$schema": "https://specs.frictionlessdata.io/schemas/data-package.json",
+  "name": "uniprot-parquet",
+  "title": "UniProtKB Parquet Data Lake",
+  "description": "An analysis-ready Parquet representation of the complete UniProtKB database. Five sorted tables (entries, features, xrefs, comments, publications) hold UniProt's JSON as it is shipped, one column per key (source columns), next to typed shortcut columns for common query patterns; accession_map resolves primary and secondary accessions. Per-file SHA-256 hashes are in SHA256SUMS.txt and manifest.json file_details. The data is CC BY 4.0; its client (homepage) is MIT.",
+  "homepage": "https://github.com/ebi-uniprot/uniprot-parquet",
+  "version": "0.1.0",
+  "licenses": [
+    {
+      "name": "CC-BY-4.0",
+      "path": "https://creativecommons.org/licenses/by/4.0/",
+      "title": "UniProt data is licensed under Creative Commons Attribution 4.0"
+    }
+  ],
+  "sources": [
+    {
+      "title": "UniProt Knowledgebase (UniProtKB)",
+      "path": "https://www.uniprot.org/"
+    }
+  ],
+  "contributors": [
+    {
+      "title": "Daniel Rice",
+      "role": "author"
+    }
+  ],
+  "keywords": [
+    "UniProtKB",
+    "UniProt",
+    "proteomics",
+    "bioinformatics",
+    "Parquet",
+    "data lake",
+    "FAIR"
+  ],
+  "created": "2026-11-27T16:54:36.187994+00:00",
+  "uniprotRelease": "test_2026",
+  "resources": [
+    {
+      "name": "entries",
+      "description": "One row per protein. Primary table for most queries.",
+      "path": [
+        "entries/review_status=swissprot/entries_00001.parquet",
+        "entries/review_status=trembl/entries_00001.parquet"
+      ],
+      "format": "parquet",
+      "mediatype": "application/vnd.apache.parquet",
+      "encoding": "binary",
+      "compression": "zstd",
+      "schema": {
+        "fields": [
+          {
+            "name": "accession",
+            "type": "string",
+            "description": "UniProtKB primary accession (e.g. P05067). Stable identifier; unique per entry.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "id",
+            "type": "string",
+            "description": "UniProtKB mnemonic entry name (e.g. A4_HUMAN). May change between releases.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "reviewed",
+            "type": "boolean",
+            "description": "True for Swiss-Prot (manually reviewed); false for TrEMBL (automated annotation).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "bool",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "organism_id",
+            "type": "integer",
+            "description": "NCBI taxonomy ID of the source organism (e.g. 9606 for Homo sapiens).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int64",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "organism_scientific_name",
+            "type": "string",
+            "description": "Scientific name of the source organism.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "gene_primary",
+            "type": "array",
+            "description": "Primary gene name of each gene of the entry, in the genes array's order; NULL for a gene with no geneName (ORF or ordered locus names only).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "protein_name_primary",
+            "type": "string",
+            "description": "Recommended (Swiss-Prot) or submitted (TrEMBL) full protein name.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "length",
+            "type": "integer",
+            "description": "Sequence length in amino acids.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "sequence",
+            "type": "object",
+            "description": "The sequence: value (amino acids, one-letter codes), length, molWeight, crc64, md5. Read sequence.value for the amino acids. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<value: string, length: int64, molWeight: int64, crc64: string, md5: string>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "gene_synonym",
+            "type": "array",
+            "description": "Flattened list of gene name synonyms across all genes.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "alt_protein_names",
+            "type": "array",
+            "description": "List of alternative full protein names from proteinDescription.alternativeNames.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "ec",
+            "type": "array",
+            "description": "Distinct EC (Enzyme Commission) numbers from every naming block (recommended, alternative, submission names) of the entry and of its domains (includes) and chains (contains), in order of first appearance.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "division",
+            "type": "string",
+            "description": "UniProt taxonomic division (archaea, bacteria, fungi, human, invertebrates, mammals, plants, rodents, vertebrates, viruses, unclassified), derived from lineage and organism_id.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "go_id",
+            "type": "array",
+            "description": "Distinct Gene Ontology term IDs (e.g. GO:0005634) from cross-references, in order of first appearance.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "go_terms",
+            "type": "array",
+            "description": "GO annotations as {id, aspect (P/F/C), term, evidence_type}; go_id is the flat id list.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<id: string, aspect: string, term: string, evidence_type: string>>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "xref_dbs",
+            "type": "array",
+            "description": "Distinct database names referenced in cross-references (e.g. PDB, Ensembl), in order of first appearance.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "proteome_id",
+            "type": "array",
+            "description": "Distinct UniProt proteome ids (UP\u2026) from cross-references, sorted.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "keywordid",
+            "type": "array",
+            "description": "UniProt keyword IDs (e.g. KW-0418).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "keyword",
+            "type": "array",
+            "description": "UniProt keyword names (e.g. 'Kinase').",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "keyword_categories",
+            "type": "array",
+            "description": "Keyword categories aligned with keywordid (e.g. Molecular function, Biological process).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "date_created",
+            "type": "date",
+            "description": "Date the entry was first made public in UniProtKB (entryAudit.firstPublicDate as a DATE).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "date32[day]",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "date_modified",
+            "type": "date",
+            "description": "Date of the last annotation update (entryAudit.lastAnnotationUpdateDate as a DATE).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "date32[day]",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "date_sequence_modified",
+            "type": "date",
+            "description": "Date of the last sequence update (entryAudit.lastSequenceUpdateDate as a DATE).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "date32[day]",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "feature_count",
+            "type": "integer",
+            "description": "Number of positional features (rows in features).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "xref_count",
+            "type": "integer",
+            "description": "Number of cross-references to external databases (rows in xrefs).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "comment_count",
+            "type": "integer",
+            "description": "Number of comment annotations (rows in comments).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "reference_count",
+            "type": "integer",
+            "description": "Number of literature/submission references (rows in publications).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "lit_pubmed_id",
+            "type": "array",
+            "description": "Distinct PubMed ids cited by the entry, as strings: numeric ids in numeric order, then any non-numeric id.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "entryType",
+            "type": "string",
+            "description": "Entry type, e.g. 'UniProtKB reviewed (Swiss-Prot)'. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "primaryAccession",
+            "type": "string",
+            "description": "Primary accession, as shipped (the accession shortcut holds the same value). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "secondaryAccessions",
+            "type": "array",
+            "description": "Secondary (merged/demerged) accessions that resolve to this entry. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "uniProtkbId",
+            "type": "string",
+            "description": "Mnemonic entry name (the same value as id). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "entryAudit",
+            "type": "object",
+            "description": "Dates and versions: firstPublicDate, lastAnnotationUpdateDate, lastSequenceUpdateDate, entryVersion, sequenceVersion. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<firstPublicDate: string, lastAnnotationUpdateDate: string, lastSequenceUpdateDate: string, entryVersion: int64, sequenceVersion: int64>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "annotationScore",
+            "type": "number",
+            "description": "UniProt annotation score (1-5). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "double",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "organism",
+            "type": "object",
+            "description": "Source organism: scientificName, commonName, synonyms, taxonId, lineage, evidences. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<scientificName: string, commonName: string, taxonId: int64, lineage: list<l: string>, synonyms: list<l: string>, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "proteinExistence",
+            "type": "string",
+            "description": "Protein existence evidence level (e.g. '1: Evidence at protein level'). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "proteinDescription",
+            "type": "object",
+            "description": "Protein names: recommendedName, alternativeNames, submissionNames, flag, contains, includes, ... Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<recommendedName: struct<fullName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, shortNames: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, ecNumbers: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>, alternativeNames: list<l: struct<fullName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, shortNames: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, ecNumbers: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>>, allergenName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, flag: string, contains: list<l: struct<recommendedName: struct<fullName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, shortNames: list<l: struct<value: string>>, ecNumbers: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>, alternativeNames: list<l: struct<fullName: struct<value: string>, shortNames: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>>>>>, submissionNames: list<l: struct<fullName: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>, includes: list<l: struct<recommendedName: struct<fullName: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>, ecNumbers: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>, alternativeNames: list<l: struct<fullName: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "genes",
+            "type": "array",
+            "description": "Genes: geneName, synonyms, orfNames, orderedLocusNames (with evidences). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<geneName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, synonyms: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, orfNames: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, orderedLocusNames: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "keywords",
+            "type": "array",
+            "description": "Keywords: id, category, name, evidences. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<id: string, category: string, name: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "extraAttributes",
+            "type": "object",
+            "description": "countByCommentType, countByFeatureType, uniParcId, ... Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<countByCommentType: struct<FUNCTION: int64, SUBUNIT: int64, INTERACTION: int64, TISSUE SPECIFICITY: int64, DISEASE: int64, ALLERGEN: int64, MISCELLANEOUS: int64, SIMILARITY: int64, ALTERNATIVE PRODUCTS: int64, WEB RESOURCE: int64, SUBCELLULAR LOCATION: int64, DOMAIN: int64, PTM: int64, SEQUENCE CAUTION: int64, INDUCTION: int64, ACTIVITY REGULATION: int64, CAUTION: int64, DISRUPTION PHENOTYPE: int64, CATALYTIC ACTIVITY: int64, COFACTOR: int64, BIOPHYSICOCHEMICAL PROPERTIES: int64, PATHWAY: int64, POLYMORPHISM: int64, MASS SPECTROMETRY: int64, BIOTECHNOLOGY: int64, DEVELOPMENTAL STAGE: int64, TOXIC DOSE: int64>, countByFeatureType: struct<Initiator methionine: int64, Chain: int64, Domain: int64, Region: int64, Compositional bias: int64, Site: int64, Modified residue: int64, Natural variant: int64, Sequence conflict: int64, Helix: int64, Alternative sequence: int64, Cross-link: int64, Beta strand: int64, Coiled coil: int64, Turn: int64, Active site: int64, Disulfide bond: int64, Mutagenesis: int64, Transit peptide: int64, Binding site: int64, Signal: int64, Propeptide: int64, Glycosylation: int64, Peptide: int64, Repeat: int64, Non-terminal residue: int64, Motif: int64, Transmembrane: int64, Topological domain: int64, Zinc finger: int64>, uniParcId: string>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "organismHosts",
+            "type": "array",
+            "description": "Host organisms (of viruses). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<scientificName: string, commonName: string, taxonId: int64>>",
+            "nullable": true,
+            "columnCategory": "source"
+          }
+        ],
+        "primaryKey": [
+          "accession"
+        ],
+        "foreignKeys": []
+      },
+      "rowCount": 52,
+      "bytes": 286218,
+      "sortOrder": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 31,
+              "trembl": 21
+            }
+          }
+        ],
+        "note": ""
+      }
+    },
+    {
+      "name": "features",
+      "description": "One row per positional annotation (domain, signal, transmembrane, etc). Sorted by (reviewed DESC, organism_id ASC, accession ASC, feature_index ASC): within a protein, features appear in UniProt's order; use ORDER BY start_pos for position order.",
+      "path": [
+        "features/review_status=swissprot/features_00001.parquet",
+        "features/review_status=trembl/features_00001.parquet"
+      ],
+      "format": "parquet",
+      "mediatype": "application/vnd.apache.parquet",
+      "encoding": "binary",
+      "compression": "zstd",
+      "schema": {
+        "fields": [
+          {
+            "name": "accession",
+            "type": "string",
+            "description": "Parent entry's primary accession. Foreign key \u2192 entries.accession.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "reviewed",
+            "type": "boolean",
+            "description": "True if the parent entry is Swiss-Prot (reviewed).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "bool",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "organism_id",
+            "type": "integer",
+            "description": "NCBI taxonomy ID of the parent entry. Foreign key \u2192 entries.organism_id.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int64",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "organism_scientific_name",
+            "type": "string",
+            "description": "Scientific name of the parent entry's organism (denormalized for convenience).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "length",
+            "type": "integer",
+            "description": "Sequence length of the parent entry (denormalized for coverage calculations).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "feature_index",
+            "type": "integer",
+            "description": "Position of this feature in the entry's features array (0-based). ORDER BY feature_index gives UniProt's order.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "start_pos",
+            "type": "integer",
+            "description": "Start position in the sequence (1-based, inclusive): location.start.value.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "end_pos",
+            "type": "integer",
+            "description": "End position in the sequence (1-based, inclusive): location.end.value.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "ligand_id",
+            "type": "string",
+            "description": "ChEBI or other identifier of the bound ligand (ligand.id). May be null.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "evidence_codes",
+            "type": "array",
+            "description": "Evidence codes (e.g. ECO:0000269) of evidences, in order.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "type",
+            "type": "string",
+            "description": "Feature type (e.g. 'Domain', 'Signal peptide', 'Natural variant'). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "location",
+            "type": "object",
+            "description": "Location: start and end ({value, modifier}), and sequence (an isoform) when not the canonical one. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<start: struct<value: int64, modifier: string>, end: struct<value: int64, modifier: string>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "description",
+            "type": "string",
+            "description": "Free-text description of the feature. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "evidences",
+            "type": "array",
+            "description": "Evidence records (evidenceCode, source, id). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<evidenceCode: string, source: string, id: string>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "featureId",
+            "type": "string",
+            "description": "UniProt feature identifier (e.g. PRO_0000001234). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "featureCrossReferences",
+            "type": "array",
+            "description": "Cross-references of the feature (e.g. dbSNP). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<database: string, id: string>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "alternativeSequence",
+            "type": "object",
+            "description": "Variant sequences: originalSequence and alternativeSequences. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<originalSequence: string, alternativeSequences: list<l: string>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "ligand",
+            "type": "object",
+            "description": "Bound ligand of a binding site: name, id, label, note. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<name: string, id: string, label: string, note: string>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "ligandPart",
+            "type": "object",
+            "description": "Part of the ligand that binds: name, id, label, note. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<name: string, id: string>",
+            "nullable": true,
+            "columnCategory": "source"
+          }
+        ],
+        "primaryKey": [
+          "accession",
+          "feature_index"
+        ],
+        "foreignKeys": [
+          {
+            "fields": [
+              "accession",
+              "organism_id"
+            ],
+            "reference": {
+              "resource": "entries",
+              "fields": [
+                "accession",
+                "organism_id"
+              ]
+            }
+          }
+        ]
+      },
+      "rowCount": 2612,
+      "bytes": 124813,
+      "sortOrder": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC",
+        "feature_index ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 2037,
+              "trembl": 575
+            }
+          }
+        ],
+        "note": ""
+      }
+    },
+    {
+      "name": "xrefs",
+      "description": "One row per cross-reference to an external database (PDB, Ensembl, GO, InterPro, etc).",
+      "path": [
+        "xrefs/review_status=swissprot/xrefs_00001.parquet",
+        "xrefs/review_status=trembl/xrefs_00001.parquet"
+      ],
+      "format": "parquet",
+      "mediatype": "application/vnd.apache.parquet",
+      "encoding": "binary",
+      "compression": "zstd",
+      "schema": {
+        "fields": [
+          {
+            "name": "accession",
+            "type": "string",
+            "description": "Parent entry's primary accession. Foreign key \u2192 entries.accession.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "reviewed",
+            "type": "boolean",
+            "description": "True if the parent entry is Swiss-Prot (reviewed).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "bool",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "organism_id",
+            "type": "integer",
+            "description": "NCBI taxonomy ID of the parent entry. Foreign key \u2192 entries.organism_id.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int64",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "xref_index",
+            "type": "integer",
+            "description": "Position of this cross-reference in the entry's uniProtKBCrossReferences array (0-based).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "database",
+            "type": "string",
+            "description": "External database name (e.g. 'PDB', 'Ensembl', 'GO', 'InterPro'). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "id",
+            "type": "string",
+            "description": "Identifier in the external database (e.g. '1ABC' for PDB). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "properties",
+            "type": "array",
+            "description": "Database-specific properties, a list of {key, value}. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<key: string, value: string>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "evidences",
+            "type": "array",
+            "description": "Evidence records supporting this cross-reference. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<evidenceCode: string, source: string, id: string>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "isoformId",
+            "type": "string",
+            "description": "Isoform accession when the cross-reference is specific to an isoform. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          }
+        ],
+        "primaryKey": [
+          "accession",
+          "xref_index"
+        ],
+        "foreignKeys": [
+          {
+            "fields": [
+              "accession",
+              "organism_id"
+            ],
+            "reference": {
+              "resource": "entries",
+              "fields": [
+                "accession",
+                "organism_id"
+              ]
+            }
+          }
+        ]
+      },
+      "rowCount": 9020,
+      "bytes": 174773,
+      "sortOrder": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC",
+        "xref_index ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 7715,
+              "trembl": 1305
+            }
+          }
+        ],
+        "note": ""
+      }
+    },
+    {
+      "name": "comments",
+      "description": "One row per comment annotation (function, subcellular location, disease, etc).",
+      "path": [
+        "comments/review_status=swissprot/comments_00001.parquet",
+        "comments/review_status=trembl/comments_00001.parquet"
+      ],
+      "format": "parquet",
+      "mediatype": "application/vnd.apache.parquet",
+      "encoding": "binary",
+      "compression": "zstd",
+      "schema": {
+        "fields": [
+          {
+            "name": "accession",
+            "type": "string",
+            "description": "Parent entry's primary accession. Foreign key \u2192 entries.accession.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "reviewed",
+            "type": "boolean",
+            "description": "True if the parent entry is Swiss-Prot (reviewed).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "bool",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "organism_id",
+            "type": "integer",
+            "description": "NCBI taxonomy ID of the parent entry. Foreign key \u2192 entries.organism_id.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int64",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "comment_index",
+            "type": "integer",
+            "description": "Position of this comment in the entry's comments array (0-based).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "text_value",
+            "type": "string",
+            "description": "The texts' values joined by a blank line. Null for comments without texts (structured types, and DISEASE / SUBCELLULAR LOCATION, whose prose is in note).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "texts",
+            "type": "array",
+            "description": "Free-text paragraphs ({value, evidences}). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "commentType",
+            "type": "string",
+            "description": "Comment type (e.g. 'FUNCTION', 'DISEASE', 'SUBCELLULAR LOCATION'). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "interactions",
+            "type": "array",
+            "description": "Binary interactions (INTERACTION). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<interactantOne: struct<uniProtKBAccession: string, intActId: string, chainId: string>, interactantTwo: struct<uniProtKBAccession: string, geneName: string, intActId: string, chainId: string>, numberOfExperiments: int64, organismDiffer: bool>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "disease",
+            "type": "object",
+            "description": "Disease: diseaseId, acronym, description, diseaseCrossReference (DISEASE). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<diseaseId: string, diseaseAccession: string, acronym: string, description: string, diseaseCrossReference: struct<database: string, id: string>, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "note",
+            "type": "any",
+            "description": "Note of the comment (texts). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "extension<arrow.json>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "events",
+            "type": "array",
+            "description": "Alternative-products events, e.g. 'Alternative splicing' (ALTERNATIVE PRODUCTS). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "isoforms",
+            "type": "array",
+            "description": "Isoforms: name, isoformIds, isoformSequenceStatus, sequenceIds (ALTERNATIVE PRODUCTS). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<name: struct<value: string>, isoformIds: list<l: string>, isoformSequenceStatus: string, sequenceIds: list<l: string>, synonyms: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "resourceName",
+            "type": "string",
+            "description": "Name of an online resource (WEB RESOURCE). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "resourceUrl",
+            "type": "string",
+            "description": "URL of an online resource (WEB RESOURCE). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "ftp",
+            "type": "boolean",
+            "description": "Whether the web resource is an FTP site (WEB RESOURCE). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "bool",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "subcellularLocations",
+            "type": "array",
+            "description": "Subcellular locations, topologies and orientations (SUBCELLULAR LOCATION). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<location: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string, id: string>, topology: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string, id: string>, orientation: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string, id: string>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "sequenceCautionType",
+            "type": "string",
+            "description": "Kind of sequence conflict (SEQUENCE CAUTION). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "sequence",
+            "type": "string",
+            "description": "Sequence the caution refers to (SEQUENCE CAUTION). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "evidences",
+            "type": "array",
+            "description": "Evidence records of the comment. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<evidenceCode: string, source: string, id: string>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "molecule",
+            "type": "string",
+            "description": "Isoform or chain the comment applies to. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "reaction",
+            "type": "object",
+            "description": "Catalysed reaction (CATALYTIC ACTIVITY): name, reactionCrossReferences, ecNumber. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<name: string, reactionCrossReferences: list<l: struct<database: string, id: string>>, ecNumber: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "cofactors",
+            "type": "array",
+            "description": "Cofactors (COFACTOR). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<name: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, cofactorCrossReference: struct<database: string, id: string>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "kineticParameters",
+            "type": "object",
+            "description": "Kinetic parameters (BIOPHYSICOCHEMICAL PROPERTIES). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<maximumVelocities: list<l: struct<velocity: double, unit: string, enzyme: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, michaelisConstants: list<l: struct<constant: double, unit: string, substrate: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "phDependence",
+            "type": "object",
+            "description": "pH dependence (BIOPHYSICOCHEMICAL PROPERTIES). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<texts: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "method",
+            "type": "string",
+            "description": "Measurement method (MASS SPECTROMETRY). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "molWeight",
+            "type": "number",
+            "description": "Measured molecular weight (MASS SPECTROMETRY). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "double",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "molWeightError",
+            "type": "number",
+            "description": "Error of the measured weight (MASS SPECTROMETRY). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "double",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "physiologicalReactions",
+            "type": "array",
+            "description": "Physiological direction of the reaction (CATALYTIC ACTIVITY). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<directionType: string, reactionCrossReference: struct<database: string, id: string>, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "temperatureDependence",
+            "type": "object",
+            "description": "Temperature dependence (BIOPHYSICOCHEMICAL PROPERTIES). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<texts: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          }
+        ],
+        "primaryKey": [
+          "accession",
+          "comment_index"
+        ],
+        "foreignKeys": [
+          {
+            "fields": [
+              "accession",
+              "organism_id"
+            ],
+            "reference": {
+              "resource": "entries",
+              "fields": [
+                "accession",
+                "organism_id"
+              ]
+            }
+          }
+        ]
+      },
+      "rowCount": 531,
+      "bytes": 211348,
+      "sortOrder": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC",
+        "comment_index ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 354,
+              "trembl": 177
+            }
+          }
+        ],
+        "note": ""
+      }
+    },
+    {
+      "name": "publications",
+      "description": "One row per literature citation or submission (derived from UniProtKB entry.references).",
+      "path": [
+        "publications/review_status=swissprot/publications_00001.parquet",
+        "publications/review_status=trembl/publications_00001.parquet"
+      ],
+      "format": "parquet",
+      "mediatype": "application/vnd.apache.parquet",
+      "encoding": "binary",
+      "compression": "zstd",
+      "schema": {
+        "fields": [
+          {
+            "name": "accession",
+            "type": "string",
+            "description": "Parent entry's primary accession. Foreign key \u2192 entries.accession.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "reviewed",
+            "type": "boolean",
+            "description": "True if the parent entry is Swiss-Prot (reviewed).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "bool",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "organism_id",
+            "type": "integer",
+            "description": "NCBI taxonomy ID of the parent entry. Foreign key \u2192 entries.organism_id.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int64",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "reference_index",
+            "type": "integer",
+            "description": "Position of this reference in the entry's references array (0-based).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int32",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "referenceNumber",
+            "type": "integer",
+            "description": "Number of the reference in the entry's reference list. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int64",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "citation",
+            "type": "object",
+            "description": "The citation: citationType, id, title, authors, authoringGroup, publicationDate, journal, volume, firstPage, lastPage, submissionDatabase, citationCrossReferences, ... Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "struct<id: string, citationType: string, authors: list<l: string>, citationCrossReferences: list<l: struct<database: string, id: string>>, title: string, publicationDate: string, journal: string, firstPage: string, lastPage: string, volume: string, submissionDatabase: string, authoringGroup: list<l: string>, institute: string, address: string>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "referencePositions",
+            "type": "array",
+            "description": "What the reference is cited for (e.g. 'NUCLEOTIDE SEQUENCE'). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: string>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "referenceComments",
+            "type": "array",
+            "description": "Reference comments (strain, tissue, plasmid, ...). Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<value: string, type: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>",
+            "nullable": true,
+            "columnCategory": "source"
+          },
+          {
+            "name": "evidences",
+            "type": "array",
+            "description": "Evidence records of this reference. Type follows the input.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "list<l: struct<evidenceCode: string, source: string, id: string>>",
+            "nullable": true,
+            "columnCategory": "source"
+          }
+        ],
+        "primaryKey": [
+          "accession",
+          "reference_index"
+        ],
+        "foreignKeys": [
+          {
+            "fields": [
+              "accession",
+              "organism_id"
+            ],
+            "reference": {
+              "resource": "entries",
+              "fields": [
+                "accession",
+                "organism_id"
+              ]
+            }
+          }
+        ]
+      },
+      "rowCount": 533,
+      "bytes": 128369,
+      "sortOrder": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC",
+        "reference_index ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 475,
+              "trembl": 58
+            }
+          }
+        ],
+        "note": ""
+      }
+    },
+    {
+      "name": "accession_map",
+      "description": "One row per primary or secondary accession, mapping to the current primary accession. The lookup table for point queries and for resolving retired accessions.",
+      "path": [
+        "accession_map/review_status=swissprot/accession_map_00001.parquet",
+        "accession_map/review_status=trembl/accession_map_00001.parquet"
+      ],
+      "format": "parquet",
+      "mediatype": "application/vnd.apache.parquet",
+      "encoding": "binary",
+      "compression": "zstd",
+      "schema": {
+        "fields": [
+          {
+            "name": "accession",
+            "type": "string",
+            "description": "Primary or secondary accession (the lookup key). A secondary accession can map to more than one primary (split entries).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "primary_accession",
+            "type": "string",
+            "description": "Current primary accession the key resolves to (FK \u2192 entries.accession).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "string",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "is_primary",
+            "type": "boolean",
+            "description": "True when accession == primary_accession.",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "bool",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "reviewed",
+            "type": "boolean",
+            "description": "True if the primary entry is Swiss-Prot (copied from entries.reviewed).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "bool",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          },
+          {
+            "name": "organism_id",
+            "type": "integer",
+            "description": "NCBI taxonomy ID of the primary entry (copied from entries.organism_id).",
+            "constraints": {
+              "required": false
+            },
+            "arrowType": "int64",
+            "nullable": true,
+            "columnCategory": "shortcut"
+          }
+        ],
+        "primaryKey": [
+          "accession",
+          "primary_accession"
+        ],
+        "foreignKeys": [
+          {
+            "fields": [
+              "primary_accession"
+            ],
+            "reference": {
+              "resource": "entries",
+              "fields": [
+                "accession"
+              ]
+            }
+          }
+        ]
+      },
+      "rowCount": 165,
+      "bytes": 8635,
+      "sortOrder": [
+        "reviewed DESC",
+        "accession ASC",
+        "primary_accession ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 142,
+              "trembl": 23
+            }
+          }
+        ],
+        "note": "accession_map is excluded from any future second partition level"
+      }
+    }
+  ]
+}

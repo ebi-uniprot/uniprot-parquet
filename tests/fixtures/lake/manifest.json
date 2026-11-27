@@ -1,0 +1,1076 @@
+{
+  "format": "uniprot-parquet",
+  "version": 2,
+  "schema_version": "0.1.0",
+  "release": "test_2026",
+  "generated_at": "2026-11-27T16:54:36.187994+00:00",
+  "tables": {
+    "entries": {
+      "description": "One row per protein. Primary table for most queries.",
+      "primary_key": [
+        "accession"
+      ],
+      "foreign_keys": {},
+      "files": [
+        "review_status=swissprot/entries_00001.parquet",
+        "review_status=trembl/entries_00001.parquet"
+      ],
+      "row_count": 52,
+      "sort_order": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 31,
+              "trembl": 21
+            }
+          }
+        ],
+        "note": ""
+      },
+      "columns": [
+        {
+          "name": "accession",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "reviewed",
+          "type": "bool",
+          "nullable": true
+        },
+        {
+          "name": "organism_id",
+          "type": "int64",
+          "nullable": true
+        },
+        {
+          "name": "organism_scientific_name",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "gene_primary",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "protein_name_primary",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "length",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "sequence",
+          "type": "struct<value: string, length: int64, molWeight: int64, crc64: string, md5: string>",
+          "nullable": true
+        },
+        {
+          "name": "gene_synonym",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "alt_protein_names",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "ec",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "division",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "go_id",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "go_terms",
+          "type": "list<l: struct<id: string, aspect: string, term: string, evidence_type: string>>",
+          "nullable": true
+        },
+        {
+          "name": "xref_dbs",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "proteome_id",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "keywordid",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "keyword",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "keyword_categories",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "date_created",
+          "type": "date32[day]",
+          "nullable": true
+        },
+        {
+          "name": "date_modified",
+          "type": "date32[day]",
+          "nullable": true
+        },
+        {
+          "name": "date_sequence_modified",
+          "type": "date32[day]",
+          "nullable": true
+        },
+        {
+          "name": "feature_count",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "xref_count",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "comment_count",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "reference_count",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "lit_pubmed_id",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "entryType",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "primaryAccession",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "secondaryAccessions",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "uniProtkbId",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "entryAudit",
+          "type": "struct<firstPublicDate: string, lastAnnotationUpdateDate: string, lastSequenceUpdateDate: string, entryVersion: int64, sequenceVersion: int64>",
+          "nullable": true
+        },
+        {
+          "name": "annotationScore",
+          "type": "double",
+          "nullable": true
+        },
+        {
+          "name": "organism",
+          "type": "struct<scientificName: string, commonName: string, taxonId: int64, lineage: list<l: string>, synonyms: list<l: string>, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>",
+          "nullable": true
+        },
+        {
+          "name": "proteinExistence",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "proteinDescription",
+          "type": "struct<recommendedName: struct<fullName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, shortNames: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, ecNumbers: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>, alternativeNames: list<l: struct<fullName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, shortNames: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, ecNumbers: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>>, allergenName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, flag: string, contains: list<l: struct<recommendedName: struct<fullName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, shortNames: list<l: struct<value: string>>, ecNumbers: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>, alternativeNames: list<l: struct<fullName: struct<value: string>, shortNames: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>>>>>, submissionNames: list<l: struct<fullName: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>, includes: list<l: struct<recommendedName: struct<fullName: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>, ecNumbers: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>, alternativeNames: list<l: struct<fullName: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>>>>",
+          "nullable": true
+        },
+        {
+          "name": "genes",
+          "type": "list<l: struct<geneName: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>, synonyms: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, orfNames: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, orderedLocusNames: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>>",
+          "nullable": true
+        },
+        {
+          "name": "keywords",
+          "type": "list<l: struct<id: string, category: string, name: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>",
+          "nullable": true
+        },
+        {
+          "name": "extraAttributes",
+          "type": "struct<countByCommentType: struct<FUNCTION: int64, SUBUNIT: int64, INTERACTION: int64, TISSUE SPECIFICITY: int64, DISEASE: int64, ALLERGEN: int64, MISCELLANEOUS: int64, SIMILARITY: int64, ALTERNATIVE PRODUCTS: int64, WEB RESOURCE: int64, SUBCELLULAR LOCATION: int64, DOMAIN: int64, PTM: int64, SEQUENCE CAUTION: int64, INDUCTION: int64, ACTIVITY REGULATION: int64, CAUTION: int64, DISRUPTION PHENOTYPE: int64, CATALYTIC ACTIVITY: int64, COFACTOR: int64, BIOPHYSICOCHEMICAL PROPERTIES: int64, PATHWAY: int64, POLYMORPHISM: int64, MASS SPECTROMETRY: int64, BIOTECHNOLOGY: int64, DEVELOPMENTAL STAGE: int64, TOXIC DOSE: int64>, countByFeatureType: struct<Initiator methionine: int64, Chain: int64, Domain: int64, Region: int64, Compositional bias: int64, Site: int64, Modified residue: int64, Natural variant: int64, Sequence conflict: int64, Helix: int64, Alternative sequence: int64, Cross-link: int64, Beta strand: int64, Coiled coil: int64, Turn: int64, Active site: int64, Disulfide bond: int64, Mutagenesis: int64, Transit peptide: int64, Binding site: int64, Signal: int64, Propeptide: int64, Glycosylation: int64, Peptide: int64, Repeat: int64, Non-terminal residue: int64, Motif: int64, Transmembrane: int64, Topological domain: int64, Zinc finger: int64>, uniParcId: string>",
+          "nullable": true
+        },
+        {
+          "name": "organismHosts",
+          "type": "list<l: struct<scientificName: string, commonName: string, taxonId: int64>>",
+          "nullable": true
+        }
+      ],
+      "column_categories": {
+        "shortcut": [
+          "accession",
+          "id",
+          "reviewed",
+          "organism_id",
+          "organism_scientific_name",
+          "gene_primary",
+          "protein_name_primary",
+          "length",
+          "gene_synonym",
+          "alt_protein_names",
+          "ec",
+          "division",
+          "go_id",
+          "go_terms",
+          "xref_dbs",
+          "proteome_id",
+          "keywordid",
+          "keyword",
+          "keyword_categories",
+          "date_created",
+          "date_modified",
+          "date_sequence_modified",
+          "feature_count",
+          "xref_count",
+          "comment_count",
+          "reference_count",
+          "lit_pubmed_id"
+        ],
+        "source": [
+          "sequence",
+          "entryType",
+          "primaryAccession",
+          "secondaryAccessions",
+          "uniProtkbId",
+          "entryAudit",
+          "annotationScore",
+          "organism",
+          "proteinExistence",
+          "proteinDescription",
+          "genes",
+          "keywords",
+          "extraAttributes",
+          "organismHosts"
+        ]
+      },
+      "file_details": {
+        "review_status=swissprot/entries_00001.parquet": {
+          "size_bytes": 138074,
+          "sha256": "01f626b64b559dbcf2fd3ae7c3571be6531abf5ffed7723a207f7d12855c5ecb",
+          "md5": "9c8525d66fb4fbcd79abe0b7d1f9a241",
+          "organism_id_min": 3702,
+          "organism_id_max": 2697049
+        },
+        "review_status=trembl/entries_00001.parquet": {
+          "size_bytes": 148144,
+          "sha256": "74d5dbf04494aa9fbadf0e90136fc46fc31ab2b3070f5ac6042a1acc99b1a3ac",
+          "md5": "bf9d4ddb3ec287b9aef76f4b58e10cfa",
+          "organism_id_min": 3755,
+          "organism_id_max": 72004
+        }
+      },
+      "size_bytes": 286218
+    },
+    "features": {
+      "description": "One row per positional annotation (domain, signal, transmembrane, etc). Sorted by (reviewed DESC, organism_id ASC, accession ASC, feature_index ASC): within a protein, features appear in UniProt's order; use ORDER BY start_pos for position order.",
+      "primary_key": [
+        "accession",
+        "feature_index"
+      ],
+      "foreign_keys": {
+        "accession": "entries.accession",
+        "organism_id": "entries.organism_id"
+      },
+      "files": [
+        "review_status=swissprot/features_00001.parquet",
+        "review_status=trembl/features_00001.parquet"
+      ],
+      "row_count": 2612,
+      "sort_order": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC",
+        "feature_index ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 2037,
+              "trembl": 575
+            }
+          }
+        ],
+        "note": ""
+      },
+      "columns": [
+        {
+          "name": "accession",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "reviewed",
+          "type": "bool",
+          "nullable": true
+        },
+        {
+          "name": "organism_id",
+          "type": "int64",
+          "nullable": true
+        },
+        {
+          "name": "organism_scientific_name",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "length",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "feature_index",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "start_pos",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "end_pos",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "ligand_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "evidence_codes",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "type",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "location",
+          "type": "struct<start: struct<value: int64, modifier: string>, end: struct<value: int64, modifier: string>>",
+          "nullable": true
+        },
+        {
+          "name": "description",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "evidences",
+          "type": "list<l: struct<evidenceCode: string, source: string, id: string>>",
+          "nullable": true
+        },
+        {
+          "name": "featureId",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "featureCrossReferences",
+          "type": "list<l: struct<database: string, id: string>>",
+          "nullable": true
+        },
+        {
+          "name": "alternativeSequence",
+          "type": "struct<originalSequence: string, alternativeSequences: list<l: string>>",
+          "nullable": true
+        },
+        {
+          "name": "ligand",
+          "type": "struct<name: string, id: string, label: string, note: string>",
+          "nullable": true
+        },
+        {
+          "name": "ligandPart",
+          "type": "struct<name: string, id: string>",
+          "nullable": true
+        }
+      ],
+      "column_categories": {
+        "shortcut": [
+          "accession",
+          "reviewed",
+          "organism_id",
+          "organism_scientific_name",
+          "length",
+          "feature_index",
+          "start_pos",
+          "end_pos",
+          "ligand_id",
+          "evidence_codes"
+        ],
+        "source": [
+          "type",
+          "location",
+          "description",
+          "evidences",
+          "featureId",
+          "featureCrossReferences",
+          "alternativeSequence",
+          "ligand",
+          "ligandPart"
+        ]
+      },
+      "file_details": {
+        "review_status=swissprot/features_00001.parquet": {
+          "size_bytes": 89003,
+          "sha256": "549920a84aa4c43f4032dcef58b2a4e0d11586d685157e8b81c589d945e36649",
+          "md5": "0886d9a8e5924764995cdba9554819ab",
+          "organism_id_min": 3702,
+          "organism_id_max": 2697049
+        },
+        "review_status=trembl/features_00001.parquet": {
+          "size_bytes": 35810,
+          "sha256": "9bd0aa0ba0b16bb195e6fb48653063f526152f1e2c372395457491fc6ce9d60b",
+          "md5": "ffd5447bf2d299f0a5c679daed66019f",
+          "organism_id_min": 3755,
+          "organism_id_max": 72004
+        }
+      },
+      "size_bytes": 124813
+    },
+    "xrefs": {
+      "description": "One row per cross-reference to an external database (PDB, Ensembl, GO, InterPro, etc).",
+      "primary_key": [
+        "accession",
+        "xref_index"
+      ],
+      "foreign_keys": {
+        "accession": "entries.accession",
+        "organism_id": "entries.organism_id"
+      },
+      "files": [
+        "review_status=swissprot/xrefs_00001.parquet",
+        "review_status=trembl/xrefs_00001.parquet"
+      ],
+      "row_count": 9020,
+      "sort_order": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC",
+        "xref_index ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 7715,
+              "trembl": 1305
+            }
+          }
+        ],
+        "note": ""
+      },
+      "columns": [
+        {
+          "name": "accession",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "reviewed",
+          "type": "bool",
+          "nullable": true
+        },
+        {
+          "name": "organism_id",
+          "type": "int64",
+          "nullable": true
+        },
+        {
+          "name": "xref_index",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "database",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "properties",
+          "type": "list<l: struct<key: string, value: string>>",
+          "nullable": true
+        },
+        {
+          "name": "evidences",
+          "type": "list<l: struct<evidenceCode: string, source: string, id: string>>",
+          "nullable": true
+        },
+        {
+          "name": "isoformId",
+          "type": "string",
+          "nullable": true
+        }
+      ],
+      "column_categories": {
+        "shortcut": [
+          "accession",
+          "reviewed",
+          "organism_id",
+          "xref_index"
+        ],
+        "source": [
+          "database",
+          "id",
+          "properties",
+          "evidences",
+          "isoformId"
+        ]
+      },
+      "file_details": {
+        "review_status=swissprot/xrefs_00001.parquet": {
+          "size_bytes": 133308,
+          "sha256": "23f8ccf88f69233b54b687e58b7ad090d8f63e18b876492f46eaa30e2bd5f660",
+          "md5": "8b5fae2fa0c6b889e630ae511f03ee18",
+          "organism_id_min": 3702,
+          "organism_id_max": 2697049
+        },
+        "review_status=trembl/xrefs_00001.parquet": {
+          "size_bytes": 41465,
+          "sha256": "c94858012a074e8f25812723c401f2ce4c20ccd3f2fde3e8b812ed11ab2f4fca",
+          "md5": "35ad1fa77c87dff2542862ee71ed9e1a",
+          "organism_id_min": 3755,
+          "organism_id_max": 72004
+        }
+      },
+      "size_bytes": 174773
+    },
+    "comments": {
+      "description": "One row per comment annotation (function, subcellular location, disease, etc).",
+      "primary_key": [
+        "accession",
+        "comment_index"
+      ],
+      "foreign_keys": {
+        "accession": "entries.accession",
+        "organism_id": "entries.organism_id"
+      },
+      "files": [
+        "review_status=swissprot/comments_00001.parquet",
+        "review_status=trembl/comments_00001.parquet"
+      ],
+      "row_count": 531,
+      "sort_order": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC",
+        "comment_index ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 354,
+              "trembl": 177
+            }
+          }
+        ],
+        "note": ""
+      },
+      "columns": [
+        {
+          "name": "accession",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "reviewed",
+          "type": "bool",
+          "nullable": true
+        },
+        {
+          "name": "organism_id",
+          "type": "int64",
+          "nullable": true
+        },
+        {
+          "name": "comment_index",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "text_value",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "texts",
+          "type": "list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>",
+          "nullable": true
+        },
+        {
+          "name": "commentType",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "interactions",
+          "type": "list<l: struct<interactantOne: struct<uniProtKBAccession: string, intActId: string, chainId: string>, interactantTwo: struct<uniProtKBAccession: string, geneName: string, intActId: string, chainId: string>, numberOfExperiments: int64, organismDiffer: bool>>",
+          "nullable": true
+        },
+        {
+          "name": "disease",
+          "type": "struct<diseaseId: string, diseaseAccession: string, acronym: string, description: string, diseaseCrossReference: struct<database: string, id: string>, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>",
+          "nullable": true
+        },
+        {
+          "name": "note",
+          "type": "extension<arrow.json>",
+          "nullable": true
+        },
+        {
+          "name": "events",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "isoforms",
+          "type": "list<l: struct<name: struct<value: string>, isoformIds: list<l: string>, isoformSequenceStatus: string, sequenceIds: list<l: string>, synonyms: list<l: struct<value: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>>>",
+          "nullable": true
+        },
+        {
+          "name": "resourceName",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "resourceUrl",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "ftp",
+          "type": "bool",
+          "nullable": true
+        },
+        {
+          "name": "subcellularLocations",
+          "type": "list<l: struct<location: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string, id: string>, topology: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string, id: string>, orientation: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string, id: string>>>",
+          "nullable": true
+        },
+        {
+          "name": "sequenceCautionType",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "sequence",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "evidences",
+          "type": "list<l: struct<evidenceCode: string, source: string, id: string>>",
+          "nullable": true
+        },
+        {
+          "name": "molecule",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "reaction",
+          "type": "struct<name: string, reactionCrossReferences: list<l: struct<database: string, id: string>>, ecNumber: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>",
+          "nullable": true
+        },
+        {
+          "name": "cofactors",
+          "type": "list<l: struct<name: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, cofactorCrossReference: struct<database: string, id: string>>>",
+          "nullable": true
+        },
+        {
+          "name": "kineticParameters",
+          "type": "struct<maximumVelocities: list<l: struct<velocity: double, unit: string, enzyme: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>, michaelisConstants: list<l: struct<constant: double, unit: string, substrate: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>>",
+          "nullable": true
+        },
+        {
+          "name": "phDependence",
+          "type": "struct<texts: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>",
+          "nullable": true
+        },
+        {
+          "name": "method",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "molWeight",
+          "type": "double",
+          "nullable": true
+        },
+        {
+          "name": "molWeightError",
+          "type": "double",
+          "nullable": true
+        },
+        {
+          "name": "physiologicalReactions",
+          "type": "list<l: struct<directionType: string, reactionCrossReference: struct<database: string, id: string>, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>",
+          "nullable": true
+        },
+        {
+          "name": "temperatureDependence",
+          "type": "struct<texts: list<l: struct<evidences: list<l: struct<evidenceCode: string, source: string, id: string>>, value: string>>>",
+          "nullable": true
+        }
+      ],
+      "column_categories": {
+        "shortcut": [
+          "accession",
+          "reviewed",
+          "organism_id",
+          "comment_index",
+          "text_value"
+        ],
+        "source": [
+          "texts",
+          "commentType",
+          "interactions",
+          "disease",
+          "note",
+          "events",
+          "isoforms",
+          "resourceName",
+          "resourceUrl",
+          "ftp",
+          "subcellularLocations",
+          "sequenceCautionType",
+          "sequence",
+          "evidences",
+          "molecule",
+          "reaction",
+          "cofactors",
+          "kineticParameters",
+          "phDependence",
+          "method",
+          "molWeight",
+          "molWeightError",
+          "physiologicalReactions",
+          "temperatureDependence"
+        ]
+      },
+      "file_details": {
+        "review_status=swissprot/comments_00001.parquet": {
+          "size_bytes": 113354,
+          "sha256": "98f7ce760550380f82e071d70c726e866016ab559d8b136c8b23003f1f01b8ac",
+          "md5": "65d2cd22cc416ded2cbdc6f86cb10068",
+          "organism_id_min": 3702,
+          "organism_id_max": 2697049
+        },
+        "review_status=trembl/comments_00001.parquet": {
+          "size_bytes": 97994,
+          "sha256": "4a1222dd2af26c3fd3c18acf6fdd949288b8e7cad2465664ddf012e7f3ec1294",
+          "md5": "578f87ef94e41840876e08a6c4c2b7a1",
+          "organism_id_min": 3755,
+          "organism_id_max": 72004
+        }
+      },
+      "size_bytes": 211348
+    },
+    "publications": {
+      "description": "One row per literature citation or submission (derived from UniProtKB entry.references).",
+      "primary_key": [
+        "accession",
+        "reference_index"
+      ],
+      "foreign_keys": {
+        "accession": "entries.accession",
+        "organism_id": "entries.organism_id"
+      },
+      "files": [
+        "review_status=swissprot/publications_00001.parquet",
+        "review_status=trembl/publications_00001.parquet"
+      ],
+      "row_count": 533,
+      "sort_order": [
+        "reviewed DESC",
+        "organism_id ASC",
+        "accession ASC",
+        "reference_index ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 475,
+              "trembl": 58
+            }
+          }
+        ],
+        "note": ""
+      },
+      "columns": [
+        {
+          "name": "accession",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "reviewed",
+          "type": "bool",
+          "nullable": true
+        },
+        {
+          "name": "organism_id",
+          "type": "int64",
+          "nullable": true
+        },
+        {
+          "name": "reference_index",
+          "type": "int32",
+          "nullable": true
+        },
+        {
+          "name": "referenceNumber",
+          "type": "int64",
+          "nullable": true
+        },
+        {
+          "name": "citation",
+          "type": "struct<id: string, citationType: string, authors: list<l: string>, citationCrossReferences: list<l: struct<database: string, id: string>>, title: string, publicationDate: string, journal: string, firstPage: string, lastPage: string, volume: string, submissionDatabase: string, authoringGroup: list<l: string>, institute: string, address: string>",
+          "nullable": true
+        },
+        {
+          "name": "referencePositions",
+          "type": "list<l: string>",
+          "nullable": true
+        },
+        {
+          "name": "referenceComments",
+          "type": "list<l: struct<value: string, type: string, evidences: list<l: struct<evidenceCode: string, source: string, id: string>>>>",
+          "nullable": true
+        },
+        {
+          "name": "evidences",
+          "type": "list<l: struct<evidenceCode: string, source: string, id: string>>",
+          "nullable": true
+        }
+      ],
+      "column_categories": {
+        "shortcut": [
+          "accession",
+          "reviewed",
+          "organism_id",
+          "reference_index"
+        ],
+        "source": [
+          "referenceNumber",
+          "citation",
+          "referencePositions",
+          "referenceComments",
+          "evidences"
+        ]
+      },
+      "file_details": {
+        "review_status=swissprot/publications_00001.parquet": {
+          "size_bytes": 87443,
+          "sha256": "65d2ecd603ff5a1922dda5e7514de4581d4a62c43628006d5fcb0a6911a71a68",
+          "md5": "d2c4146cd9a8163c018e8bbb922c9fd8",
+          "organism_id_min": 3702,
+          "organism_id_max": 2697049
+        },
+        "review_status=trembl/publications_00001.parquet": {
+          "size_bytes": 40926,
+          "sha256": "c7dd80ec0f249851f8d78fce69a343b993dc093c6e59cbf710b5a84d70ad3196",
+          "md5": "d965a29aa3a84cffaaf54d8b80820736",
+          "organism_id_min": 3755,
+          "organism_id_max": 72004
+        }
+      },
+      "size_bytes": 128369
+    },
+    "accession_map": {
+      "description": "One row per primary or secondary accession, mapping to the current primary accession. The lookup table for point queries and for resolving retired accessions.",
+      "primary_key": [
+        "accession",
+        "primary_accession"
+      ],
+      "foreign_keys": {
+        "primary_accession": "entries.accession"
+      },
+      "files": [
+        "review_status=swissprot/accession_map_00001.parquet",
+        "review_status=trembl/accession_map_00001.parquet"
+      ],
+      "row_count": 165,
+      "sort_order": [
+        "reviewed DESC",
+        "accession ASC",
+        "primary_accession ASC"
+      ],
+      "partitioning": {
+        "scheme": "hive",
+        "keys": [
+          {
+            "name": "review_status",
+            "type": "string",
+            "values": [
+              "swissprot",
+              "trembl"
+            ],
+            "derived_from": "reviewed",
+            "row_counts": {
+              "swissprot": 142,
+              "trembl": 23
+            }
+          }
+        ],
+        "note": "accession_map is excluded from any future second partition level"
+      },
+      "columns": [
+        {
+          "name": "accession",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "primary_accession",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "is_primary",
+          "type": "bool",
+          "nullable": true
+        },
+        {
+          "name": "reviewed",
+          "type": "bool",
+          "nullable": true
+        },
+        {
+          "name": "organism_id",
+          "type": "int64",
+          "nullable": true
+        }
+      ],
+      "column_categories": {
+        "shortcut": [
+          "accession",
+          "primary_accession",
+          "is_primary",
+          "reviewed",
+          "organism_id"
+        ],
+        "source": []
+      },
+      "file_details": {
+        "review_status=swissprot/accession_map_00001.parquet": {
+          "size_bytes": 4671,
+          "sha256": "3d2791ce46f67d74214fab4c5b4365efb95c5ca800221b9f58d4add8827d8f46",
+          "md5": "f7d7cc26a619c4ad85430ffd724987be",
+          "organism_id_min": 3702,
+          "organism_id_max": 2697049
+        },
+        "review_status=trembl/accession_map_00001.parquet": {
+          "size_bytes": 3964,
+          "sha256": "debc815a58fd8fd2d0964f8873fe0e4826ba55e7a2b8e35cdb8ccda743e4de84",
+          "md5": "aadb0417297df3ea3e8ac11b8a3a936f",
+          "organism_id_min": 3755,
+          "organism_id_max": 72004
+        }
+      },
+      "size_bytes": 8635
+    }
+  },
+  "total_rows": 12913,
+  "compression": {
+    "codec": "zstd",
+    "level": 9
+  },
+  "target_file_bytes": 268435456,
+  "row_group_size": 100000
+}

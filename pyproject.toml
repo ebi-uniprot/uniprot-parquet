@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uniprot-parquet"
+version = "0.1.0"
+description = "DuckDB client and macros for the UniProtKB Parquet data lake"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Daniel Rice" }
+]
+dependencies = [
+    "duckdb>=1.5"
+]
+
+[project.urls]
+Homepage = "https://github.com/ebi-uniprot/uniprot-parquet"
+Data = "https://huggingface.co/datasets/uniprot/uniprotkb-parquet"
+
+[tool.setuptools]
+py-modules = ["uniprot_parquet"]
+
+# ─── Linting and type checking (CI runs both: `ruff check .` and `mypy`) ───
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "RUF001", "RUF002", "RUF003",   # en dashes, arrows and × in strings, docstrings and comments are intended
+    "SIM108",                       # if/else blocks are often clearer than a long ternary
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["uniprot_parquet"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["uniprot_parquet.py", "tests"]
+mypy_path = ["tests"]
+explicit_package_bases = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+# The pipeline's module, imported only by tests that skip here
+module = ["parquet_transform"]
+ignore_missing_imports = true

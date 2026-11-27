@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The client on the test lake, on the oldest Python it supports and the
+  # newest, under DuckDB 1.5 and 2 (the dataset card's `pip install -U duckdb`
+  # gives users the newest).
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+        duckdb: ["duckdb>=1.5,<2", "duckdb>=2,<3"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "${{ matrix.duckdb }}" pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short -rs
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install linters
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.16.10 mypy==2.3.1 "duckdb>=1.5,<2" pytest
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Mypy (strict)
+        run: mypy

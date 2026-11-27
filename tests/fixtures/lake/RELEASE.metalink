@@ -1,0 +1,94 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<metalink xmlns="urn:ietf:params:xml:ns:metalink">
+  <published>2026-11-27T16:54:36Z</published>
+  <file name="entries/review_status=swissprot/entries_00001.parquet">
+    <size>138074</size>
+    <hash type="sha-256">01f626b64b559dbcf2fd3ae7c3571be6531abf5ffed7723a207f7d12855c5ecb</hash>
+    <hash type="md5">9c8525d66fb4fbcd79abe0b7d1f9a241</hash>
+    <url>entries/review_status=swissprot/entries_00001.parquet</url>
+  </file>
+  <file name="entries/review_status=trembl/entries_00001.parquet">
+    <size>148144</size>
+    <hash type="sha-256">74d5dbf04494aa9fbadf0e90136fc46fc31ab2b3070f5ac6042a1acc99b1a3ac</hash>
+    <hash type="md5">bf9d4ddb3ec287b9aef76f4b58e10cfa</hash>
+    <url>entries/review_status=trembl/entries_00001.parquet</url>
+  </file>
+  <file name="features/review_status=swissprot/features_00001.parquet">
+    <size>89003</size>
+    <hash type="sha-256">549920a84aa4c43f4032dcef58b2a4e0d11586d685157e8b81c589d945e36649</hash>
+    <hash type="md5">0886d9a8e5924764995cdba9554819ab</hash>
+    <url>features/review_status=swissprot/features_00001.parquet</url>
+  </file>
+  <file name="features/review_status=trembl/features_00001.parquet">
+    <size>35810</size>
+    <hash type="sha-256">9bd0aa0ba0b16bb195e6fb48653063f526152f1e2c372395457491fc6ce9d60b</hash>
+    <hash type="md5">ffd5447bf2d299f0a5c679daed66019f</hash>
+    <url>features/review_status=trembl/features_00001.parquet</url>
+  </file>
+  <file name="xrefs/review_status=swissprot/xrefs_00001.parquet">
+    <size>133308</size>
+    <hash type="sha-256">23f8ccf88f69233b54b687e58b7ad090d8f63e18b876492f46eaa30e2bd5f660</hash>
+    <hash type="md5">8b5fae2fa0c6b889e630ae511f03ee18</hash>
+    <url>xrefs/review_status=swissprot/xrefs_00001.parquet</url>
+  </file>
+  <file name="xrefs/review_status=trembl/xrefs_00001.parquet">
+    <size>41465</size>
+    <hash type="sha-256">c94858012a074e8f25812723c401f2ce4c20ccd3f2fde3e8b812ed11ab2f4fca</hash>
+    <hash type="md5">35ad1fa77c87dff2542862ee71ed9e1a</hash>
+    <url>xrefs/review_status=trembl/xrefs_00001.parquet</url>
+  </file>
+  <file name="comments/review_status=swissprot/comments_00001.parquet">
+    <size>113354</size>
+    <hash type="sha-256">98f7ce760550380f82e071d70c726e866016ab559d8b136c8b23003f1f01b8ac</hash>
+    <hash type="md5">65d2cd22cc416ded2cbdc6f86cb10068</hash>
+    <url>comments/review_status=swissprot/comments_00001.parquet</url>
+  </file>
+  <file name="comments/review_status=trembl/comments_00001.parquet">
+    <size>97994</size>
+    <hash type="sha-256">4a1222dd2af26c3fd3c18acf6fdd949288b8e7cad2465664ddf012e7f3ec1294</hash>
+    <hash type="md5">578f87ef94e41840876e08a6c4c2b7a1</hash>
+    <url>comments/review_status=trembl/comments_00001.parquet</url>
+  </file>
+  <file name="publications/review_status=swissprot/publications_00001.parquet">
+    <size>87443</size>
+    <hash type="sha-256">65d2ecd603ff5a1922dda5e7514de4581d4a62c43628006d5fcb0a6911a71a68</hash>
+    <hash type="md5">d2c4146cd9a8163c018e8bbb922c9fd8</hash>
+    <url>publications/review_status=swissprot/publications_00001.parquet</url>
+  </file>
+  <file name="publications/review_status=trembl/publications_00001.parquet">
+    <size>40926</size>
+    <hash type="sha-256">c7dd80ec0f249851f8d78fce69a343b993dc093c6e59cbf710b5a84d70ad3196</hash>
+    <hash type="md5">d965a29aa3a84cffaaf54d8b80820736</hash>
+    <url>publications/review_status=trembl/publications_00001.parquet</url>
+  </file>
+  <file name="accession_map/review_status=swissprot/accession_map_00001.parquet">
+    <size>4671</size>
+    <hash type="sha-256">3d2791ce46f67d74214fab4c5b4365efb95c5ca800221b9f58d4add8827d8f46</hash>
+    <hash type="md5">f7d7cc26a619c4ad85430ffd724987be</hash>
+    <url>accession_map/review_status=swissprot/accession_map_00001.parquet</url>
+  </file>
+  <file name="accession_map/review_status=trembl/accession_map_00001.parquet">
+    <size>3964</size>
+    <hash type="sha-256">debc815a58fd8fd2d0964f8873fe0e4826ba55e7a2b8e35cdb8ccda743e4de84</hash>
+    <hash type="md5">aadb0417297df3ea3e8ac11b8a3a936f</hash>
+    <url>accession_map/review_status=trembl/accession_map_00001.parquet</url>
+  </file>
+  <file name="manifest.json">
+    <size>34480</size>
+    <hash type="sha-256">cef54749bf4a02b04eeb41ed028861eae132fc1050fb8c099097440aaf46bf68</hash>
+    <hash type="md5">b3db838d92909fcee0fbd7f2a0d69024</hash>
+    <url>manifest.json</url>
+  </file>
+  <file name="datapackage.json">
+    <size>61050</size>
+    <hash type="sha-256">68c9cb0fc04b17f6e47191614f7cd1652a2e17f387c4371df374d1d36be360af</hash>
+    <hash type="md5">b7bb22b4813969688c812690865a6f9d</hash>
+    <url>datapackage.json</url>
+  </file>
+  <file name="LICENSE">
+    <size>17280</size>
+    <hash type="sha-256">635886bdd313f985c3675ad185be25b23a027fc1e9273903e73005389a024a50</hash>
+    <hash type="md5">dac3afec591ca57eff8719aff7a70999</hash>
+    <url>LICENSE</url>
+  </file>
+</metalink>
